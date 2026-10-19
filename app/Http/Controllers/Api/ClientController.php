@@ -1041,4 +1041,126 @@ class ClientController extends Controller
         }
         return response()->json(['message' => 'Deleted successfully']);
     }
+
+    /* ================= Assigned clients (old Employee_Profile → ASSIGNED CLIENTS) =================
+     * m_client_account.assigned_daid / assigned_auid  (old tbl_client_account.AssignedDAID / AssignedAuditorID)
+     * DA = m_employee.designation_id 3, Auditor = 5 or 10 (old DesignationID). */
+    private const ASSIGN_DA = [3], ASSIGN_AUDITOR = [5, 10];
+
+    private function assignCol(string $table, array $names): ?string
+    {
+        if (!Schema::hasTable($table)) return null;
+        $cols = Schema::getColumnListing($table);
+        foreach ($names as $n) if (in_array($n, $cols, true)) return $n;
+        return null;
+    }
+
+    /** [DA column, Auditor column] on m_client_account */
+    private function assignCols(): array
+    {
+        $da = $this->assignCol('m_client_account', ['assigned_daid', 'assigned_da_id']);
+        $au = $this->assignCol('m_client_account', ['assigned_auid', 'assigned_auditor_id', 'assigned_auditorid']);
+        abort_unless($da && $au, 422, 'm_client_account has no assigned DA / Auditor columns.');
+        return [$da, $au];
+    }
+
+    /** "no one" for a column: NULL if the column allows it, otherwise 0 */
+    private function noOne(string $table, string $col): ?int
+    {
+        $c = collect(Schema::getColumns($table))->firstWhere('name', $col);
+        return ($c['nullable'] ?? true) ? null : 0;
+    }
+
+    /* GET /api/client-accounts/assigned?page=&per_page=&q=&client_num=&active=   accounts + their DA / Auditor */
+    public function assignedAccounts(Request $request)
+    {
+        [$page, $per] = $this->pageArgs($request);
+        [$da, $au] = $this->assignCols();
+        [$st, $sl] = $this->labelTable(['m_client_account_status'], ['status_name', 'description', 'name']);
+        $emp = fn ($a) => "NULLIF(TRIM(CONCAT_WS(' ', {$a}.last_name, {$a}.first_name, {$a}.middle_name)), '')";
+
+        $q = DB::table('m_client_account as A')
+            ->leftJoin('m_client as C', 'C.client_num', '=', 'A.client_num')
+            ->leftJoin('m_employee as DA', 'DA.id', '=', "A.{$da}")
+            ->leftJoin('m_employee as AU', 'AU.id', '=', "A.{$au}")
+            ->select(['A.id', 'A.client_num', 'A.branch_code', 'A.branch_type', 'A.trade_name', 'A.is_active',
+                'C.last_name', 'C.first_name', 'C.middle_name', 'C.suffix',
+                DB::raw("A.{$da} AS da_id"), DB::raw("A.{$au} AS auditor_id"),
+                DB::raw($emp('DA') . ' AS da_name'), DB::raw($emp('AU') . ' AS auditor_name')]);
+        if ($st) $q->leftJoin("{$st} as ST", 'ST.id', '=', 'A.status_id')->addSelect(DB::raw("ST.{$sl} AS status_label"));
+
+        if ($n = trim((string) $request->query('client_num'))) $q->where('A.client_num', $n);
+        $active = $request->query('active', 'all');
+        if ($active === 'active') $q->where(fn ($w) => $w->whereNull('A.is_active')->orWhere('A.is_active', 1));
+        if ($active === 'inactive') $q->where('A.is_active', 0);
+
+        $this->search($q, $request->query('q'), array_filter([
+            'A.trade_name', 'A.branch_code', 'A.branch_type', 'A.client_num', 'C.last_name', 'C.first_name',
+            "CONCAT_WS(' ', C.first_name, C.last_name)", $st ? "ST.{$sl}" : null,
+            "CONCAT_WS(' ', DA.last_name, DA.first_name)", "CONCAT_WS(' ', DA.first_name, DA.last_name)",
+            "CONCAT_WS(' ', AU.last_name, AU.first_name)", "CONCAT_WS(' ', AU.first_name, AU.last_name)",
+        ]));
+        $q->orderBy('C.last_name')->orderBy('C.first_name')->orderBy('A.branch_code');
+
+        return response()->json($this->paged($q, $page, $per, fn ($rows) => $rows->map(function ($a) {
+            $a->client_name = $this->fullName($a);
+            $a->status_label = $a->status_label ?? '';
+            $a->da_id = ((int) $a->da_id) ?: null;
+            $a->auditor_id = ((int) $a->auditor_id) ?: null;
+            foreach (['last_name', 'first_name', 'middle_name', 'suffix'] as $k) unset($a->$k);
+            return $a;
+        })));
+    }
+
+    /* GET /api/client-accounts/assignees   active DAs and Auditors for the popup (old doGetEmployeeList) */
+    public function assignees()
+    {
+        $active = $this->assignCol('m_employee', ['is_active', 'active']);
+        $list = fn (array $designations) => DB::table('m_employee')->whereIn('designation_id', $designations)
+            ->when($active, fn ($q) => $q->where($active, 1))
+            ->orderBy('last_name')->orderBy('first_name')
+            ->get(['id', DB::raw("TRIM(CONCAT_WS(' ', last_name, first_name, middle_name)) AS name")]);
+        return response()->json(['da' => $list(self::ASSIGN_DA), 'auditors' => $list(self::ASSIGN_AUDITOR)]);
+    }
+
+    /* PUT /api/client-accounts/{id}/assigned  { da_id, auditor_id }   (old doUpdateAssignedClient) */
+    public function updateAssigned(Request $request, int $id)
+    {
+        $d = $request->validate(['da_id' => ['nullable', 'integer'], 'auditor_id' => ['nullable', 'integer']]);
+        [$da, $au] = $this->assignCols();
+        $acc = $this->account($id);
+        $newDa = ((int) ($d['da_id'] ?? 0)) ?: null;
+        $newAu = ((int) ($d['auditor_id'] ?? 0)) ?: null;
+
+        $check = function (?int $emp, array $designations, string $label) {
+            if ($emp && !DB::table('m_employee')->where('id', $emp)->whereIn('designation_id', $designations)->exists()) {
+                abort(422, "The selected {$label} is not valid.");
+            }
+        };
+        $check($newDa, self::ASSIGN_DA, 'DA');
+        $check($newAu, self::ASSIGN_AUDITOR, 'Auditor');
+
+        $oldDa = (int) ($acc->$da ?? 0);
+        $oldAu = (int) ($acc->$au ?? 0);
+        $staffEmp = $this->assignCol('m_user_client_staff', ['employee_id', 'emp_id']);
+        $staffCa = $this->assignCol('m_user_client_staff', ['caid', 'client_account_id']);
+
+        DB::transaction(function () use ($id, $da, $au, $newDa, $newAu, $oldDa, $oldAu, $staffEmp, $staffCa) {
+            // old: UPDATE tbl2_user_igb SET EmployeeID = new WHERE EmployeeID = old AND CAID = …  (auditor first, then DA)
+            if ($staffEmp && $staffCa) {
+                $none = $this->noOne('m_user_client_staff', $staffEmp);
+                foreach ([[$oldAu, $newAu], [$oldDa, $newDa]] as [$old, $new]) {
+                    if ($old > 0 && $old !== (int) $new) {
+                        DB::table('m_user_client_staff')->where($staffCa, $id)->where($staffEmp, $old)->update([$staffEmp => $new ?? $none]);
+                    }
+                }
+            }
+            DB::table('m_client_account')->where('id', $id)->update([
+                $da => $newDa ?? $this->noOne('m_client_account', $da),
+                $au => $newAu ?? $this->noOne('m_client_account', $au),
+            ]);
+        });
+
+        return response()->json(['message' => 'Assigned DA / Auditor saved.', 'da_id' => $newDa, 'auditor_id' => $newAu]);
+    }
 }

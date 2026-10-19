@@ -434,6 +434,11 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::delete('/client-valid-ids/{id}', [ClientController::class, 'destroyValidId'])->whereNumber('id');
     Route::get('/client-coa-template', [ClientController::class, 'coaTemplate']);
 
+    // Assigned clients (put these ABOVE any '/client-accounts/{id}' routes)
+    Route::get('/client-accounts/assigned', [ClientController::class, 'assignedAccounts']);
+    Route::get('/client-accounts/assignees', [ClientController::class, 'assignees']);
+    Route::put('/client-accounts/{id}/assigned', [ClientController::class, 'updateAssigned'])->whereNumber('id');
+
     // Master File → Nature of Business → Charts of account popup (nob 0 = general chart)
     Route::get('/nature-coa/{nob}', [ClientController::class, 'natureCoa'])->whereNumber('nob');
     Route::post('/nature-coa/{nob}/copy-general', [ClientController::class, 'natureCoaCopyGeneral'])->whereNumber('nob');
