@@ -691,3 +691,5 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/billing/return-ar/{transNumber}/print', [PrintController::class, 'returnArPrint']);
     Route::get('/billing/deposit/r1', [PrintController::class, 'depositR1Print']);
 });
+
+   require __DIR__ . '/api_mobile.php';

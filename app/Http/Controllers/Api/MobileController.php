@@ -1922,7 +1922,8 @@ class MobileController extends Controller
 
         $token = method_exists($user, 'createToken') ? $user->createToken('mobile-' . $type)->plainTextToken : null;
 
-        return response()->json([
+        // every value as text, like the old login.php (the app reads them as String)
+        return response()->json(array_map(fn ($v) => $v === null ? '' : (string) $v, [
             'result' => 'Success',
             'token' => $token,
             'tradeName' => $acc->trade_name ?? '',
@@ -1939,12 +1940,12 @@ class MobileController extends Controller
             'TIN' => $acc->tin ?? '',
             'userCount' => $type,
             'employeeId' => (int) ($emp->id ?? 0),
-            'CAID' => $type === 'User2' ? null : (int) $user->caid,
+            'CAID' => $type === 'User2' ? $user->comid : (int) $user->caid,      // old: staff CAID = ComID
             'workId' => $workId,
             'userTypeId' => $type === 'User2' ? (int) ($user->user_type_id ?? 0) : $designation,
             'designationId' => $designation,
             'position' => $position ?: ($type === 'User2' ? 'Staff' : ($type === 'User3' ? 'Client Staff' : '')),
-        ]);
+        ]));
     }
 
     /** active logins with this username that may use the mobile app */
@@ -2533,7 +2534,14 @@ class MobileController extends Controller
         $type = (string) $r->input('type', '');
         $file = $r->file('pdf');
 
-        $fail = fn (string $m) => response()->json(['success' => false, 'message' => $m], 500);
+        $fail = function (string $m) use ($r) {
+            // written to storage/logs/laravel.log so the reason can be seen on the server
+            \Illuminate\Support\Facades\Log::warning('upload_receipt failed: ' . $m, [
+                'userId' => $r->input('userId'), 'type' => $r->input('type'),
+                'files' => array_keys($r->allFiles()),
+            ]);
+            return response()->json(['success' => false, 'message' => $m], 500);
+        };
         if (!$userId) return $fail('User ID is required');
         $folders = ['sales' => ['S', 'Sales_Invoices', '(SALES)'], 'purchases' => ['P', 'Vendor_Invoices', '(PURCHASES)'], 'expenses' => ['E', 'Expenses_Transaction', '(EXPENSES)']];
         if (!isset($folders[$type])) return $fail('Invalid transaction type');
