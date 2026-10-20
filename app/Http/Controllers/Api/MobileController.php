@@ -85,7 +85,18 @@ class MobileController extends Controller
     private function onlyFilled(string $table, array $row): array
     {
         $row = $this->only($table, $row);
-        foreach (Schema::getColumns($table) as $c) {
+        $cols = collect(Schema::getColumns($table))->keyBy('name');
+
+        // linked columns (foreign keys): 0 / '' means "no link" → NULL, or MySQL refuses the row (error 1452)
+        foreach (Schema::getForeignKeys($table) as $fk) {
+            foreach ($fk['columns'] as $col) {
+                if (array_key_exists($col, $row) && in_array($row[$col], [0, '0', '', null], true) && ($cols[$col]['nullable'] ?? false)) {
+                    $row[$col] = null;
+                }
+            }
+        }
+
+        foreach ($cols as $c) {
             $name = $c['name'];
             if (array_key_exists($name, $row) || $c['nullable'] || $c['default'] !== null || !empty($c['auto_increment'])) continue;
             $t = strtolower((string) ($c['type_name'] ?? $c['type'] ?? ''));
@@ -2552,6 +2563,10 @@ class MobileController extends Controller
     {
         $userId = (int) $r->input('userId', 0);
         $employeeId = (int) $r->input('employeeId', 0);
+        // must be a real m_employee.id (the app may send 0 for clients, or the old employee number = com_id)
+        if ($employeeId > 0 && !DB::table('m_employee')->where('id', $employeeId)->exists()) {
+            $employeeId = (int) DB::table('m_employee')->where('com_id', $employeeId)->value('id');
+        }
         $type = (string) $r->input('type', '');
         $file = $r->file('pdf');
 
@@ -2591,7 +2606,7 @@ class MobileController extends Controller
                     'filename' => $dbName, 'trans_type' => $type, 'added_by' => $userId,
                     'account_code' => (string) $r->input('accountCode', ''), 'reference' => '', 'reference_no' => '',
                     'assigned_daid' => $daid, 'assigned_auid' => $auid, 'assigned_auditor_id' => $auid,
-                    'employee_id' => $employeeId, 'trans_status' => 0,
+                    'employee_id' => $employeeId ?: null, 'trans_status' => 0,
                     'created_at' => now(), 'updated_at' => now(),
                 ]));
 
@@ -2599,7 +2614,7 @@ class MobileController extends Controller
                 $notifId = null;
                 if (Schema::hasTable('t_notification')) {
                     $notifId = DB::table('t_notification')->insertGetId([
-                        'ca_id' => $caid, 'from_emp_id' => $employeeId, 'to_emp_id' => $daid,
+                        'ca_id' => $caid ?: null, 'from_emp_id' => $employeeId ?: null, 'to_emp_id' => $daid ?: null,
                         'message' => $message, 'is_read' => 0, 'module' => 'Scan', 'reference' => '',
                         'created_at' => now(), 'updated_at' => now(),
                     ]);
