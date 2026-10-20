@@ -42,11 +42,23 @@ class AiAssistantController extends Controller
         return [$type, (int) $u->id, $name];
     }
 
+    /** DB time (saved in the app timezone) → ISO 8601 with offset, so the browser shows the right local / PH time */
+    private function iso($v): ?string
+    {
+        if ($v === null || $v === '') return null;
+        try {
+            return \Illuminate\Support\Carbon::parse($v, config('app.timezone'))->toIso8601String();
+        } catch (\Throwable) {
+            return (string) $v;
+        }
+    }
+
     public function index(Request $request)
     {
         [$type, $id] = $this->who($request);
         $rows = DB::table('t_ai_message')->where('user_type', $type)->where('user_id', $id)
-            ->orderByDesc('id')->limit(50)->get(['id', 'role', 'content', 'created_at'])->reverse()->values();
+            ->orderByDesc('id')->limit(50)->get(['id', 'role', 'content', 'created_at'])->reverse()->values()
+            ->map(function ($r) { $r->created_at = $this->iso($r->created_at); return $r; });
         return response()->json(['messages' => $rows, 'ready' => (bool) config('services.ai.key')]);
     }
 
@@ -104,8 +116,8 @@ class AiAssistantController extends Controller
         ]);
 
         return response()->json([
-            'user'  => ['id' => $userMsgId, 'role' => 'user', 'content' => trim($d['message']), 'created_at' => (string) $now],
-            'reply' => ['id' => $replyId, 'role' => 'assistant', 'content' => $reply, 'created_at' => (string) now()],
+            'user'  => ['id' => $userMsgId, 'role' => 'user', 'content' => trim($d['message']), 'created_at' => $this->iso($now)],
+            'reply' => ['id' => $replyId, 'role' => 'assistant', 'content' => $reply, 'created_at' => $this->iso(now())],
         ]);
     }
 

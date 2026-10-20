@@ -54,6 +54,17 @@ class NotificationController extends Controller
         return [$emp, $designation, $caid];
     }
 
+    /** DB time (saved in the app timezone) → ISO 8601 with offset, so the browser shows the right local / PH time */
+    private function iso($v): ?string
+    {
+        if ($v === null || $v === '') return null;
+        try {
+            return \Illuminate\Support\Carbon::parse($v, config('app.timezone'))->toIso8601String();
+        } catch (\Throwable) {
+            return (string) $v;
+        }
+    }
+
     private function cols(string $table): array
     {
         static $cache = [];
@@ -199,7 +210,7 @@ class NotificationController extends Controller
                 'sub'    => $n->ca_id ? ($branches[(int) $n->ca_id] ?? '') : '',
                 'ca_id'  => ((int) $n->ca_id) ?: null,
                 'to'     => $this->link($n->module, (string) $n->message, (string) $n->reference),
-                'time'   => (string) $n->created_at,
+                'time'   => $this->iso($n->created_at),
                 'unread' => !(int) $n->is_read,
             ])->all();
     }

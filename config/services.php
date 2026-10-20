@@ -42,6 +42,11 @@ return [
         'cluster' => env('PUSHER_APP_CLUSTER', 'ap1'),
     ],
 
+    'giphy' => [
+        'key'    => env('GIPHY_API_KEY'),
+        'rating' => env('GIPHY_RATING', 'pg'),   // g | pg | pg-13  (workplace-safe)
+    ],
+
     'ai' => [
         'provider' => env('AI_PROVIDER', 'openai'),   // openai | anthropic
         'key'      => env('AI_API_KEY'),

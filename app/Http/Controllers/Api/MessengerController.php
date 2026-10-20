@@ -6,7 +6,9 @@ use App\Http\Controllers\Controller;
 use App\Models\UserClientStaff;
 use App\Models\UserStaff;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
@@ -24,16 +26,27 @@ use Illuminate\Support\Str;
  * POST   /messenger/direct            {employee_id}             open (or create) a direct chat
  * POST   /messenger/groups            {name, member_ids[]}      new group
  * GET    /messenger/conversations/{id}?before_id=|after_id=     messages (30 at a time) + members + seen
- * POST   /messenger/conversations/{id}/messages  (multipart) body?, images[]?, files[]?, reply_to_id?   send
+ * POST   /messenger/conversations/{id}/messages  (multipart) body?, images[]?, files[]?, sticker?, reply_to_id?   send
+ *        sticker = a key of the app's sticker set ("pip:happy", "txt:thanks", "emo:😂"); drawn by Messenger.jsx
+ *        gif     = an https link to a GIF (from the GIF library)
+ * GET    /messenger/gifs?q=                        the shared GIF library (most used first)
+ * POST   /messenger/gifs        {lines}            add GIF links – one per line, "title | https://…" or just the link
+ * DELETE /messenger/gifs/{id}                      remove a GIF I added
+ * GET    /messenger/giphy?q=&offset=               GIPHY search (trending when q is empty) – key stays on the server
+ *        .env GIPHY_API_KEY=…  ·  config/services.php 'giphy' => ['key' => env('GIPHY_API_KEY'), 'rating' => env('GIPHY_RATING', 'pg')]
  * GET    /messenger/conversations/{id}/shared?kind=media|files|links&before_id=   chat info: shared photos / files / links
  * POST   /messenger/conversations/{id}/read       {message_id}  seen up to here
  * PUT    /messenger/conversations/{id}            {name}        rename group
+ * PUT    /messenger/conversations/{id}/customize  {theme?, emoji?, background?}   chat theme / quick emoji / background (everyone sees it)
+ * GET    /messenger/conversations/{id}/search?q=   search the messages of one chat (text + file names)
  * POST   /messenger/conversations/{id}/members    {employee_ids[]}  add people
  * DELETE /messenger/conversations/{id}/members/{employee}       remove (admin) / leave (myself)
  * DELETE /messenger/messages/{id}                               unsend my message
  * POST   /messenger/conversations/{id}/typing                     "is typing…" to the others
  * POST   /messenger/conversations/{id}/pin  {pinned}              pin / unpin a chat (my list only)
  * POST   /messenger/messages/{id}/react     {emoji|null}          react (same emoji again = remove)
+ * POST   /messenger/messages/{id}/pin       {pinned}              pin / unpin a message for everyone in the chat
+ * POST   /messenger/messages/{id}/forward   {conversation_id? | employee_id?}   forward a copy to a chat or a person
  * POST   /messenger/pusher-auth       {socket_id, channel_name}  real time: my private channel private-emp.<my employee id>
  *
  * Real time = Pusher (same account as the old mobile_php). Events on private-emp.<employee id>:
@@ -47,6 +60,12 @@ class MessengerController extends Controller
     private const PAGE = 30;
     private const ONLINE_SECONDS = 70;          // the app pings every ~20 s while open
     private const MAX_IMAGES = 10;
+    // keys must match THEMES in Messenger.jsx
+    private const THEMES = ['default' => 'Default', 'ocean' => 'Ocean', 'berry' => 'Berry', 'sunset' => 'Sunset', 'forest' => 'Forest',
+        'grape' => 'Grape', 'rose' => 'Rose', 'teal' => 'Teal', 'tangerine' => 'Tangerine', 'midnight' => 'Midnight', 'igb' => 'IGB'];
+    // keys must match BACKGROUNDS in Messenger.jsx
+    private const BACKGROUNDS = ['none' => 'None', 'sky' => 'Sky', 'blush' => 'Blush', 'mint' => 'Mint', 'sand' => 'Sand', 'lavender' => 'Lavender',
+        'aurora' => 'Aurora', 'peach' => 'Peach', 'dots' => 'Dots', 'grid' => 'Grid', 'waves' => 'Waves', 'night' => 'Night', 'galaxy' => 'Galaxy'];
     private const FILE_TYPES = 'pdf,doc,docx,xls,xlsx,csv,txt,ppt,pptx,zip,rar,7z,odt,ods,rtf,xml,json';
 
     private array $names = [];
@@ -87,6 +106,17 @@ class MessengerController extends Controller
         }
     }
 
+    /** DB time (saved in the app timezone) → ISO 8601 with offset, so the browser shows the right local / PH time */
+    private function iso($v): ?string
+    {
+        if ($v === null || $v === '') return null;
+        try {
+            return \Illuminate\Support\Carbon::parse($v, config('app.timezone'))->toIso8601String();
+        } catch (\Throwable) {
+            return (string) $v;
+        }
+    }
+
     private function name(?int $id): string
     {
         return $id ? ($this->names[$id] ?? 'Unknown') : '';
@@ -123,8 +153,8 @@ class MessengerController extends Controller
             ->get(['employee_id', 'last_seen_at']);
         $online = [];
         foreach ($rows as $r) {
-            $this->lastSeen[(int) $r->employee_id] = (string) $r->last_seen_at;
-            if (now()->diffInSeconds($r->last_seen_at, true) <= self::ONLINE_SECONDS) $online[(int) $r->employee_id] = (string) $r->last_seen_at;
+            $this->lastSeen[(int) $r->employee_id] = $this->iso($r->last_seen_at);
+            if (now()->diffInSeconds($r->last_seen_at, true) <= self::ONLINE_SECONDS) $online[(int) $r->employee_id] = $this->iso($r->last_seen_at);
         }
         return $online;
     }
@@ -178,7 +208,18 @@ class MessengerController extends Controller
         $online = array_keys($this->presence());
         $cfg = $this->pusherCfg();
         return response()->json(['me' => $me, 'unread' => $unread, 'online' => array_values(array_diff($online, [$me])),
-            'pusher' => $cfg ? ['key' => $cfg['key'], 'cluster' => $cfg['cluster']] : null]);
+            'pusher' => $cfg ? ['key' => $cfg['key'], 'cluster' => $cfg['cluster']] : null,
+            // the server's real upload limits (php.ini), so the app can say "too big" before sending
+            'limits' => ['post' => $this->iniBytes('post_max_size'), 'file' => $this->iniBytes('upload_max_filesize')]]);
+    }
+
+    /** php.ini size ("8M", "2G", "512K") → bytes; 0 = no limit */
+    private function iniBytes(string $key): int
+    {
+        $v = trim((string) ini_get($key));
+        if ($v === '' || $v === '0' || $v === '-1') return 0;
+        $n = (float) $v;
+        return (int) match (strtoupper(substr($v, -1))) { 'G' => $n * 1073741824, 'M' => $n * 1048576, 'K' => $n * 1024, default => $n };
     }
 
     /* GET /messenger/people?q=   employees I can message (online first) */
@@ -246,7 +287,7 @@ class MessengerController extends Controller
         if ($last) {
             $who = $last->employee_id === null ? '' : ((int) $last->employee_id === $me ? 'You: ' : ($isGroup ? explode(' ', $this->name((int) $last->employee_id))[0] . ': ' : ''));
             $preview = $last->deleted_at ? $who . 'Unsent a message'
-                : ($last->type === 'image' ? $who . 'Sent a photo' : ($last->type === 'file' ? $who . 'Sent a file' : $who . Str::limit((string) $last->body, 60)));
+                : ($last->type === 'image' ? $who . 'Sent a photo' : ($last->type === 'file' ? $who . 'Sent a file' : ($last->type === 'sticker' ? $who . 'Sent a sticker' : ($last->type === 'gif' ? $who . 'Sent a GIF' : $who . Str::limit((string) $last->body, 60)))));
         }
         return [
             'id' => (int) $c->id,
@@ -257,7 +298,7 @@ class MessengerController extends Controller
             'members' => count($memberIds),
             'online' => $isGroup ? count(array_intersect($others, array_keys($online))) > 0 : isset($online[$other]),
             'preview' => $preview,
-            'time' => (string) ($c->last_message_at ?? $c->created_at),
+            'time' => $this->iso($c->last_message_at ?? $c->created_at),
             'unread' => $unread,
             'pinned' => !empty($c->pinned_at),
         ];
@@ -345,11 +386,15 @@ class MessengerController extends Controller
                 'other' => $other ? $this->person($other, $online) : null,
                 'avatars' => array_map(fn ($i) => ['name' => $this->name($i), 'photo' => $this->url($this->photos[$i] ?? null)], array_slice($others, 0, 2)),
                 'i_am_admin' => (bool) ($active->firstWhere('employee_id', $me)->is_admin ?? false),
+                'theme' => $c->theme ?? null,
+                'emoji' => $c->emoji ?? null,
+                'background' => $c->background ?? null,
             ],
             'members' => $active->map(fn ($m) => $this->person((int) $m->employee_id, $online) + [
                 'is_admin' => (bool) $m->is_admin, 'last_read_id' => (int) $m->last_read_id, 'me' => (int) $m->employee_id === $me,
             ])->values(),
             'messages' => $this->rows($msgs, $me),
+            'pinned' => $this->pinnedOf($id),
             'has_more' => !$after && $msgs->count() === self::PAGE,
             'unsent' => $unsent,
             'changed' => $this->rows($changed, $me),
@@ -377,7 +422,7 @@ class MessengerController extends Controller
                 'sender' => $this->name($rt->employee_id ? (int) $rt->employee_id : null),
                 'type' => $rt->type,
                 'body' => $rt->deleted_at ? null : Str::limit((string) $rt->body, 120),
-                'image' => !$rt->deleted_at && $rt->type === 'image' ? $this->url($rt->file_key) : null,
+                'image' => !$rt->deleted_at && $rt->type === 'image' ? $this->url($rt->file_key) : (!$rt->deleted_at && $rt->type === 'gif' ? $rt->body : null),
                 'file_name' => !$rt->deleted_at && $rt->type === 'file' ? $rt->file_name : null,
                 'unsent' => (bool) $rt->deleted_at,
             ] : null;
@@ -418,7 +463,9 @@ class MessengerController extends Controller
             'photo' => $m->employee_id ? $this->url($this->photos[(int) $m->employee_id] ?? null) : null,
             'mine' => (int) $m->employee_id === $me,
             'unsent' => $deleted,
-            'time' => (string) $m->created_at,
+            'pinned' => !$deleted && !empty($m->pinned_at),
+            'forwarded' => !$deleted && !empty($m->forwarded),
+            'time' => $this->iso($m->created_at),
         ];
     }
 
@@ -434,6 +481,8 @@ class MessengerController extends Controller
             'files' => ['nullable', 'array', 'max:' . self::MAX_IMAGES],
             'files.*' => ['file', 'mimes:' . self::FILE_TYPES, 'max:20480'],
             'reply_to_id' => ['nullable', 'integer'],
+            'sticker' => ['nullable', 'string', 'max:40', 'regex:/^(pip|txt|emo):\S{1,32}$/u'],
+            'gif' => ['nullable', 'string', 'max:500', 'url:https'],
         ], [
             'images.*.max' => 'Each photo must be 10 MB or less.', 'images.*.image' => 'Only photos can be sent as photos.',
             'files.*.max' => 'Each file must be 20 MB or less.',
@@ -442,7 +491,9 @@ class MessengerController extends Controller
         $body = trim((string) $request->input('body', ''));
         $files = $request->file('images', []);
         $docs = $request->file('files', []);
-        abort_if($body === '' && !$files && !$docs, 422, 'Type a message or add a photo or file.');
+        $sticker = trim((string) $request->input('sticker', ''));
+        $gif = trim((string) $request->input('gif', ''));
+        abort_if($body === '' && !$files && !$docs && $sticker === '' && $gif === '', 422, 'Type a message or add a photo or file.');
         $replyTo = (int) $request->input('reply_to_id', 0);
         if ($replyTo && !DB::table('t_msg_message')->where('id', $replyTo)->where('conversation_id', $id)->exists()) $replyTo = 0;
 
@@ -461,8 +512,19 @@ class MessengerController extends Controller
             $stored[] = [$key, mb_substr($f->getClientOriginalName(), 0, 255), (int) $f->getSize(), 'file'];
         }
 
-        $newIds = DB::transaction(function () use ($id, $me, $body, $stored, $replyTo) {
+        $newIds = DB::transaction(function () use ($id, $me, $body, $stored, $replyTo, $sticker, $gif) {
             $ids = [];
+            if ($gif !== '') {          // a GIF is sent on its own too
+                $ids[] = DB::table('t_msg_message')->insertGetId(['conversation_id' => $id, 'employee_id' => $me, 'type' => 'gif',
+                    'reply_to_id' => $replyTo ?: null, 'body' => $gif, 'created_at' => now(), 'updated_at' => now()]);
+                $replyTo = 0;
+                if (Schema::hasTable('t_msg_gif')) DB::table('t_msg_gif')->where('url', $gif)->increment('uses');
+            }
+            if ($sticker !== '') {      // a sticker is sent on its own, like FB
+                $ids[] = DB::table('t_msg_message')->insertGetId(['conversation_id' => $id, 'employee_id' => $me, 'type' => 'sticker',
+                    'reply_to_id' => $replyTo ?: null, 'body' => $sticker, 'created_at' => now(), 'updated_at' => now()]);
+                $replyTo = 0;
+            }
             // the reply goes on the text, or on the first photo when there is no text
             $replyOnPhoto = $body === '' ? $replyTo : 0;
             foreach ($stored as $n => [$key, $name, $size, $type]) {
@@ -512,6 +574,39 @@ class MessengerController extends Controller
         DB::table('t_msg_conversation')->where('id', $id)->update(['name' => $name ?: null, 'updated_at' => now()]);
         $this->loadPeople([$me]);
         $this->system($id, $name ? $this->name($me) . " named the group {$name}." : $this->name($me) . ' removed the group name.');
+        $this->pushChanged($id);
+        return $this->show($request, $id);
+    }
+
+    /* PUT /messenger/conversations/{id}/customize {theme?, emoji?}   anyone in the chat, like FB */
+    public function customize(Request $request, int $id)
+    {
+        $me = $this->me($request);
+        $this->member($id, $me);
+        $d = $request->validate([
+            'theme' => ['nullable', 'string', 'in:' . implode(',', array_keys(self::THEMES))],
+            'emoji' => ['nullable', 'string', 'max:16'],
+            'background' => ['nullable', 'string', 'in:' . implode(',', array_keys(self::BACKGROUNDS))],
+        ]);
+        abort_unless(Schema::hasColumn('t_msg_conversation', 'theme'), 422, 'Run php artisan migrate first (chat themes).');
+        $this->loadPeople([$me]);
+        $who = $this->name($me);
+        if ($request->has('theme')) {
+            $theme = ($d['theme'] ?? 'default') === 'default' ? null : $d['theme'];
+            DB::table('t_msg_conversation')->where('id', $id)->update(['theme' => $theme, 'updated_at' => now()]);
+            $this->system($id, "{$who} changed the theme to " . self::THEMES[$theme ?? 'default'] . '.');
+        }
+        if ($request->has('emoji')) {
+            $emoji = trim((string) ($d['emoji'] ?? '')) ?: null;
+            DB::table('t_msg_conversation')->where('id', $id)->update(['emoji' => $emoji, 'updated_at' => now()]);
+            $this->system($id, "{$who} set the quick reaction to " . ($emoji ?? '👍') . '.');
+        }
+        if ($request->has('background')) {
+            abort_unless(Schema::hasColumn('t_msg_conversation', 'background'), 422, 'Run php artisan migrate first (chat backgrounds).');
+            $bg = ($d['background'] ?? 'none') === 'none' ? null : $d['background'];
+            DB::table('t_msg_conversation')->where('id', $id)->update(['background' => $bg, 'updated_at' => now()]);
+            $this->system($id, $bg ? "{$who} changed the background to " . self::BACKGROUNDS[$bg] . '.' : "{$who} removed the background.");
+        }
         $this->pushChanged($id);
         return $this->show($request, $id);
     }
@@ -639,6 +734,31 @@ class MessengerController extends Controller
         return response()->json(['ok' => true]);
     }
 
+    /* GET /messenger/conversations/{id}/search?q=   newest first, max 50 */
+    public function search(Request $request, int $id)
+    {
+        $me = $this->me($request);
+        $this->member($id, $me);
+        $q = trim((string) $request->query('q', ''));
+        if (mb_strlen($q) < 2) return response()->json(['items' => []]);
+        $like = '%' . str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $q) . '%';
+        $rows = DB::table('t_msg_message')->where('conversation_id', $id)->whereNull('deleted_at')
+            ->where(fn ($w) => $w->where(fn ($x) => $x->where('type', 'text')->where('body', 'like', $like))
+                ->orWhere(fn ($x) => $x->where('type', 'file')->where('file_name', 'like', $like)))
+            ->orderByDesc('id')->limit(50)->get(['id', 'employee_id', 'type', 'body', 'file_name', 'created_at']);
+        $this->loadPeople($rows->pluck('employee_id')->filter()->all());
+
+        return response()->json(['items' => $rows->map(function ($m) use ($q) {
+            $text = $m->type === 'file' ? (string) $m->file_name : (string) $m->body;
+            // a short piece of text around the first match
+            $pos = mb_stripos($text, $q);
+            $start = max(0, ($pos === false ? 0 : $pos) - 40);
+            $snip = ($start > 0 ? '…' : '') . mb_substr($text, $start, 140) . (mb_strlen($text) > $start + 140 ? '…' : '');
+            return ['id' => (int) $m->id, 'type' => $m->type, 'text' => $snip,
+                'sender' => $this->name($m->employee_id ? (int) $m->employee_id : null), 'time' => $this->iso($m->created_at)];
+        })->values()]);
+    }
+
     /* GET /messenger/conversations/{id}/shared?kind=media|files|links&before_id=   for the chat info panel */
     public function shared(Request $request, int $id)
     {
@@ -652,7 +772,7 @@ class MessengerController extends Controller
         $q = DB::table('t_msg_message')->where('conversation_id', $id)->whereNull('deleted_at')
             ->when($before, fn ($x) => $x->where('id', '<', $before))->orderByDesc('id');
         match ($kind) {
-            'media' => $q->where('type', 'image'),
+            'media' => $q->whereIn('type', ['image', 'gif']),
             'files' => $q->where('type', 'file'),
             'links' => $q->where('type', 'text')->where(fn ($w) => $w->where('body', 'like', '%http://%')->orWhere('body', 'like', '%https://%')),
         };
@@ -663,8 +783,8 @@ class MessengerController extends Controller
 
         $items = [];
         foreach ($rows as $m) {
-            $base = ['message_id' => (int) $m->id, 'sender' => $this->name($m->employee_id ? (int) $m->employee_id : null), 'time' => (string) $m->created_at];
-            if ($kind === 'media') $items[] = $base + ['url' => $this->url($m->file_key), 'name' => $m->file_name];
+            $base = ['message_id' => (int) $m->id, 'sender' => $this->name($m->employee_id ? (int) $m->employee_id : null), 'time' => $this->iso($m->created_at)];
+            if ($kind === 'media') $items[] = $base + ['url' => $m->type === 'gif' ? $m->body : $this->url($m->file_key), 'name' => $m->type === 'gif' ? 'GIF' : $m->file_name, 'gif' => $m->type === 'gif'];
             if ($kind === 'files') $items[] = $base + ['url' => $this->url($m->file_key, $m->file_name), 'name' => $m->file_name, 'size' => (int) $m->file_size];
             if ($kind === 'links') {
                 preg_match_all('~https?://[^\s<>"\']+~i', (string) $m->body, $hits);
@@ -675,6 +795,124 @@ class MessengerController extends Controller
             }
         }
         return response()->json(['items' => $items, 'has_more' => $more, 'next_before' => $more ? (int) $rows->last()->id : null]);
+    }
+
+    /* GET /messenger/gifs?q=   the shared GIF library */
+    public function gifs(Request $request)
+    {
+        $me = $this->me($request);
+        if (!Schema::hasTable('t_msg_gif')) return response()->json([]);
+        $q = trim((string) $request->query('q', ''));
+        $like = '%' . str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $q) . '%';
+        return response()->json(DB::table('t_msg_gif')
+            ->when($q !== '', fn ($x) => $x->where(fn ($w) => $w->where('title', 'like', $like)->orWhere('url', 'like', $like)))
+            ->orderByDesc('uses')->orderByDesc('id')->limit(300)->get(['id', 'url', 'title', 'added_by', 'uses'])
+            ->map(fn ($g) => ['id' => (int) $g->id, 'url' => $g->url, 'title' => (string) $g->title, 'uses' => (int) $g->uses, 'mine' => (int) $g->added_by === $me])->values());
+    }
+
+    /**
+     * a pasted link → the direct GIF link, or [null, why not]
+     *   giphy.com/gifs/some-title-AbC123  → https://media.giphy.com/media/AbC123/giphy.gif
+     *   giphy.com/embed/AbC123            → same
+     *   media*.giphy.com / i.giphy.com / media.tenor.com / any …gif|webp|png|jpg link → kept
+     *   tenor.com/view/…                  → refused (Tenor page; copy the image address instead)
+     */
+    private function gifLink(string $url): array
+    {
+        $url = trim($url, " \t<>\"'");
+        if (!filter_var($url, FILTER_VALIDATE_URL)) return [null, 'not a link'];
+        if (!str_starts_with(strtolower($url), 'https://')) return [null, 'must start with https://'];
+        if (strlen($url) > 500) return [null, 'link is too long'];
+        $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+        $path = (string) parse_url($url, PHP_URL_PATH);
+
+        if (in_array($host, ['giphy.com', 'www.giphy.com'], true) && preg_match('~^/(gifs|embed|stickers)/(?:[^/]*-)?([A-Za-z0-9]+)/?$~', $path, $m)) {
+            return ["https://media.giphy.com/media/{$m[2]}/giphy.gif", null];
+        }
+        if (in_array($host, ['tenor.com', 'www.tenor.com'], true)) {
+            return [null, 'Tenor page link – open the GIF, right-click it → "Copy image address" (media.tenor.com/…)'];
+        }
+        if (preg_match('~(^|\.)giphy\.com$~', $host) || $host === 'media.tenor.com' || preg_match('~^c\.tenor\.com$~', $host)) return [$url, null];
+        if (preg_match('~\.(gif|webp|png|jpe?g)$~i', $path)) return [$url, null];
+        return [null, 'not a direct GIF link (it should end in .gif)'];
+    }
+
+    /* POST /messenger/gifs {lines}   "title | https://…gif" or just the link, one per line (max 200) */
+    public function addGifs(Request $request)
+    {
+        $me = $this->me($request);
+        abort_unless(Schema::hasTable('t_msg_gif'), 422, 'Run php artisan migrate first (GIF library).');
+        $lines = preg_split('/\r\n|\r|\n/', (string) $request->validate(['lines' => ['required', 'string', 'max:100000']])['lines']);
+        $added = 0; $skipped = [];
+        foreach (array_slice(array_values(array_filter(array_map('trim', $lines))), 0, 200) as $line) {
+            [$title, $raw] = str_contains($line, '|') ? array_map('trim', explode('|', $line, 2)) : ['', $line];
+            [$url, $why] = $this->gifLink($raw);
+            if (!$url) { $skipped[] = ['line' => $line, 'why' => $why]; continue; }
+            if (DB::table('t_msg_gif')->where('url', $url)->exists()) { $skipped[] = ['line' => $line, 'why' => 'already in the list']; continue; }
+            DB::table('t_msg_gif')->insert(['url' => $url, 'title' => mb_substr($title, 0, 80) ?: null, 'added_by' => $me, 'created_at' => now(), 'updated_at' => now()]);
+            $added++;
+        }
+        return response()->json(['added' => $added, 'skipped' => $skipped,
+            'message' => "{$added} GIF(s) added" . ($skipped ? ', ' . count($skipped) . ' not added' : '') . '.']);
+    }
+
+    /* GET /messenger/giphy?q=&offset=   GIPHY search / trending, cached 10 min (the free key allows ~100 calls an hour) */
+    public function giphy(Request $request)
+    {
+        $this->me($request);
+        $key = config('services.giphy.key');
+        if (!$key) return response()->json(['ready' => false, 'items' => [], 'more' => false]);
+        $q = mb_substr(trim((string) $request->query('q', '')), 0, 50);
+        $offset = max(0, min(4975, (int) $request->query('offset', 0)));
+        $rating = in_array(config('services.giphy.rating'), ['g', 'pg', 'pg-13'], true) ? config('services.giphy.rating') : 'pg';
+        $limit = 24;
+
+        try {
+            $data = Cache::remember('giphy:' . md5(strtolower($q) . "|{$offset}|{$rating}"), now()->addMinutes(10), function () use ($key, $q, $offset, $rating, $limit) {
+                $r = Http::timeout(8)->get('https://api.giphy.com/v1/gifs/' . ($q === '' ? 'trending' : 'search'), array_filter([
+                    'api_key' => $key, 'q' => $q ?: null, 'limit' => $limit, 'offset' => $offset, 'rating' => $rating, 'lang' => 'en',
+                ], fn ($v) => $v !== null))->throw()->json();
+                return [
+                    'items' => collect($r['data'] ?? [])->map(function ($g) {
+                        $img = $g['images'] ?? [];
+                        $send = $img['downsized_medium']['url'] ?? $img['fixed_height']['url'] ?? $img['original']['url'] ?? null;
+                        $thumb = $img['fixed_width_downsampled']['url'] ?? $img['fixed_width']['url'] ?? $send;
+                        if (!$send) return null;
+                        return [
+                            'id' => (string) $g['id'],
+                            'title' => trim(preg_replace('/\s+GIF.*$/i', '', (string) ($g['title'] ?? ''))),
+                            'url' => strtok($send, '?'),     // clean link (no tracking query)
+                            'thumb' => $thumb,
+                            'w' => (int) ($img['fixed_width']['width'] ?? 200),
+                            'h' => (int) ($img['fixed_width']['height'] ?? 150),
+                        ];
+                    })->filter()->values()->all(),
+                    'total' => (int) ($r['pagination']['total_count'] ?? 0),
+                ];
+            });
+        } catch (\Throwable $e) {
+            report($e);
+            $status = $e instanceof \Illuminate\Http\Client\RequestException ? $e->response->status() : 0;
+            $why = match (true) {
+                $status === 401 || $status === 403 => 'The GIPHY_API_KEY is wrong.',
+                $status === 429 => 'GIPHY limit reached for this hour. Try again later (or use a GIPHY production key).',
+                str_contains($e->getMessage(), 'cURL error 60') => 'SSL problem on this PC (cURL error 60): set curl.cainfo in php.ini.',
+                default => "Couldn't reach GIPHY right now.",
+            };
+            return response()->json(['ready' => true, 'items' => [], 'more' => false, 'error' => $why]);
+        }
+        return response()->json(['ready' => true, 'items' => $data['items'], 'more' => $offset + $limit < min($data['total'], 5000), 'next' => $offset + $limit]);
+    }
+
+    /* DELETE /messenger/gifs/{id}   only the one who added it */
+    public function removeGif(Request $request, int $id)
+    {
+        $me = $this->me($request);
+        $g = DB::table('t_msg_gif')->where('id', $id)->first();
+        abort_unless($g, 404, 'GIF not found.');
+        abort_unless((int) $g->added_by === $me, 403, 'Only the one who added this GIF can remove it.');
+        DB::table('t_msg_gif')->where('id', $id)->delete();
+        return response()->json(['message' => 'GIF removed.']);
     }
 
     /* POST /messenger/conversations/{id}/pin {pinned}   pin / unpin in MY list */
@@ -711,6 +949,98 @@ class MessengerController extends Controller
         return response()->json(['message_id' => $id, 'reactions' => $reactions]);
     }
 
+    /** pinned messages of a chat, newest pin first (max 20) */
+    private function pinnedOf(int $conversationId): array
+    {
+        if (!Schema::hasColumn('t_msg_message', 'pinned_at')) return [];
+        $rows = DB::table('t_msg_message')->where('conversation_id', $conversationId)->whereNotNull('pinned_at')->whereNull('deleted_at')
+            ->orderByDesc('pinned_at')->limit(20)->get();
+        $this->loadPeople(array_merge($rows->pluck('employee_id')->filter()->all(), $rows->pluck('pinned_by')->filter()->all()));
+        return $rows->map(fn ($m) => [
+            'id' => (int) $m->id,
+            'type' => $m->type,
+            'text' => $m->type === 'image' ? 'Photo' : ($m->type === 'file' ? (string) $m->file_name : ($m->type === 'sticker' ? 'Sticker' : ($m->type === 'gif' ? 'GIF' : Str::limit((string) $m->body, 120)))),
+            'sticker' => $m->type === 'sticker' ? $m->body : null,
+            'image' => $m->type === 'image' ? $this->url($m->file_key) : ($m->type === 'gif' ? $m->body : null),
+            'sender' => $this->name($m->employee_id ? (int) $m->employee_id : null),
+            'pinned_by' => $this->name($m->pinned_by ? (int) $m->pinned_by : null),
+            'pinned_at' => $this->iso($m->pinned_at),
+            'time' => $this->iso($m->created_at),
+        ])->values()->all();
+    }
+
+    /* POST /messenger/messages/{id}/pin {pinned}   anyone in the chat can pin / unpin (like FB) */
+    public function pinMessage(Request $request, int $id)
+    {
+        $me = $this->me($request);
+        abort_unless(Schema::hasColumn('t_msg_message', 'pinned_at'), 422, 'Run php artisan migrate first (pinned messages).');
+        $on = (bool) $request->validate(['pinned' => ['required', 'boolean']])['pinned'];
+        $m = DB::table('t_msg_message')->where('id', $id)->first();
+        abort_unless($m && !$m->deleted_at && $m->type !== 'system', 404, 'Message not found.');
+        $cid = (int) $m->conversation_id;
+        $this->member($cid, $me);
+
+        if ($on !== !empty($m->pinned_at)) {
+            DB::table('t_msg_message')->where('id', $id)->update(['pinned_at' => $on ? now() : null, 'pinned_by' => $on ? $me : null, 'updated_at' => now()]);
+            $this->loadPeople([$me]);
+            $this->system($cid, $this->name($me) . ($on ? ' pinned a message.' : ' unpinned a message.'));
+            $this->pushChanged($cid);
+        }
+        return $this->show($request, $cid);
+    }
+
+    /* POST /messenger/messages/{id}/forward {conversation_id | employee_id}   a copy of the message (photo / file copied too) */
+    public function forward(Request $request, int $id)
+    {
+        $me = $this->me($request);
+        $d = $request->validate(['conversation_id' => ['nullable', 'integer'], 'employee_id' => ['nullable', 'integer']]);
+        $m = DB::table('t_msg_message')->where('id', $id)->first();
+        abort_unless($m && !$m->deleted_at && in_array($m->type, ['text', 'image', 'file', 'sticker', 'gif'], true), 404, 'Message not found.');
+        $this->member((int) $m->conversation_id, $me);          // I can see the original
+
+        // where to: an existing chat of mine, or a person (direct chat, created if needed)
+        $to = (int) ($d['conversation_id'] ?? 0);
+        if (!$to && !empty($d['employee_id'])) {
+            $other = (int) $d['employee_id'];
+            abort_if($other === $me, 422, "You can't forward to yourself.");
+            abort_unless($this->employeeOk([$other]), 422, 'Employee not found.');
+            $key = min($me, $other) . '-' . max($me, $other);
+            $to = (int) DB::table('t_msg_conversation')->where('direct_key', $key)->value('id');
+            if (!$to) {
+                $to = DB::transaction(function () use ($me, $other, $key) {
+                    $cid = DB::table('t_msg_conversation')->insertGetId(['is_group' => 0, 'direct_key' => $key, 'created_by' => $me, 'created_at' => now(), 'updated_at' => now()]);
+                    foreach ([$me, $other] as $e) DB::table('t_msg_member')->insert(['conversation_id' => $cid, 'employee_id' => $e, 'created_at' => now(), 'updated_at' => now()]);
+                    return $cid;
+                });
+            }
+        }
+        abort_unless($to, 422, 'Pick a chat or a person.');
+        $this->member($to, $me);
+
+        // photo / file: its own copy, so unsending the original doesn't break this one
+        $fileKey = null;
+        if ($m->file_key) {
+            $ext = pathinfo($m->file_key, PATHINFO_EXTENSION) ?: 'bin';
+            $fileKey = "Messenger/{$to}" . ($m->type === 'file' ? '/files' : '') . '/' . Str::uuid() . ".{$ext}";
+            try { Storage::disk('s3')->copy($m->file_key, $fileKey); } catch (\Throwable $e) { report($e); abort(500, 'Could not copy the file.'); }
+        }
+
+        $newId = DB::transaction(function () use ($to, $me, $m, $fileKey) {
+            $row = ['conversation_id' => $to, 'employee_id' => $me, 'type' => $m->type, 'body' => $m->body,
+                'file_key' => $fileKey, 'file_name' => $m->file_name, 'file_size' => $m->file_size, 'created_at' => now(), 'updated_at' => now()];
+            if (Schema::hasColumn('t_msg_message', 'forwarded')) $row['forwarded'] = 1;
+            $nid = DB::table('t_msg_message')->insertGetId($row);
+            DB::table('t_msg_conversation')->where('id', $to)->update(['last_message_at' => now(), 'updated_at' => now()]);
+            DB::table('t_msg_member')->where('conversation_id', $to)->where('employee_id', $me)->update(['last_read_id' => $nid]);
+            return $nid;
+        });
+
+        $this->loadPeople([$me]);
+        $rows = $this->rows(DB::table('t_msg_message')->where('id', $newId)->get(), $me);
+        $this->push(array_diff($this->activeIds($to), [$me]), 'message', ['conversation_id' => $to, 'messages' => $rows]);
+        return response()->json(['conversation_id' => $to, 'messages' => $rows]);
+    }
+
     /* DELETE /messenger/messages/{id}   unsend my own message */
     public function unsend(Request $request, int $id)
     {
@@ -718,7 +1048,8 @@ class MessengerController extends Controller
         $m = DB::table('t_msg_message')->where('id', $id)->first();
         abort_unless($m && (int) $m->employee_id === $me && !$m->deleted_at, 404, 'Message not found.');
         $this->member((int) $m->conversation_id, $me);
-        DB::table('t_msg_message')->where('id', $id)->update(['deleted_at' => now(), 'body' => null, 'updated_at' => now()]);
+        DB::table('t_msg_message')->where('id', $id)->update(array_merge(['deleted_at' => now(), 'body' => null, 'updated_at' => now()],
+            Schema::hasColumn('t_msg_message', 'pinned_at') ? ['pinned_at' => null, 'pinned_by' => null] : []));
         if (Schema::hasTable('t_msg_reaction')) DB::table('t_msg_reaction')->where('message_id', $id)->delete();
         if ($m->file_key) {
             try { Storage::disk('s3')->delete($m->file_key); } catch (\Throwable) { /* keep going */ }

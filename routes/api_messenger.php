@@ -10,6 +10,10 @@ use Illuminate\Support\Facades\Route;
 Route::prefix('messenger')->controller(MessengerController::class)->group(function () {
     Route::get('summary', 'summary');
     Route::get('people', 'people');
+    Route::get('gifs', 'gifs');
+    Route::get('giphy', 'giphy');
+    Route::post('gifs', 'addGifs');
+    Route::delete('gifs/{id}', 'removeGif')->whereNumber('id');
     Route::post('pusher-auth', 'pusherAuth');
     Route::get('conversations', 'conversations');
     Route::post('direct', 'direct');
@@ -23,7 +27,11 @@ Route::prefix('messenger')->controller(MessengerController::class)->group(functi
     Route::delete('conversations/{id}/members/{employee}', 'removeMember')->whereNumber(['id', 'employee']);
     Route::put('conversations/{id}/members/{employee}/admin', 'setAdmin')->whereNumber(['id', 'employee']);
     Route::get('conversations/{id}/shared', 'shared')->whereNumber('id');
+    Route::get('conversations/{id}/search', 'search')->whereNumber('id');
+    Route::put('conversations/{id}/customize', 'customize')->whereNumber('id');
     Route::post('conversations/{id}/pin', 'pin')->whereNumber('id');
     Route::post('messages/{id}/react', 'react')->whereNumber('id');
+    Route::post('messages/{id}/pin', 'pinMessage')->whereNumber('id');
+    Route::post('messages/{id}/forward', 'forward')->whereNumber('id');
     Route::delete('messages/{id}', 'unsend')->whereNumber('id');
 });
