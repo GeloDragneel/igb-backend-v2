@@ -2597,7 +2597,8 @@ class MobileController extends Controller
                 'file_size' => $file->getSize(),
             ]);
         } catch (Throwable $e) {
-            return $fail($e->getMessage());
+            report($e);                               // full error in storage/logs/laravel.log
+            return $fail($this->s3Reason($e));
         }
     }
 
@@ -2653,6 +2654,31 @@ class MobileController extends Controller
     private function tmpPath(\Illuminate\Http\UploadedFile $file): string
     {
         return (string) ($file->getRealPath() ?: $file->getPathname());
+    }
+
+    /** short, readable reason for an S3 / network failure (full error still goes to laravel.log) */
+    private function s3Reason(Throwable $e): string
+    {
+        $msg = $e->getMessage();
+        if ($e instanceof \Aws\Exception\AwsException) {
+            $code = (string) $e->getAwsErrorCode();
+            $aws = (string) $e->getAwsErrorMessage();
+            $hint = match ($code) {
+                'InvalidAccessKeyId', 'SignatureDoesNotMatch' => 'AWS key / secret in .env is wrong',
+                'AccessDenied' => 'these AWS keys may not write to the bucket (needs s3:PutObject)',
+                'PermanentRedirect', 'AuthorizationHeaderMalformed' => 'wrong AWS region in .env (should be ap-southeast-1)',
+                'NoSuchBucket' => 'the bucket name in .env is wrong',
+                'AccessControlListNotSupported' => 'the bucket does not allow ACLs',
+                default => '',
+            };
+            if ($code !== '') return "S3 {$code}: {$aws}" . ($hint ? " ({$hint})" : '');
+        }
+        if (preg_match('/cURL error (\d+)/', $msg, $m)) {
+            return $m[1] === '60'
+                ? 'S3 SSL error (cURL 60): set curl.cainfo / openssl.cafile to cacert.pem in the server php.ini, then restart IIS'
+                : "S3 network error (cURL {$m[1]}): the server could not reach Amazon S3";
+        }
+        return mb_substr($msg, 0, 300);
     }
 
     /** contents of an uploaded file (works even when its path can't be opened) */
