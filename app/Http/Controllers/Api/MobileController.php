@@ -78,6 +78,27 @@ class MobileController extends Controller
         return array_intersect_key($row, array_flip($this->cols($table)));
     }
 
+    /**
+     * only() + a blank value for every NOT NULL column that has no default and wasn't given
+     * (so an insert never fails with "Field 'x' doesn't have a default value")
+     */
+    private function onlyFilled(string $table, array $row): array
+    {
+        $row = $this->only($table, $row);
+        foreach (Schema::getColumns($table) as $c) {
+            $name = $c['name'];
+            if (array_key_exists($name, $row) || $c['nullable'] || $c['default'] !== null || !empty($c['auto_increment'])) continue;
+            $t = strtolower((string) ($c['type_name'] ?? $c['type'] ?? ''));
+            $row[$name] = match (true) {
+                str_contains($t, 'int') || str_contains($t, 'dec') || str_contains($t, 'float') || str_contains($t, 'double') || str_contains($t, 'bit') => 0,
+                $t === 'date' => now()->toDateString(),
+                str_contains($t, 'time') => now(),
+                default => '',
+            };
+        }
+        return $row;
+    }
+
     private function err(string $message, array $extra = []): JsonResponse
     {
         return response()->json(['result' => 'Error', 'message' => $message] + $extra);
@@ -2566,9 +2587,9 @@ class MobileController extends Controller
             if (!$url) return $fail('S3 upload failed');
 
             [$id, $notifId, $message] = DB::transaction(function () use ($r, $dbName, $type, $userId, $caid, $daid, $auid, $employeeId, $acc, $label) {
-                $id = DB::table('t_mobile_transaction')->insertGetId($this->only('t_mobile_transaction', [
+                $id = DB::table('t_mobile_transaction')->insertGetId($this->onlyFilled('t_mobile_transaction', [
                     'filename' => $dbName, 'trans_type' => $type, 'added_by' => $userId,
-                    'account_code' => (string) $r->input('accountCode', ''), 'reference' => '',
+                    'account_code' => (string) $r->input('accountCode', ''), 'reference' => '', 'reference_no' => '',
                     'assigned_daid' => $daid, 'assigned_auid' => $auid, 'assigned_auditor_id' => $auid,
                     'employee_id' => $employeeId, 'trans_status' => 0,
                     'created_at' => now(), 'updated_at' => now(),
