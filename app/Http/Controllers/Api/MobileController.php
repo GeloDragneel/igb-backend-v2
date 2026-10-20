@@ -127,7 +127,7 @@ class MobileController extends Controller
         $res = $s3->putObject([
             'Bucket' => config('filesystems.disks.s3.bucket') ?: 'igb-fems-files-singapore',
             'Key' => "$folder/$name",
-            'SourceFile' => $file->getRealPath(),
+            'Body' => $this->fileBody($file),
             'ContentType' => $file->getMimeType(),
         ]);
         return !empty($res['ObjectURL']) ? $name : null;
@@ -2562,7 +2562,7 @@ class MobileController extends Controller
         $dbName = "{$ext}{$stamp}.{$fileExt}";
 
         try {
-            $url = $this->putS3($file->getRealPath(), "{$folder}/{$s3Name}", 'application/pdf');
+            $url = $this->putS3(null, "{$folder}/{$s3Name}", 'application/pdf', $this->fileBody($file));
             if (!$url) return $fail('S3 upload failed');
 
             [$id, $notifId, $message] = DB::transaction(function () use ($r, $dbName, $type, $userId, $caid, $daid, $auid, $employeeId, $acc, $label) {
@@ -2613,13 +2613,13 @@ class MobileController extends Controller
         if ($comId === '' || $id === '') return $fail('Missing comId or id');
         if ($file->getSize() > 10 * 1024 * 1024) return $fail('File too large. Maximum size is 10MB.');
 
-        $info = @getimagesize($file->getRealPath());
+        $info = @getimagesize($this->tmpPath($file));
         if ($info === false) return $fail('Invalid image file');
         $image = match ($info[2]) {
-            IMAGETYPE_JPEG => @imagecreatefromjpeg($file->getRealPath()),
-            IMAGETYPE_PNG => @imagecreatefrompng($file->getRealPath()),
-            IMAGETYPE_GIF => @imagecreatefromgif($file->getRealPath()),
-            IMAGETYPE_WEBP => @imagecreatefromwebp($file->getRealPath()),
+            IMAGETYPE_JPEG => @imagecreatefromjpeg($this->tmpPath($file)),
+            IMAGETYPE_PNG => @imagecreatefrompng($this->tmpPath($file)),
+            IMAGETYPE_GIF => @imagecreatefromgif($this->tmpPath($file)),
+            IMAGETYPE_WEBP => @imagecreatefromwebp($this->tmpPath($file)),
             default => null,
         };
         if ($image === null) return $fail('Unsupported image format');
@@ -2646,6 +2646,27 @@ class MobileController extends Controller
     }
 
     /** S3 putObject from a file path or raw body → ObjectURL */
+    /**
+     * path of an uploaded temp file. getRealPath() is empty on IIS when the web user can't list the temp folder,
+     * so fall back to the plain temp path PHP gave us.
+     */
+    private function tmpPath(\Illuminate\Http\UploadedFile $file): string
+    {
+        return (string) ($file->getRealPath() ?: $file->getPathname());
+    }
+
+    /** contents of an uploaded file (works even when its path can't be opened) */
+    private function fileBody(\Illuminate\Http\UploadedFile $file): string
+    {
+        $path = $this->tmpPath($file);
+        $data = $path !== '' ? @file_get_contents($path) : false;
+        if ($data === false || $data === '') $data = $file->get();     // last try through Laravel
+        if ($data === false || $data === '' || $data === null) {
+            throw new \RuntimeException('The server could not read the uploaded file (check upload_tmp_dir permissions in php.ini).');
+        }
+        return $data;
+    }
+
     private function putS3(?string $path, string $key, string $contentType, ?string $body = null, ?string $acl = null): ?string
     {
         $s3 = new S3Client([

@@ -469,6 +469,19 @@ class MessengerController extends Controller
         ];
     }
 
+    /**
+     * uploaded file → S3 at $key (returns the key, or null). Reads the bytes itself: on IIS getRealPath() can be empty
+     * ("unable to open \"\" … path must not be empty"), which breaks putFileAs.
+     */
+    private function putUpload(string $key, \Illuminate\Http\UploadedFile $f): ?string
+    {
+        $path = (string) ($f->getRealPath() ?: $f->getPathname());
+        $data = $path !== '' ? @file_get_contents($path) : false;
+        if ($data === false || $data === '') $data = $f->get();
+        abort_if($data === false || $data === '' || $data === null, 500, 'The server could not read the uploaded file (check upload_tmp_dir in php.ini).');
+        return Storage::disk('s3')->put($key, $data, ['ContentType' => $f->getMimeType() ?: 'application/octet-stream']) ? $key : null;
+    }
+
     /* POST /messenger/conversations/{id}/messages   multipart: body?, images[]? */
     public function send(Request $request, int $id)
     {
@@ -501,13 +514,13 @@ class MessengerController extends Controller
         $stored = [];
         foreach ($files as $f) {
             $ext = strtolower($f->getClientOriginalExtension() ?: $f->extension() ?: 'jpg');
-            $key = Storage::disk('s3')->putFileAs("Messenger/{$id}", $f, Str::uuid() . ".{$ext}");
+            $key = $this->putUpload("Messenger/{$id}/" . Str::uuid() . ".{$ext}", $f);
             abort_unless($key, 500, 'Could not upload the photo.');
             $stored[] = [$key, mb_substr($f->getClientOriginalName(), 0, 255), (int) $f->getSize(), 'image'];
         }
         foreach ($docs as $f) {
             $ext = strtolower($f->getClientOriginalExtension() ?: $f->extension() ?: 'bin');
-            $key = Storage::disk('s3')->putFileAs("Messenger/{$id}/files", $f, Str::uuid() . ".{$ext}");
+            $key = $this->putUpload("Messenger/{$id}/files/" . Str::uuid() . ".{$ext}", $f);
             abort_unless($key, 500, 'Could not upload the file.');
             $stored[] = [$key, mb_substr($f->getClientOriginalName(), 0, 255), (int) $f->getSize(), 'file'];
         }

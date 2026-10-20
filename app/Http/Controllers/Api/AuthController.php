@@ -140,7 +140,6 @@ class AuthController extends Controller
         if (!in_array($type, ['Staff', 'ClientStaff'], true)) {
             return response()->json(['switch' => false, 'only' => 'fems', 'all' => false, 'paths' => []]);
         }
-
         $switch = true;
         if ($type === 'Staff') {
             $switch = $this->staffAlwaysSwitch($user) || $this->staffHasClients($user);
