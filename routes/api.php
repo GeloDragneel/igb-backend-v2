@@ -35,6 +35,7 @@ use App\Http\Controllers\Api\ProfileController;
 use App\Http\Controllers\Api\HRDashboardController;
 use App\Http\Controllers\Api\AdministrationController;
 use App\Http\Controllers\Api\PrintController;
+use App\Http\Controllers\Api\NotificationController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -695,6 +696,11 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/billing/soa/{transNumber}/print/{type}', [PrintController::class, 'billingSoaPrint']);
     Route::get('/billing/return-ar/{transNumber}/print', [PrintController::class, 'returnArPrint']);
     Route::get('/billing/deposit/r1', [PrintController::class, 'depositR1Print']);
+
+    Route::get('/notifications', [NotificationController::class, 'index']);
+    Route::put('/notifications/read', [NotificationController::class, 'read']);
+    Route::put('/notifications/read-all', [NotificationController::class, 'readAll']);    
+
 });
 
    require __DIR__ . '/api_mobile.php';

@@ -1161,6 +1161,11 @@ class ClientController extends Controller
             ]);
         });
 
+        // bell notice to the newly assigned DA / Auditor
+        $label = trim(trim((string) $acc->branch_code) . ' ' . trim((string) $acc->trade_name));
+        if ($newDa && $newDa !== $oldDa) NotificationController::send($newDa, "You are now the DA of {$label}", 'Assigned', $id);
+        if ($newAu && $newAu !== $oldAu) NotificationController::send($newAu, "You are now the Auditor of {$label}", 'Assigned', $id);
+
         return response()->json(['message' => 'Assigned DA / Auditor saved.', 'da_id' => $newDa, 'auditor_id' => $newAu]);
     }
 }
