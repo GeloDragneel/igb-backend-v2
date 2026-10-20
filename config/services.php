@@ -35,6 +35,18 @@ return [
         ],
     ],
 
+    'pusher' => [
+        'key'     => env('PUSHER_APP_KEY'),
+        'secret'  => env('PUSHER_APP_SECRET'),
+        'app_id'  => env('PUSHER_APP_ID'),
+        'cluster' => env('PUSHER_APP_CLUSTER', 'ap1'),
+    ],
+
+    'ai' => [
+        'provider' => env('AI_PROVIDER', 'openai'),   // openai | anthropic
+        'key'      => env('AI_API_KEY'),
+        'model'    => env('AI_MODEL'), // empty   gpt-4o-mini (openai) / claude-haiku-4-5-20251001 (anthropic)
+    ],
     'billing' => ['added_by_ca_id' => env('BILLING_ADDED_BY_CAID')],
 
 ];

@@ -36,6 +36,7 @@ use App\Http\Controllers\Api\HRDashboardController;
 use App\Http\Controllers\Api\AdministrationController;
 use App\Http\Controllers\Api\PrintController;
 use App\Http\Controllers\Api\NotificationController;
+use App\Http\Controllers\Api\AiAssistantController; 
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -701,6 +702,11 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::put('/notifications/read', [NotificationController::class, 'read']);
     Route::put('/notifications/read-all', [NotificationController::class, 'readAll']);    
 
+    Route::get('/ai/messages', [AiAssistantController::class, 'index']);
+    Route::post('/ai/messages', [AiAssistantController::class, 'store']);
+    Route::delete('/ai/messages', [AiAssistantController::class, 'destroy']);
+
+    require __DIR__ . '/api_messenger.php';
 });
 
-   require __DIR__ . '/api_mobile.php';
+require __DIR__ . '/api_mobile.php';

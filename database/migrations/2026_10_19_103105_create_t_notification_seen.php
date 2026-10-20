@@ -1,27 +1,14 @@
 <?php
 
 use Illuminate\Database\Migrations\Migration;
-use Illuminate\Database\Schema\Blueprint;
-use Illuminate\Support\Facades\Schema;
 
+/**
+ * Replaced by 2026_10_20_140001_create_t_notification_live_read.
+ * t_notification_seen already existed in the database (another feature), so this does nothing –
+ * and its rollback does nothing too, so that table is never dropped.
+ */
 return new class extends Migration
 {
-    /**
-     * Run the migrations.
-     */
-    public function up(): void
-    {
-        Schema::create('t_notification_seen', function (Blueprint $table) {
-            $table->id();
-            $table->timestamps();
-        });
-    }
-
-    /**
-     * Reverse the migrations.
-     */
-    public function down(): void
-    {
-        Schema::dropIfExists('t_notification_seen');
-    }
+    public function up(): void {}
+    public function down(): void {}
 };

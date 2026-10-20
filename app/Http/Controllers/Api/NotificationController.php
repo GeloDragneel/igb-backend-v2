@@ -17,7 +17,7 @@ use Illuminate\Support\Facades\Schema;
  *   saved  t_notification rows sent to my employee (to_emp_id) – can be marked read
  *          (scan uploads from the app, assigned clients, leave / OT decisions …)
  *   live   counted from the data every time, gone when the work is done
- *          (read = t_notification_seen: unread again when the count goes up):
+ *          (read = t_notification_live_read: unread again when the count goes up):
  *            DA (3)                      pending scans · reverted sales / purchases / expenses   (assigned_daid = me)
  *            Auditor (5) / Supervisor (10) sales / purchases / expenses for audit              (assigned_auid = me)
  *            CEO / Supervisor / IT / CFO   leave and overtime requests waiting for approval
@@ -117,7 +117,7 @@ class NotificationController extends Controller
         ]);
     }
 
-    /* PUT /notifications/read  { key }   one item: saved "n<id>" → t_notification.is_read, live → t_notification_seen */
+    /* PUT /notifications/read  { key }   one item: saved "n<id>" → t_notification.is_read, live → t_notification_live_read */
     public function read(Request $request)
     {
         [$emp, $designation, $caid] = $this->who($request) ?? abort(403, 'Not available for this login.');
@@ -145,14 +145,14 @@ class NotificationController extends Controller
         return response()->json(['message' => 'All marked as read.']);
     }
 
-    /* ---------------- read state of live items (t_notification_seen) ---------------- */
+    /* ---------------- read state of live items (t_notification_live_read) ---------------- */
 
     /** remember the count I have seen for each item */
     private function markSeen(int $emp, array $items): void
     {
-        if (!Schema::hasTable('t_notification_seen')) return;
+        if (!Schema::hasTable('t_notification_live_read')) return;
         foreach ($items as $it) {
-            DB::table('t_notification_seen')->updateOrInsert(
+            DB::table('t_notification_live_read')->updateOrInsert(
                 ['employee_id' => $emp, 'item_key' => $it['key']],
                 ['seen_count' => $it['n'], 'updated_at' => now(), 'created_at' => now()]
             );
@@ -165,15 +165,15 @@ class NotificationController extends Controller
      */
     private function withSeen(int $emp, array $items): array
     {
-        if (!Schema::hasTable('t_notification_seen')) return $items;
-        $seen = DB::table('t_notification_seen')->where('employee_id', $emp)->pluck('seen_count', 'item_key')->map(fn ($v) => (int) $v)->all();
+        if (!Schema::hasTable('t_notification_live_read')) return $items;
+        $seen = DB::table('t_notification_live_read')->where('employee_id', $emp)->pluck('seen_count', 'item_key')->map(fn ($v) => (int) $v)->all();
         $now = collect($items)->pluck('n', 'key')->all();
 
         foreach ($seen as $key => $count) {
             if (!isset($now[$key])) {
-                DB::table('t_notification_seen')->where('employee_id', $emp)->where('item_key', $key)->delete();
+                DB::table('t_notification_live_read')->where('employee_id', $emp)->where('item_key', $key)->delete();
             } elseif ($now[$key] < $count) {
-                DB::table('t_notification_seen')->where('employee_id', $emp)->where('item_key', $key)->update(['seen_count' => $now[$key], 'updated_at' => now()]);
+                DB::table('t_notification_live_read')->where('employee_id', $emp)->where('item_key', $key)->update(['seen_count' => $now[$key], 'updated_at' => now()]);
                 $seen[$key] = $now[$key];
             }
         }
