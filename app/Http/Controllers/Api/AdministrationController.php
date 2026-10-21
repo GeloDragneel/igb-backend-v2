@@ -862,6 +862,68 @@ class AdministrationController extends Controller
         ]);
     }
 
+    /**
+     * GET /admin/user-access/{id}/clients
+     * every client account + whether this staff's employee has a login there (m_user_client_staff.employee_id),
+     * and whether they are the assigned DA / Auditor of it
+     */
+    public function userAccessClients(Request $request, int $id)
+    {
+        $this->staffOnly($request);
+        $staff = DB::table('m_user_staff')->where('id', $id)->first();
+        abort_unless($staff, 404, 'Staff login not found.');
+        $empId = Schema::hasTable('m_employee') && isset($staff->comid)
+            ? (int) DB::table('m_employee')->where('com_id', $staff->comid)->value('id') : 0;
+
+        $da = $this->pick('m_client_account', ['assigned_daid', 'assigned_da_id']);
+        $au = $this->pick('m_client_account', ['assigned_auid', 'assigned_auditor_id']);
+        $hasClient = Schema::hasTable('m_client');
+        $logins = $empId && Schema::hasTable('m_user_client_staff')
+            ? DB::table('m_user_client_staff')->where('employee_id', $empId)->get()->groupBy('caid') : collect();
+
+        $rows = DB::table('m_client_account as A')
+            ->when($hasClient, fn ($q) => $q->leftJoin('m_client as C', 'C.client_num', '=', 'A.client_num'))
+            ->orderBy('A.trade_name')->orderBy('A.branch_code')
+            ->get(array_filter([
+                'A.id', 'A.client_num', 'A.trade_name', 'A.branch_code', 'A.branch_type',
+                $this->pick('m_client_account', ['is_active']) ? 'A.is_active' : null,
+                $da ? DB::raw("A.{$da} AS da_id") : null,
+                $au ? DB::raw("A.{$au} AS au_id") : null,
+                DB::raw($hasClient ? "TRIM(CONCAT_WS(' ', C.last_name, C.first_name, C.middle_name)) AS client_name" : "'' AS client_name"),
+            ]))
+            ->map(function ($r) use ($logins, $empId) {
+                $l = ($logins[$r->id] ?? collect())->first();
+                return [
+                    'caid'        => (int) $r->id,
+                    'client_num'  => (string) $r->client_num,
+                    'trade_name'  => (string) $r->trade_name,
+                    'branch_code' => (string) $r->branch_code,
+                    'branch_type' => (string) $r->branch_type,
+                    'client_name' => trim(preg_replace('/\s+/', ' ', (string) $r->client_name)),
+                    'active'      => !isset($r->is_active) || (int) $r->is_active === 1,
+                    'role'        => $empId && (int) ($r->da_id ?? 0) === $empId ? 'DA' : ($empId && (int) ($r->au_id ?? 0) === $empId ? 'Auditor' : null),
+                    'login'       => $l ? [
+                        'id'       => (int) $l->id,
+                        'username' => (string) $l->username,
+                        'active'   => (int) ($l->is_active ?? 0) === 1,
+                        'web'      => (int) ($l->is_web ?? 0) === 1,
+                        'scan'     => (int) ($l->is_scan_suite ?? 0) === 1,
+                        'pos'      => (int) ($l->is_pos ?? 0) === 1,
+                    ] : null,
+                ];
+            })->values();
+
+        return response()->json([
+            'employee_id' => $empId ?: null,
+            'rows'        => $rows,
+            'counts'      => [
+                'all'      => $rows->count(),
+                'login'    => $rows->whereNotNull('login')->count(),
+                'assigned' => $rows->whereNotNull('role')->count(),
+            ],
+        ]);
+    }
+
     /** the sidebar: which Staff pages the logged-in staff can open */
     public function userAccessMine(Request $request)
     {
