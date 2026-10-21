@@ -14,10 +14,13 @@ use Illuminate\Support\Facades\Schema;
 class BranchController extends Controller
 {
     // Designations (m_user_type ids)
-    const DATA_ANALYST = 3;
-    const AUDIT_SUPERVISOR = 10;
-    const SUPERVISOR = 4;
+    const IT_OFFICER = 1;
     const CEO = 2;
+    const DATA_ANALYST = 3;
+    const SUPERVISOR = 4;
+    const AUDIT_SUPERVISOR = 10;
+    /** these see every client account */
+    const SEES_ALL = [self::IT_OFFICER, self::CEO, self::SUPERVISOR, self::AUDIT_SUPERVISOR];
 
     /** GET /api/branches – client accounts the logged-in user can switch between */
     public function index(Request $request)
@@ -34,69 +37,69 @@ class BranchController extends Controller
         return collect();
     }
 
-    /* ---------------- Staff (same rules as the old query) ---------------- */
+    /* ---------------- Staff ----------------
+     * IT OFFICER / CEO / SUPERVISOR / AUDIT SUPERVISOR → every client account.
+     * Everyone else → the client accounts assigned to them (DA or Auditor).
+     * Nothing assigned → their company's own branch (m_employee.company_caid).
+     */
     private function forStaff(UserStaff $user)
     {
-        $emp = Employee::where('com_id', $user->comid)->first();
-        if (!$emp) return [];
+        $emp = DB::table('m_employee')->where('com_id', $user->comid)->first();
+        if (!$emp) return collect();
 
-        $empId       = (int) $emp->id;
-        $designation = (int) $emp->designation_id;
-        $seesAll     = in_array($designation, [self::AUDIT_SUPERVISOR, self::SUPERVISOR, self::CEO], true);
+        $type = (int) ($emp->designation_id ?? 0) ?: (int) ($user->user_type_id ?? 0);
+        $seesAll = in_array($type, self::SEES_ALL, true)
+            || in_array((int) ($user->user_type_id ?? 0), self::SEES_ALL, true);
 
-        $q = $this->base();
-
-        if ($designation === self::DATA_ANALYST) {
-            $q->where('A.assigned_daid', $empId)
-              ->leftJoin('m_employee as C', 'C.id', '=', 'A.assigned_auid')
-              ->leftJoin('m_user_client_staff as D', function ($j) {
-                  $j->on('D.employee_id', '=', 'A.assigned_daid')->on('D.caid', '=', 'A.id');
-              });
-        } elseif ($seesAll) {
-            $q->leftJoin('m_employee as C', 'C.id', '=', 'A.assigned_daid')
-              ->leftJoin('m_user_client_staff as D', function ($j) use ($empId) {
-                  $j->on('D.caid', '=', 'A.id')->where('D.employee_id', '=', $empId);
-              });
-        } else {
-            $q->where('A.assigned_auid', $empId)
-              ->leftJoin('m_employee as C', 'C.id', '=', 'A.assigned_daid')
-              ->leftJoin('m_user_client_staff as D', function ($j) {
-                  $j->on('D.employee_id', '=', 'A.assigned_auid')->on('D.caid', '=', 'A.id');
-              });
-        }
-
-        return $this->finish($q, function ($r) use ($designation, $seesAll, $empId) {
-            return $designation === self::DATA_ANALYST
-                ? (int) $r->assigned_daid
-                : ($seesAll ? $empId : (int) $r->assigned_auid);
-        });
+        return $this->forEmployee((int) $emp->id, $seesAll, (int) ($emp->company_caid ?? 0));
     }
 
     /* ---------------- ClientStaff ----------------
-     * Every account with this username, PLUS – when the login is an employee
-     * (employee_id > 0) – every client account assigned to that employee
-     * as DA (m_client_account.assigned_daid) or Auditor (assigned_auid).
+     * The client accounts assigned to the employee (DA / Auditor) + every account
+     * where the employee has a login in m_user_client_staff.
+     * Nothing at all → the company's own branch.
      */
     private function forClientStaff(UserClientStaff $user)
     {
         $empId = (int) $user->employee_id;
+        $companyCaid = $empId ? (int) DB::table('m_employee')->where('id', $empId)->value('company_caid') : 0;
 
-        $q = $this->base()
-            ->leftJoin('m_user_client_staff as D', function ($j) use ($user) {
-                $j->on('D.caid', '=', 'A.id')
-                  ->where('D.username', '=', $user->username)
-                  ->where('D.is_active', '=', 1);
+        return $this->forEmployee($empId, false, $companyCaid, (string) $user->username, (int) $user->caid);
+    }
+
+    /**
+     * one row per client account, has_login = the employee has a m_user_client_staff row there
+     * (or, for a client staff, a row with the same username)
+     */
+    private function forEmployee(int $empId, bool $seesAll, int $companyCaid, string $username = '', int $ownCaid = 0)
+    {
+        $logins = DB::table('m_user_client_staff')
+            ->where(function ($w) use ($empId, $username) {
+                $w->whereRaw('1 = 0');
+                if ($empId > 0) $w->orWhere('employee_id', $empId);
+                if ($username !== '') $w->orWhere('username', $username);
             })
-            ->leftJoin('m_employee as C', 'C.id', '=', 'A.assigned_daid')
-            ->where(function ($w) use ($empId) {
-                $w->whereNotNull('D.id');
-                if ($empId > 0) {
-                    $w->orWhere('A.assigned_daid', $empId)
-                      ->orWhere('A.assigned_auid', $empId);
-                }
-            });
+            ->groupBy('caid')
+            ->select('caid', DB::raw('MIN(id) as id'), DB::raw('MIN(username) as username'));
 
-        return $this->finish($q, fn ($r) => $empId);
+        $build = function (bool $onlyCompany) use ($logins, $empId, $seesAll, $companyCaid, $ownCaid) {
+            $q = $this->base()
+                ->leftJoinSub($logins, 'D', 'D.caid', '=', 'A.id')
+                ->leftJoin('m_employee as C', 'C.id', '=', 'A.assigned_daid');
+            if ($onlyCompany) return $q->where('A.id', $companyCaid);
+            if ($seesAll) return $q;
+            return $q->where(function ($w) use ($empId, $ownCaid) {
+                $w->whereNotNull('D.id');
+                if ($ownCaid > 0) $w->orWhere('A.id', $ownCaid);
+                if ($empId > 0) $w->orWhere('A.assigned_daid', $empId)->orWhere('A.assigned_auid', $empId);
+            });
+        };
+
+        $rows = $this->finish($build(false), fn ($r) => $empId);
+        if ($rows->isEmpty() && $companyCaid > 0) {
+            $rows = $this->finish($build(true), fn ($r) => $empId);
+        }
+        return $rows;
     }
 
     /* ---------------- Client: every branch with the same client number ---------------- */
@@ -146,6 +149,11 @@ class BranchController extends Controller
             ->orderBy('A.trade_name')
             ->orderBy('A.branch_code')
             ->get()
+            // one row per client account: an employee with several m_user_client_staff rows
+            // for the same account (duplicates) must not list that account 2-3 times
+            ->sortByDesc(fn ($r) => (int) $r->login_id > 0 ? 1 : 0)
+            ->unique('caid')
+            ->sortBy(fn ($r) => $r->trade_name . "\x00" . $r->branch_code)
             ->map(function ($r) use ($employeeIdFor) {
                 $r->employee_id = $employeeIdFor($r);
                 $r->has_login   = (int) $r->login_id > 0;
