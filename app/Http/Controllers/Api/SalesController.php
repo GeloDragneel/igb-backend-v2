@@ -670,6 +670,102 @@ class SalesController extends Controller
             'ticket_no' => $ticketNo,
         ]);
     }
+    /* =====================================================================
+       DOCUMENT NO. ALREADY USED  (Sales / Purchases / Expenses)
+         "123" matches an existing 123 · 123,155,125 · 123-155-125 · 123 155 125 · 123. · 123-
+         (each part of a document no. is compared on its own, separators ignored)
+         → the page shows the matches and asks for a supervisor override to save anyway
+       GET  /{module}/document-check?document_no=&id=
+       POST /{module}/document-override {document_no, id?, username, password} → {token} (10 min)
+       save / store: sends doc_override_token; refused without it when a match exists
+       ===================================================================== */
+
+    /** [master table, party column, trans_type (AP only)] – ApInvoiceController overrides it */
+    protected function docScope(): array
+    {
+        return ['t_sales_invoice_master', 'customer_id', null];
+    }
+
+    /** "123-155 / 125." → ["123", "155", "125"] */
+    protected function docTokens(?string $doc): array
+    {
+        return array_values(array_unique(array_filter(
+            preg_split('/[^0-9A-Za-z]+/', strtoupper(trim((string) $doc))) ?: [],
+            fn ($t) => $t !== ''
+        )));
+    }
+
+    /** invoices of these books whose document no. has one of the same parts (void left out) */
+    protected function docMatches(int $addedBy, ?string $doc, ?int $exceptId)
+    {
+        $tokens = $this->docTokens($doc);
+        if (!$tokens) return collect();
+        [$table, $party, $type] = $this->docScope();
+        $q = DB::table("{$table} as M")
+            ->leftJoin('m_vendor_customer as V', 'V.id', '=', "M.{$party}")
+            ->leftJoin('m_invoice_status as S', 'S.id', '=', 'M.invoice_status_id')
+            ->where('M.added_by', $addedBy)
+            ->where('M.invoice_status_id', '<>', 5)
+            ->whereNotNull('M.document_no')->where('M.document_no', '<>', '')
+            ->when($type, fn ($w) => $w->whereRaw('LOWER(M.trans_type) = ?', [strtolower($type)]))
+            ->when($exceptId, fn ($w) => $w->where('M.id', '<>', $exceptId))
+            ->where(function ($w) use ($tokens) {
+                // tokens are letters / digits only, so they are safe inside the pattern
+                foreach ($tokens as $t) $w->orWhereRaw('UPPER(M.document_no) REGEXP ?', ['(^|[^0-9A-Z])' . $t . '([^0-9A-Z]|$)']);
+            });
+        return $q->orderByDesc('M.transaction_date')->limit(50)->get([
+            'M.id', 'M.invoice_no', 'M.document_no', 'M.transaction_date', 'M.declared_month', 'M.grand_total',
+            DB::raw("COALESCE(V.name, '') AS party"), DB::raw("COALESCE(S.name, '') AS status"),
+        ])->map(fn ($r) => [
+            'id' => (int) $r->id, 'invoice_no' => $r->invoice_no, 'document_no' => $r->document_no,
+            'transaction_date' => substr((string) $r->transaction_date, 0, 10), 'declared_month' => $r->declared_month,
+            'grand_total' => round((float) $r->grand_total, 2), 'party' => $r->party, 'status' => $r->status,
+        ])->values();
+    }
+
+    /** null = ok to save · otherwise the refusal response */
+    protected function docGuard(Request $request, int $addedBy, ?string $doc, ?int $exceptId, ?string $oldDoc = null)
+    {
+        if (trim((string) $doc) === '') return null;
+        // editing without changing the document no. → no new check
+        if ($exceptId && $oldDoc !== null && $this->docTokens($oldDoc) === $this->docTokens($doc)) return null;
+        if ($this->docMatches($addedBy, $doc, $exceptId)->isEmpty()) return null;
+        $tok = (string) $request->input('doc_override_token', '');
+        $ok = $tok !== '' && ($c = Cache::get("doc-ovr:{$tok}"))
+            && (int) $c['by'] === $addedBy && $c['doc'] === $this->docTokens($doc);
+        return $ok ? null : response()->json(['message' => 'Document number already used. A supervisor override is needed to save it.', 'code' => 'duplicate_document'], 422);
+    }
+
+    /* GET /{module}/document-check?document_no=&id= */
+    public function documentCheck(Request $request)
+    {
+        $d = $request->validate(['document_no' => ['nullable', 'string', 'max:100'], 'id' => ['nullable', 'integer']]);
+        $by = (int) $this->addedByFor($request);
+        if (!$by) return response()->json(['matches' => []]);
+        return response()->json(['tokens' => $this->docTokens($d['document_no'] ?? ''), 'matches' => $this->docMatches($by, $d['document_no'] ?? '', $d['id'] ?? null)]);
+    }
+
+    /* POST /{module}/document-override {document_no, username, password} → {token} */
+    public function documentOverride(Request $request)
+    {
+        $d = $request->validate([
+            'document_no' => ['required', 'string', 'max:100'],
+            'username'    => ['required', 'string'],
+            'password'    => ['required', 'string'],
+        ], ['username.required' => 'Username is required', 'password.required' => 'Password is required']);
+        $by = (int) $this->addedByFor($request);
+        abort_unless($by, 422, 'No client account selected.');
+
+        // same supervisors as the Declared Month override (user type 10, active)
+        $sup = UserStaff::where('username', $d['username'])->where('user_type_id', 10)->where('is_active', 1)->first(['id', 'password']);
+        if (!$sup || !\Illuminate\Support\Facades\Hash::check((string) $d['password'], (string) $sup->getRawOriginal('password'))) {
+            return response()->json(['message' => 'User not found'], 422);
+        }
+        $token = \Illuminate\Support\Str::random(40);
+        Cache::put("doc-ovr:{$token}", ['by' => $by, 'doc' => $this->docTokens($d['document_no']), 'supervisor' => (int) $sup->id], now()->addMinutes(10));
+        return response()->json(['token' => $token, 'message' => 'Override approved']);
+    }
+
     public function store(Request $request)
     {
         return $this->save($request, null);
@@ -738,6 +834,11 @@ class SalesController extends Controller
             if ($this->lockedMonth($caid, [$existing->declared_month])) {
                 return response()->json(['message' => 'Declared Month is disabled'], 422);
             }
+        }
+
+        // ---------- document no. already used → supervisor override ----------
+        if (empty($d['scan_action']) && ($refuse = $this->docGuard($request, (int) $addedBy, $d['document_no'] ?? null, $id, $existing->document_no ?? null))) {
+            return $refuse;
         }
 
         // ---------- line amounts (always calculated here) ----------

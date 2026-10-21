@@ -74,6 +74,16 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/sales/override', [SalesController::class, 'override']);
     Route::get('/sales/blank-attachment', [SalesController::class, 'blankAttachment']);
 
+    // routes/api.php – inside the auth:sanctum group.
+    // Put them ABOVE any route like /sales/{id} so "document-check" isn't read as an id.
+    Route::get('/sales/document-check', [SalesController::class, 'documentCheck']);
+    Route::post('/sales/document-override', [SalesController::class, 'documentOverride']);
+    Route::get('/purchases/document-check', [PurchaseController::class, 'documentCheck']);
+    Route::post('/purchases/document-override', [PurchaseController::class, 'documentOverride']);
+    Route::get('/expenses/document-check', [ExpenseController::class, 'documentCheck']);
+    Route::post('/expenses/document-override', [ExpenseController::class, 'documentOverride']);
+
+
     Route::get('/accounts', [ChartOfAccountController::class, 'listAccounts']);
     Route::post('/accounts', [ChartOfAccountController::class, 'storeAccount']);
     Route::put('/accounts/{code}', [ChartOfAccountController::class, 'updateAccount']);

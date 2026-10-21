@@ -55,6 +55,12 @@ abstract class ApInvoiceController extends SalesController
 
     private static array $apColCache = [];
 
+    /** document no. check: purchase / expense invoices of this module */
+    protected function docScope(): array
+    {
+        return [self::M, 'vendor_id', $this->apType];
+    }
+
     protected function apCols(string $table): array
     {
         return self::$apColCache[$table] ??= Schema::getColumnListing($table);
@@ -668,10 +674,9 @@ abstract class ApInvoiceController extends SalesController
         $scanAction = $d['scan_action'] ?? null;
         $record     = $scanAction ? 'invalid' : ($d['trans_type'] ?? 'posted');
 
-        // document number already used (old doGetExistsDocNo)
-        if (!$scanAction && !empty($d['document_no'])
-            && $this->apBase($addedBy)->where('document_no', $d['document_no'])->where('invoice_status_id', '<>', 5)->exists()) {
-            return response()->json(['message' => 'Document number already in use'], 422);
+        // document number already used (123 vs 123-155-125 …) → supervisor override (doc_override_token)
+        if (!$scanAction && ($refuse = $this->docGuard($request, (int) $addedBy, $d['document_no'] ?? null, null))) {
+            return $refuse;
         }
 
         $lineRows = $this->apLineRows($d['lines']);
