@@ -37,6 +37,7 @@ use App\Http\Controllers\Api\AdministrationController;
 use App\Http\Controllers\Api\PrintController;
 use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\AiAssistantController; 
+use App\Http\Controllers\Api\ArchiveController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -725,6 +726,15 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/ai/messages', [AiAssistantController::class, 'index']);
     Route::post('/ai/messages', [AiAssistantController::class, 'store']);
     Route::delete('/ai/messages', [AiAssistantController::class, 'destroy']);
+
+    // inside Route::middleware('auth:sanctum')->group(function () { ... });
+    // STAFF → ARCHIVE (S3 file manager)
+    Route::get('/archive', [ArchiveController::class, 'index']);
+    Route::get('/archive/summary', [ArchiveController::class, 'summary']);
+    Route::get('/archive/file', [ArchiveController::class, 'file']);
+    Route::post('/archive/folder', [ArchiveController::class, 'createFolder']);    // IT Officer
+    Route::put('/archive/folder', [ArchiveController::class, 'renameFolder']);     // IT Officer
+    Route::post('/archive/upload', [ArchiveController::class, 'upload']);          // IT Officer
 
     require __DIR__ . '/api_messenger.php';
 });
