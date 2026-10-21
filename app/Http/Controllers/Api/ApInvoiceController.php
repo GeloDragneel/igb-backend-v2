@@ -917,11 +917,12 @@ abstract class ApInvoiceController extends SalesController
         if (!$scan) return response()->json(['message' => 'Receipt not found.'], 404);
         if ($scan->reference_no) return response()->json(['reference_no' => $scan->reference_no]);
 
-        $key = $this->apScanKey($scan);
+        $key = \Illuminate\Support\Facades\Cache::has("scan-text:{$scan->id}") ? 'cached' : $this->apScanKey($scan);   // no S3 lookups when already read
         if (!$key) return response()->json(['message' => 'File not found in storage.'], 404);
 
         try {
-            $text = $this->scanText($this->apTextract(), $key);
+            // read once, then remembered 7 days: Scan again (or the list's pre-read) answers instantly
+            $text = \Illuminate\Support\Facades\Cache::remember("scan-text:{$scan->id}", now()->addDays(7), fn () => $this->scanText($this->apTextract(), $key));
         } catch (\Throwable $e) {
             report($e);
             return response()->json(['message' => 'Scanning failed: ' . $e->getMessage()], 422);

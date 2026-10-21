@@ -189,6 +189,8 @@ class BirReturnController extends ReportController
         foreach ($out as &$f) {
             $f['filing'] = $filed[$f['filename']] ?? null;
             $f['status'] = $f['filing']['status'] ?? 'not_filed';
+            // Reconciled is checked again now against the CURRENT books (data changed after filing → Not reconciled)
+            if ($f['filing']) $f['filing']['reconciled'] = $this->liveReconciled($request, $f['filename']);
         }
         unset($f);
 
@@ -526,6 +528,32 @@ class BirReturnController extends ReportController
             ];
         }
         return $out;
+    }
+
+    /** the return's amounts vs the books right now: true = same · false = different · null = nothing in the books to compare */
+    private function liveReconciled(Request $request, string $name): ?bool
+    {
+        try {
+            $path = $this->ebirPath('savefile') . '/' . $name;
+            if (!is_file($path)) return null;
+            $parts = explode('-', basename($name, '.xml'));
+            $form = $parts[1] ?? '';
+            [$from, $to] = $this->periodRange($parts[2] ?? '');
+            $chart = $this->chartOf($this->booksOf($request));
+            $lines = $this->entryTemplate($request, $form, $from, $to, $chart, $this->parseSaveFile($path));
+            [, $status] = $this->reconcile($request, $form, $from, $to, $chart, $lines);
+            $live = $status === 'no_books' ? null : $status === 'reconciled';
+
+            // keep the saved flag up to date too
+            if (Schema::hasColumn(self::FILING, 'reconciled')) {
+                DB::table(self::FILING)->where('added_by', $this->booksOf($request))->where('filename', $name)
+                    ->update(['reconciled' => $live, 'updated_at' => now()]);
+            }
+            return $live;
+        } catch (\Throwable $e) {
+            report($e);
+            return null;
+        }
     }
 
     private function filingOf(Request $request, string $name): ?array

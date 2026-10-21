@@ -1310,11 +1310,12 @@ class SalesController extends Controller
             return response()->json(['reference_no' => $scan->reference_no]);
         }
 
-        $key = $this->scanKey($scan);
+        $key = Cache::has("scan-text:{$scan->id}") ? 'cached' : $this->scanKey($scan);   // no S3 lookups when already read
         if (!$key) return response()->json(['message' => 'File not found in storage.'], 404);
 
         try {
-            $text = $this->scanText($this->textract(), $key);
+            // read once, then remembered 7 days: Scan again (or the list's pre-read) answers instantly
+            $text = Cache::remember("scan-text:{$scan->id}", now()->addDays(7), fn () => $this->scanText($this->textract(), $key));
         } catch (\Throwable $e) {
             report($e);
             return response()->json(['message' => 'Scanning failed: ' . $e->getMessage()], 422);

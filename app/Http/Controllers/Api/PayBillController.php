@@ -134,7 +134,7 @@ class PayBillController extends SalesController
         $amount = round((float) $d['amount'], 2);
         $balance = round((float) $inv->grand_total - $this->paid($inv->invoice_no), 2);
         if ($amount > $balance + 0.01) return response()->json(['message' => 'More than the balance (' . number_format($balance, 2) . ').'], 422);
-        if ($this->isLocked($this->caidFor($request), [substr($d['pv_date'], 0, 7)])) return response()->json(['message' => 'Declared Month is disabled'], 422);
+        // no Declared Month lock here: paying a bill doesn't change what was declared
 
         do { $no = 'PV-' . date('ymd-his') . random_int(10000, 99999); } while (DB::table(self::PM)->where('pvoucher_no', $no)->exists());
         try {
@@ -185,7 +185,6 @@ class PayBillController extends SalesController
         $by = $this->addedByFor($request);
         $m = DB::table(self::PM)->where('added_by', $by)->where('pvoucher_no', $pvoucherNo)->first();
         if (!$m) return response()->json(['message' => 'Payment not found.'], 404);
-        if ($this->isLocked($this->caidFor($request), [substr((string) $m->pv_date, 0, 7)])) return response()->json(['message' => 'Declared Month is disabled'], 422);
 
         DB::transaction(function () use ($by, $type, $m) {
             $nos = DB::table(self::PD)->where('pvoucher_no', $m->pvoucher_no)->pluck('ap_invoice_no')->filter()->unique();
