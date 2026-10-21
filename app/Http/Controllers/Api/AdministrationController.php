@@ -76,6 +76,24 @@ class AdministrationController extends Controller
         }
     }
 
+    /**
+     * foreign-key columns: 0 / '' means "nobody" → NULL (MySQL refuses 0, there is no row with id 0).
+     * A NOT NULL foreign-key column is left alone.
+     */
+    private function fkClean(string $table, array $row): array
+    {
+        static $fks = [];
+        if (!isset($fks[$table])) {
+            $nullable = collect(Schema::getColumns($table))->filter(fn ($c) => $c['nullable'])->pluck('name')->flip();
+            $fks[$table] = collect(Schema::getForeignKeys($table))->flatMap(fn ($f) => $f['columns'])
+                ->filter(fn ($c) => isset($nullable[$c]))->unique()->values()->all();
+        }
+        foreach ($fks[$table] as $c) {
+            if (array_key_exists($c, $row) && ($row[$c] === 0 || $row[$c] === '0' || $row[$c] === '')) $row[$c] = null;
+        }
+        return $row;
+    }
+
     /** where the invoice lives: [type, master table, detail table, party column] */
     private function locate(string $referenceNo): ?array
     {
@@ -386,10 +404,47 @@ class AdministrationController extends Controller
         ], fn ($v, $k) => $k !== '' && $v !== null, ARRAY_FILTER_USE_BOTH);
     }
 
+    /**
+     * snapshot of the invoice BEFORE the change → t_ticket_history.
+     * Plain insert (not TicketHistory::create): JSON-encoded here, only real columns,
+     * and NOT NULL columns without a default get an empty value, so it can't fail on the table's setup.
+     */
+    private function saveHistory(object $t, ?object $live, $liveLines): void
+    {
+        $table = (new TicketHistory)->getTable();
+        $json = json_encode(
+            ['master' => (array) $live, 'details' => collect($liveLines)->map(fn ($r) => (array) $r)->all()],
+            JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR
+        );
+        $now = now();
+        $row = $this->only($table, [
+            'ticket_no' => $t->ticket_no, 'reference_no' => $t->reference_no, 'table_data' => $json,
+            'created_at' => $now, 'updated_at' => $now,
+        ]);
+        foreach (Schema::getColumns($table) as $c) {
+            if (array_key_exists($c['name'], $row) || $c['nullable'] || $c['default'] !== null || $c['auto_increment']) continue;
+            $type = strtolower((string) $c['type_name']);
+            $row[$c['name']] = preg_match('/int|decimal|float|double|bit/', $type) ? 0
+                : (preg_match('/date|time/', $type) ? $now : '');
+        }
+        DB::table($table)->insert($row);
+    }
+
     public function ticketApprove(Request $request, string $ticketNo)
     {
         $this->staffOnly($request);
 
+        try {
+            return $this->approveTicket($request, $ticketNo);
+        } catch (\Illuminate\Database\QueryException $e) {
+            // show the real database reason instead of "Server Error" (full error still in laravel.log)
+            report($e);
+            abort(422, 'Could not approve: ' . ($e->errorInfo[2] ?? $e->getMessage()));
+        }
+    }
+
+    private function approveTicket(Request $request, string $ticketNo)
+    {
         return DB::transaction(function () use ($request, $ticketNo) {
             $t = RequestTicket::where('ticket_no', $ticketNo)->lockForUpdate()->latest('id')->first();
             abort_unless($t, 404, 'Ticket not found.');
@@ -404,11 +459,7 @@ class AdministrationController extends Controller
             $now = now();
 
             // 1) snapshot BEFORE the change (old tbl2_history)
-            TicketHistory::create([
-                'ticket_no'    => $t->ticket_no,
-                'reference_no' => $t->reference_no,
-                'table_data'   => ['master' => (array) $live, 'details' => $liveLines->map(fn ($r) => (array) $r)->all()],
-            ]);
+            $this->saveHistory($t, $live, $liveLines);
 
             if ($action === 'VOID') {
                 // 2) VOID (old doVoidInvoice / doVoidAP): status 5, lines removed (they stay in the snapshot)
@@ -429,7 +480,7 @@ class AdministrationController extends Controller
                 // a REVERTED invoice goes back to the auditor as PENDING (old: AuditStatusID 3 → 1)
                 $audit = (int) ($live->audit_status_id ?? 0) === self::AUDIT_REVERTED ? self::AUDIT_PENDING : ($live->audit_status_id ?? null);
                 if ($audit !== null) $m['audit_status_id'] = $audit;
-                DB::table($mt)->where('id', $live->id)->update($this->only($mt, $m));
+                DB::table($mt)->where('id', $live->id)->update($this->fkClean($mt, $this->only($mt, $m)));
 
                 $master = DB::table($mt)->where('id', $live->id)->first();
                 $first = (array) ($liveLines->first() ?? []);
@@ -463,7 +514,11 @@ class AdministrationController extends Controller
                     foreach (['invoice_no', 'added_by', 'invoice_status_id', 'audit_status_id', 'declared_month', 'document_no', 'currency', 'ex_rate'] as $k) {
                         if (isset($master->{$k})) $row[$k] = $master->{$k};
                     }
-                    DB::table($dt)->insert($this->only($dt, $row));
+                    // DA / auditor always from the invoice (the ticket lines may carry 0)
+                    foreach (['assigned_daid', 'assigned_auid'] as $k) {
+                        if (property_exists($master, $k)) $row[$k] = $master->{$k};
+                    }
+                    DB::table($dt)->insert($this->fkClean($dt, $this->only($dt, $row)));
                     $saved++;
                 }
                 abort_if($saved === 0, 422, 'No details inserted');

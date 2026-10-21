@@ -496,6 +496,7 @@ class MessengerController extends Controller
             'reply_to_id' => ['nullable', 'integer'],
             'sticker' => ['nullable', 'string', 'max:40', 'regex:/^(pip|txt|emo):\S{1,32}$/u'],
             'gif' => ['nullable', 'string', 'max:500', 'url:https'],
+            'client_id' => ['nullable', 'string', 'max:40', 'regex:/^t[\w-]+$/'],
         ], [
             'images.*.max' => 'Each photo must be 10 MB or less.', 'images.*.image' => 'Only photos can be sent as photos.',
             'files.*.max' => 'Each file must be 20 MB or less.',
@@ -556,7 +557,9 @@ class MessengerController extends Controller
 
         $this->loadPeople([$me]);
         $rows = $this->rows(DB::table('t_msg_message')->whereIn('id', $newIds)->orderBy('id')->get(), $me);
-        $this->push(array_diff($this->activeIds($id), [$me]), 'message', ['conversation_id' => $id, 'messages' => $rows]);
+        // client_id = the instant copy the sender's browser already showed the others → they swap it for this one
+        $this->push(array_diff($this->activeIds($id), [$me]), 'message',
+            ['conversation_id' => $id, 'messages' => $rows, 'client_id' => $request->input('client_id')]);
         return response()->json(['messages' => $rows]);
     }
 
@@ -730,7 +733,11 @@ class MessengerController extends Controller
     {
         $me = $this->me($request);
         $d = $request->validate(['socket_id' => ['required', 'string'], 'channel_name' => ['required', 'string']]);
-        abort_unless($d['channel_name'] === "private-emp.{$me}", 403, 'Not your channel.');
+        // my own channel, or the channel of a chat I'm in (instant messages / typing between the members)
+        if ($d['channel_name'] !== "private-emp.{$me}") {
+            abort_unless(preg_match('/^private-conv\.(\d+)$/', $d['channel_name'], $m), 403, 'Not your channel.');
+            $this->member((int) $m[1], $me);
+        }
         $p = $this->pusher();
         abort_unless($p, 503, 'Real time is not set up.');
         $json = method_exists($p, 'authorizeChannel') ? $p->authorizeChannel($d['channel_name'], $d['socket_id']) : $p->socket_auth($d['channel_name'], $d['socket_id']);
