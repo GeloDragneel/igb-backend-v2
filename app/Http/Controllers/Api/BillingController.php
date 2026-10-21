@@ -94,17 +94,22 @@ class BillingController extends Controller
         if (!$u) return null;
         $key = get_class($u) . ':' . $u->id;
         if (array_key_exists($key, $cache)) return $cache[$key];
-
-        $ids = [];
+ 
+        $exists = fn ($id) => $id > 0 && DB::table('m_employee')->where('id', $id)->exists();
+ 
+        // 1) employee id on the login (m_user_client_staff.employee_id …)
         foreach (['employee_id', 'emp_id', 'employeeid'] as $k) {
-            $v = $u->getAttribute($k);
-            if (is_numeric($v) && (int) $v > 0) $ids[] = (int) $v;
+            $v = (int) $u->getAttribute($k);
+            if ($exists($v)) return $cache[$key] = $v;
         }
-        if (method_exists($u, 'employee') && ($e = $u->employee)) $ids[] = (int) $e->id;
-        $ids[] = (int) $u->id;                                                         // m_user_staff.id = m_employee.id
-        foreach (array_unique(array_filter($ids)) as $id) {
-            if (DB::table('m_employee')->where('id', $id)->exists()) return $cache[$key] = $id;
+        // 2) staff login: m_user_staff.comid → m_employee.com_id  (same link as everywhere else)
+        foreach (['comid', 'com_id'] as $k) {
+            $c = $u->getAttribute($k);
+            if ($c !== null && $c !== '' && ($id = (int) DB::table('m_employee')->where('com_id', $c)->value('id'))) return $cache[$key] = $id;
         }
+        // 3) relation on the model, if there is one
+        if (method_exists($u, 'employee') && ($e = $u->employee) && $exists((int) $e->id)) return $cache[$key] = (int) $e->id;
+ 
         return $cache[$key] = null;
     }
 

@@ -4926,7 +4926,7 @@ class ReportController extends SalesController
         abort_unless($users, 422, 'This client has no login.');
         $months = $this->vsMonths($from, $to);
         $zero = array_fill_keys($months, 0.0);
-
+ 
         // one bucket per line; "total" also counts rows whose declared month is not a plain YYYY-MM (old Total column)
         $lines = [];
         foreach (['Sales' => ['NetOfVAT', 'VATExempt', 'ZeroRated'], 'Purchases' => ['NetOfVAT', 'VATExempt', 'ZeroRated'],
@@ -4945,7 +4945,7 @@ class ReportController extends SalesController
             foreach ($sum['sales'] as $r) {
                 foreach ($map as $f => $c) $add($lines['Sales'][$c], $r->m, $r->{$f});
                 $add($other['ov'], $r->m, $r->ov);
-                $outputTotal += (float) $r->ov;
+                $outputTotal += (float) $r->ov;   // same figures as the months (Total = sum of the months)
             }
             foreach ($sum['grn'] as $r) {
                 foreach ($map as $f => $c) $add($lines['Purchases'][$c], $r->m, $r->{$f});
@@ -4964,12 +4964,12 @@ class ReportController extends SalesController
         };
         $fold($this->vsEbirSums($users, $from, $to, $adjusted));
         if ($adjusted) $fold($this->vsEbirMoved($users, $from, $to));
-
+ 
         // 2307 (VT) withheld on sales
         $void = self::VS_VOID;
         $in = $this->vsIn($users);
         $ut = $this->vsUndeclaredTable();
-        $vt = ['values' => $adjusted ? null : $zero, 'total' => 0.0];
+        $vt = ['values' => $zero, 'total' => 0.0];   // per month in BOTH views (Original + See adjustment)
         if (!$adjusted) {
             foreach (DB::select("
                 SELECT LEFT(A.`2307_vt_declared_month`, 7) AS m, SUM(A.`2307_vt`) AS v
@@ -4978,19 +4978,24 @@ class ReportController extends SalesController
                   AND A.`2307_vt_declared_month` BETWEEN ? AND ?{$this->vsSalesPosted('A', 't_sales_invoice_master')}
                 GROUP BY LEFT(A.`2307_vt_declared_month`, 7)", [...$users, $from, $to]) as $r) $add($vt, $r->m, $r->v);
         } else {
-            $vt['total'] = (float) DB::selectOne("
-                SELECT
-                  (SELECT COALESCE(SUM(A.`2307_vt`), 0) FROM t_sales_invoice_master A
-                     LEFT JOIN (SELECT DISTINCT reference_no, old_declared_month FROM {$ut} WHERE is_approved = 0) P
-                       ON P.reference_no = A.invoice_no AND P.old_declared_month = A.declared_month
+            // See adjustment, per month: invoices not undeclared → their 2307 VT month · undeclared ones → their NEW month
+            foreach (DB::select("
+                SELECT X.m, SUM(X.v) AS v FROM (
+                    SELECT LEFT(A.`2307_vt_declared_month`, 7) AS m, A.`2307_vt` AS v
+                    FROM t_sales_invoice_master A
+                    LEFT JOIN (SELECT DISTINCT reference_no, old_declared_month FROM {$ut} WHERE is_approved = 0) P
+                      ON P.reference_no = A.invoice_no AND P.old_declared_month = A.declared_month
                     WHERE A.added_by IN ({$in}) AND A.invoice_status_id <> {$void} AND A.`2307_vt` != 0
-                      AND A.`2307_vt_declared_month` BETWEEN ? AND ? AND P.reference_no IS NULL{$this->vsSalesPosted('A', 't_sales_invoice_master')})
-                + (SELECT COALESCE(SUM(A.`2307_vt`), 0) FROM t_sales_invoice_master A
-                     INNER JOIN {$ut} U ON U.reference_no = A.invoice_no AND U.is_approved = 0
+                      AND A.`2307_vt_declared_month` BETWEEN ? AND ? AND P.reference_no IS NULL{$this->vsSalesPosted('A', 't_sales_invoice_master')}
+                    UNION ALL
+                    SELECT LEFT(U.new_declared_month, 7) AS m, A.`2307_vt` AS v
+                    FROM t_sales_invoice_master A
+                    INNER JOIN {$ut} U ON U.reference_no = A.invoice_no AND U.is_approved = 0
                     WHERE A.added_by IN ({$in}) AND A.invoice_status_id <> {$void} AND A.`2307_vt` != 0
-                      AND U.new_declared_month BETWEEN ? AND ?{$this->vsSalesPosted('A', 't_sales_invoice_master')}) AS v", [...$users, $from, $to, ...$users, $from, $to])->v;
+                      AND U.new_declared_month BETWEEN ? AND ?{$this->vsSalesPosted('A', 't_sales_invoice_master')}
+                ) X GROUP BY X.m", [...$users, $from, $to, ...$users, $from, $to]) as $r) $add($vt, $r->m, $r->v);
         }
-
+ 
         // build the table the page shows (old HTML table, same rows)
         $names = ['NetOfVAT' => 'Net of VAT', 'VATExempt' => 'VAT Exempt', 'ZeroRated' => 'Zero Rated'];
         $sections = [];
@@ -5021,13 +5026,13 @@ class ReportController extends SalesController
         $second = isset($months[1]) ? $other['tp']['values'][$months[1]] : 0.0;
         // old CalculateTotalVATPayableExcess(): VAT due − (1st month + 2nd month + 2307 VT), from the 2-decimal figures
         $payable = round($due['total'] - (round($first, 2) + round($second, 2) + round($vt['total'], 2)), 2);
-
+ 
         $clientId = (int) $d['client_id'];
         $pending = DB::table($ut)->where('client_id', $clientId)->whereBetween('old_declared_month', [$from, $to])
             ->where('is_approved', 0)->where('report', 'EBIR')->count();
         $lock = $this->vsLockTable();
         $lockCa = $lock ? $this->vsPick($lock, ['ca_id', 'caid']) : null;
-
+ 
         return response()->json([
             'mode'              => $adjusted ? 'adjusted' : 'initial',
             'months'            => $months,
