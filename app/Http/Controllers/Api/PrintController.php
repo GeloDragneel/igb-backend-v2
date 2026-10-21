@@ -2308,6 +2308,8 @@ class PrintController extends ReportController
     }
     /* ======================= Billing → Deposit: PRINT R1 (old merge.php → PrintR1.odt, view qry2_deposit_r1) ======================= */
     // GET /billing/deposit/r1?date=YYYY-MM-DD   deposited payments of that DEPOSIT date (the date saved by the Deposit button)
+    /* ======================= Billing → Deposit: PRINT R1 (old merge.php → PrintR1.odt, view qry2_deposit_r1) ======================= */
+    // GET /billing/deposit/r1?date=YYYY-MM-DD   deposited payments of that DEPOSIT date (the date saved by the Deposit button)
     public function depositR1Print(Request $request)
     {
         try {
@@ -2351,18 +2353,22 @@ class PrintController extends ReportController
             $rows = $q->orderBy('P.id')->get();
             // like the old merge.php: no rows → still print the R1 (empty list)
 
-            $num = fn ($v) => number_format((float) ($v ?? 0), 2, '.', '');
+            // same as the old PrintR1.php: grouped by collection type → header row, lines (numbered), TOTAL:, then GRAND TOTAL:
             $day = fn ($v) => $v ? substr((string) $v, 0, 10) : '';
-            $total = 0.0;
-            $data = [];
-            foreach ($rows as $i => $r) {
+            $blank = ['payment_id' => '', 'client_name' => '', 'payment_date' => '', 'period' => '', 'amount' => '',
+                'tender' => '', 'details' => '', 'or_num' => '', 'ar_num' => '', 'remarks' => ''];
+            $groups = [];
+            $n = 1;
+            foreach ($rows as $r) {
                 $amount = (float) ($r->amount ?? 0);
                 $co = (float) ($r->co_amount ?? 0);
                 $net = (float) ($r->total_amount ?? 0) ?: $amount - $co;
-                $total += $net;
+                $label = trim((string) ($r->col_type_name ?? '')) ?: 'OTHERS';
+                $groups[$label] ??= ['rows' => [], 'subtotal' => 0.0];
+                $groups[$label]['subtotal'] += $net;
                 // fields used by DepositR1_FINAL.odt:  [r.payment_id;block=tbs:row] [r.client_name] [r.payment_date] ...
-                $data[] = [
-                    'payment_id' => $r->id,
+                $groups[$label]['rows'][] = [
+                    'payment_id' => $n++,
                     'client_name' => trim((string) ($r->trade_name ?? '')) !== '' ? $r->trade_name : ($r->client_last_name ?? ''),
                     'payment_date' => $day($payDate ? ($r->{$payDate} ?? null) : null),
                     'period' => $r->service_period ?? '',
@@ -2374,6 +2380,15 @@ class PrintController extends ReportController
                     'remarks' => $r->remarks ?? '',
                 ];
             }
+            $total = 0.0;
+            $data = [];
+            foreach ($groups as $label => $g) {
+                $data[] = ['payment_id' => $label] + $blank;                                               // group header
+                array_push($data, ...$g['rows']);                                                          // lines
+                $data[] = ['period' => 'TOTAL:', 'amount' => number_format($g['subtotal'], 2)] + $blank;    // subtotal
+                $total += $g['subtotal'];
+            }
+            $data[] = ['period' => 'GRAND TOTAL:', 'amount' => number_format($total, 2)] + $blank;         // footer
 
             $tbs = $this->billingTbs();
             // [onshow.DepSlipNumber]: the deposit slip no(s). of that date
