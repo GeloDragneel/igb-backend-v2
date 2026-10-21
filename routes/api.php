@@ -133,6 +133,13 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/bir/filing/{name}', [BirReturnController::class, 'filing']);
     Route::post('/bir/filing/{name}', [BirReturnController::class, 'fileReturn']);
 
+    // routes/api.php – inside the auth:sanctum group, next to the other /bir routes
+    Route::get('/bir/filing/{name}/payments', [BirReturnController::class, 'payments']);
+    Route::post('/bir/filing/{name}/payments', [BirReturnController::class, 'payStore']);
+    Route::delete('/bir/payments/{id}', [BirReturnController::class, 'payDelete']);
+    Route::get('/bir/payments/{id}/attachment', [BirReturnController::class, 'payAttachment']);
+
+
     Route::get('/reports/bir2307', [ReportController::class, 'bir2307Summary']);
     Route::get('/reports/vat-summary', [ReportController::class, 'vatSummary']);
     Route::get('/reports/vat-summary/docs', [ReportController::class, 'vatSummaryDocs']);

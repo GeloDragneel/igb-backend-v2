@@ -506,6 +506,13 @@ class BirReturnController extends ReportController
         if (!$names || !Schema::hasTable(self::FILING)) return [];
         $rows = DB::table(self::FILING)->where('added_by', $by)->whereIn('filename', $names)->get()->keyBy('filename');
         if ($rows->isEmpty()) return [];
+        // new filings: a General Journal entry (jv_no) + payments in t_bir_return_payment
+        $isGj = fn ($r) => !empty($r->jv_no ?? null);
+        $gjRows = $rows->filter($isGj);
+        $gjAlive = $gjRows->isEmpty() ? collect() : DB::table('t_general_journal')->where('added_by', $by)
+            ->whereIn('jv_no', $gjRows->pluck('jv_no')->all())->distinct()->pluck('jv_no')->flip();
+        $gjPaid = $gjRows->isEmpty() || !Schema::hasTable(self::PAYMENT) ? collect() : DB::table(self::PAYMENT)
+            ->whereIn('filing_id', $gjRows->pluck('id')->all())->groupBy('filing_id')->selectRaw('filing_id, SUM(amount) AS amt')->pluck('amt', 'filing_id');
         $paid = Schema::hasTable('t_pvoucher_detail')
             ? DB::table('t_pvoucher_detail')->whereIn('ap_invoice_no', $rows->pluck('invoice_no')->filter()->all() ?: [''])
                 ->groupBy('ap_invoice_no')->selectRaw('ap_invoice_no, SUM(amount) AS amt')->pluck('amt', 'ap_invoice_no')
@@ -514,12 +521,19 @@ class BirReturnController extends ReportController
             ->where('invoice_status_id', 5)->pluck('invoice_no')->flip();
         $out = [];
         foreach ($rows as $name => $r) {
-            if (isset($void[$r->invoice_no])) continue;          // bill voided through a ticket → not filed
-            $p = round((float) ($paid[$r->invoice_no] ?? 0), 2);
+            if ($isGj($r)) {
+                if (!isset($gjAlive[$r->jv_no])) continue;       // journal entry deleted → not filed
+                $p = round((float) ($gjPaid[$r->id] ?? 0), 2);
+            } else {
+                if (isset($void[$r->invoice_no])) continue;      // (old) Expenses bill voided through a ticket → not filed
+                $p = round((float) ($paid[$r->invoice_no] ?? 0), 2);
+            }
             $amt = round((float) $r->amount, 2);
             $out[$name] = [
                 'status'     => $amt <= 0.009 || $p >= $amt - 0.009 ? 'paid' : ($p > 0 ? 'partial' : 'unpaid'),
                 'invoice_no' => $r->invoice_no,
+                'jv_no'      => $r->jv_no ?? null,
+                'kind'       => $isGj($r) ? 'journal' : 'expenses',   // journal = General Journal + BIR payments · expenses = old Pay Bill
                 'amount'     => $amt,
                 'paid'       => $p,
                 'balance'    => round(max(0, $amt - $p), 2),
@@ -815,7 +829,7 @@ class BirReturnController extends ReportController
             'date'                 => ['required', 'date'],
             'declared_month'       => ['required', 'date_format:Y-m'],
             'remarks'              => ['nullable', 'string', 'max:255'],
-            'item_id'              => ['required', 'integer', 'exists:m_items,id'],
+            'item_id'              => ['nullable', 'integer'],   // not used any more (General Journal has no items)
             'lines'                => ['required', 'array', 'min:2', 'max:20'],
             'lines.*.side'         => ['required', 'in:dr,cr'],
             'lines.*.account_code' => ['required', 'string', 'max:15'],
@@ -849,61 +863,218 @@ class BirReturnController extends ReportController
         [, $recon] = $this->reconcile($request, $form, $from, $to, $chart, $retLines);
         $reconciled = $recon === 'no_books' ? null : $recon === 'reconciled';
 
-        return DB::transaction(function () use ($request, $d, $by, $caid, $lines, $bill, $name, $form, $from, $to, $label, $reconciled) {
-            $M = 't_purchase_expense_master';
-            $D = 't_purchase_expense_detail';
-            $mCols = Schema::getColumnListing($M);
-            $dCols = Schema::getColumnListing($D);
-            $only = fn (array $cols, array $row) => array_intersect_key($row, array_flip($cols));
-            $account = $caid ? \App\Models\ClientAccount::find($caid) : null;
-            $status = fn (string $n) => (int) (DB::table('m_invoice_status')->whereRaw('UPPER(name) LIKE ?', [$n . '%'])->value('id') ?: ($n === 'PAID' ? 1 : 2));
-            $audit = Schema::hasTable('m_audit_status') ? DB::table('m_audit_status')->whereRaw("UPPER(name) LIKE 'PENDING%'")->value('id') : null;
-            $vendor = Schema::hasTable('m_vendor_customer')
-                ? DB::table('m_vendor_customer')->when(Schema::hasColumn('m_vendor_customer', 'added_by'), fn ($q) => $q->where('added_by', $by))
-                    ->where(fn ($q) => $q->where('name', 'like', '%INTERNAL REVENUE%')->orWhere('name', 'BIR'))->value('id')
-                : null;
-            $statusId = \App\Support\PaymentAccounts::isCash($by, $bill['code']) ? $status('PAID') : $status('UNPAID');
+        abort_unless(Schema::hasColumn(self::FILING, 'jv_no'), 422, 'Run the BIR General Journal migration first (php artisan migrate).');
 
-            do {
-                $no = 'AP-' . date('ymd-his') . random_int(10000, 99999);
-            } while (DB::table($M)->where('invoice_no', $no)->exists());
+        return DB::transaction(function () use ($request, $d, $by, $lines, $bill, $name, $form, $from, $to, $label, $parts, $reconciled) {
+            // reference: BIR-2550Q-122026Q4 (unique for this client)
+            $base = 'BIR-' . $this->birFolder($form) . '-' . ($parts[2] ?? date('ymd'));
+            $jv = $base;
+            for ($n = 2; DB::table('t_general_journal')->where('added_by', $by)->where('jv_no', $jv)->exists(); $n++) $jv = "{$base}-{$n}";
 
-            $itemId = (int) $d['item_id'];
-            $docNo = 'BIR ' . $form . ' ' . $label;
-            $master = [
-                'vendor_id' => $vendor ?: null, 'added_by' => $by, 'transaction_date' => $d['date'], 'declared_month' => $d['declared_month'],
-                'account_code' => $bill['code'], 'document_no' => mb_substr($docNo, 0, 100), 'invoice_no' => $no, 'currency' => 'PHP', 'ex_rate' => 1,
-                'sub_total' => $bill['amount'], 'total' => $bill['amount'], 'grand_total' => $bill['amount'], 'discount_amount' => 0,
-                '2307_vt' => 0, '2307_it' => 0,
-                'remarks' => mb_substr($d['remarks'] ?: "FILE & SUBMITTED · {$name}", 0, 255),
-                'is_scanned' => 0, 'invoice_status_id' => $statusId, 'audit_status_id' => $audit,
-                'assigned_daid' => $account->assigned_daid ?? null, 'assigned_auid' => $account->assigned_auid ?? null,
-                'seq_no' => (int) DB::table($M)->where('added_by', $by)->lockForUpdate()->max('seq_no') + 1,
-                'trans_type' => 'Expenses', 'record_status' => 'posted', 'created_at' => now(), 'updated_at' => now(),
-            ];
-            DB::table($M)->insert($only($mCols, $master));
+            $remarks = mb_substr($d['remarks'] ?: "BIR {$form} {$label} · FILE & SUBMITTED", 0, 255);
+            $this->gjInsert($request, $by, $jv, $d['date'], $d['declared_month'], $lines->map(fn ($l) => [
+                'account_code' => $l['code'],
+                'debit'  => $l['side'] === 'dr' ? $l['amount'] : 0,
+                'credit' => $l['side'] === 'cr' ? $l['amount'] : 0,
+                'remarks' => $l['bill'] ? mb_substr("{$remarks} · to pay", 0, 255) : $remarks,
+            ])->all());
 
-            // debits as lines; credits other than the bill as negative lines → lines add up to the bill
-            foreach ($lines->reject(fn ($l) => $l['bill']) as $l) {
-                $amt = $l['side'] === 'dr' ? $l['amount'] : -$l['amount'];
-                DB::table($D)->insert($only($dCols, [
-                    'invoice_no' => $no, 'item_id' => $itemId, 'quantity' => 1, 'unit_price' => $amt, 'amount' => $amt, 'discount_amount' => 0,
-                    'input_vat' => 0, 'net_of_vat' => 0, 'vat_exempt' => 0, 'non_vat' => $amt, 'zero_rated' => 0,
-                    'account_code' => $l['code'], 'document_no' => $master['document_no'], 'declared_month' => $d['declared_month'],
-                    'currency' => 'PHP', 'ex_rate' => 1, 'added_by' => $by, 'vendor_id' => $master['vendor_id'],
-                    'transaction_date' => $d['date'], 'invoice_status_id' => $statusId, 'audit_status_id' => $audit,
-                    'trans_type' => 'Expenses', 'created_at' => now(), 'updated_at' => now(),
-                ]));
-            }
-
-            DB::table(self::FILING)->insert([
+            DB::table(self::FILING)->insert(array_intersect_key([
                 'added_by' => $by, 'filename' => $name, 'form' => $form, 'return_period' => $label, 'period_from' => $from, 'period_to' => $to,
-                'invoice_no' => $no, 'amount' => $bill['amount'], 'filed_date' => $d['date'],
-                'filed_by' => $request->user()->id ?? null, 'created_at' => now(), 'updated_at' => now(),
-            ] + (Schema::hasColumn(self::FILING, 'reconciled') ? ['reconciled' => $reconciled] : []));
+                'invoice_no' => $jv, 'jv_no' => $jv, 'bill_account' => $bill['code'], 'amount' => $bill['amount'], 'filed_date' => $d['date'],
+                'filed_by' => $request->user()->id ?? null, 'reconciled' => $reconciled, 'created_at' => now(), 'updated_at' => now(),
+            ], array_flip(Schema::getColumnListing(self::FILING))));
 
-            return response()->json(['message' => "Filed & submitted · Expenses {$no} (" . number_format($bill['amount'], 2) . ' to pay)', 'invoice_no' => $no]);
+            return response()->json(['message' => "Filed & submitted · General Journal {$jv} (" . number_format($bill['amount'], 2) . ' to pay)', 'jv_no' => $jv]);
         });
+    }
+
+    /* =====================================================================
+       BIR return PAYMENTS (instead of Pay Bill)
+         each payment = a General Journal entry: Dr <tax payable> · Cr <cash / bank>
+         + a row in t_bir_return_payment · attachment → S3 BIR_Return/<form>/
+       ===================================================================== */
+    private const PAYMENT = 't_bir_return_payment';
+
+    /** S3 folder / short code of a form: 2550Qv2024 → 2550Q, 2551Qv2018 → 2551Q */
+    private function birFolder(string $form): string
+    {
+        foreach (['0605', '0619E', '1601EQ', '1601C', '2550M', '2550Q', '2551Q'] as $f) {
+            if (str_starts_with(strtoupper($form), $f)) return $f;
+        }
+        return preg_replace('/[^0-9A-Za-z]/', '', $form) ?: 'Other';
+    }
+
+    /** lines → t_general_journal (same columns as Task → General Journal) */
+    private function gjInsert(Request $request, int $by, string $jv, string $date, string $month, array $lines): void
+    {
+        $hasType = Schema::hasColumn('t_general_journal', 'entry_type');
+        foreach ($lines as $l) {
+            if ((float) $l['debit'] <= 0 && (float) $l['credit'] <= 0) continue;
+            DB::table('t_general_journal')->insert([
+                'jv_no' => $jv, 'transaction_date' => $date, 'declared_month' => $month,
+                'account_code' => $l['account_code'], 'remarks' => $l['remarks'] ?? null,
+                'debit' => round((float) $l['debit'], 2), 'credit' => round((float) $l['credit'], 2),
+                'subsidiary' => null, 'added_by' => $by,
+                'employee_id' => $request->user()->employee_id ?? null, 'created_at' => now(), 'updated_at' => now(),
+            ] + ($hasType ? ['entry_type' => 'NORMAL'] : []));
+        }
+    }
+
+    /** the filing (General Journal kind) of this file, or 404.
+        A return filed the OLD way (Expenses bill, nothing paid yet) is moved to the General Journal here, automatically. */
+    private function gjFiling(Request $request, string $name): object
+    {
+        abort_unless(Schema::hasTable(self::PAYMENT) && Schema::hasColumn(self::FILING, 'jv_no'), 422, 'Run the BIR General Journal migration first (php artisan migrate).');
+        $by = $this->booksOf($request);
+        $f = DB::table(self::FILING)->where('added_by', $by)->where('filename', $name)->first();
+        abort_unless($f, 404, 'This return is not filed yet.');
+        if (empty($f->jv_no)) $f = $this->moveToJournal($request, $by, $f);
+        return $f;
+    }
+
+    /** old filing (Expenses bill AP-…) → General Journal entry; only while nothing is paid on the bill */
+    private function moveToJournal(Request $request, int $by, object $f): object
+    {
+        $M = 't_purchase_expense_master';
+        $D = 't_purchase_expense_detail';
+        $bill = DB::table($M)->where('added_by', $by)->where('invoice_no', $f->invoice_no)->first();
+        abort_unless($bill, 404, 'The old Expenses bill of this return was not found.');
+        $paid = Schema::hasTable('t_pvoucher_detail') ? (float) DB::table('t_pvoucher_detail')->where('ap_invoice_no', $bill->invoice_no)->sum('amount') : 0;
+        abort_if($paid > 0.009, 409, 'This return already has Pay Bill payments, so it stays on Pay Bill.');
+
+        // the bill: lines = debits (positive) / other credits (negative) · the bill itself = credit on its account
+        $lines = DB::table($D)->where('invoice_no', $bill->invoice_no)->get(['account_code', 'amount'])
+            ->map(fn ($l) => ['account_code' => $l->account_code, 'debit' => max(0, (float) $l->amount), 'credit' => max(0, -(float) $l->amount)])
+            ->filter(fn ($l) => $l['account_code'] && ($l['debit'] > 0 || $l['credit'] > 0))->values()->all();
+        $lines[] = ['account_code' => $bill->account_code, 'debit' => 0, 'credit' => (float) $bill->grand_total];
+
+        $parts = explode('-', basename($f->filename, '.xml'));
+        $base = 'BIR-' . $this->birFolder((string) $f->form) . '-' . ($parts[2] ?? date('ymd'));
+        $jv = $base;
+        for ($n = 2; DB::table('t_general_journal')->where('added_by', $by)->where('jv_no', $jv)->exists(); $n++) $jv = "{$base}-{$n}";
+        $remarks = mb_substr("BIR {$f->form} {$f->return_period} · FILE & SUBMITTED", 0, 255);
+
+        DB::transaction(function () use ($request, $by, $f, $bill, $lines, $jv, $remarks, $M, $D) {
+            $this->gjInsert($request, $by, $jv, substr((string) $bill->transaction_date, 0, 10), (string) $bill->declared_month,
+                array_map(fn ($l) => $l + ['remarks' => $remarks], $lines));
+            DB::table($D)->where('invoice_no', $bill->invoice_no)->delete();
+            DB::table($M)->where('id', $bill->id)->delete();
+            DB::table(self::FILING)->where('id', $f->id)->update(array_intersect_key(
+                ['invoice_no' => $jv, 'jv_no' => $jv, 'bill_account' => $bill->account_code, 'updated_at' => now()],
+                array_flip(Schema::getColumnListing(self::FILING))
+            ));
+        });
+        return DB::table(self::FILING)->where('id', $f->id)->first();
+    }
+
+    /* GET /api/bir/filing/{name}/payments */
+    public function payments(Request $request, string $name)
+    {
+        $f = $this->gjFiling($request, $name);
+        $rows = DB::table(self::PAYMENT)->where('filing_id', $f->id)->orderByDesc('pay_date')->orderByDesc('id')->get();
+        $paid = round((float) $rows->sum('amount'), 2);
+        return response()->json([
+            'document_no' => "BIR {$f->form} · {$f->return_period}",
+            'jv_no'       => $f->jv_no,
+            'form_folder' => 'BIR_Return/' . $this->birFolder((string) $f->form),
+            'payable'     => $f->bill_account ?: DB::table('t_general_journal')->where('added_by', $this->booksOf($request))->where('jv_no', $f->jv_no)
+                ->where('credit', '>', 0)->orderByDesc('credit')->value('account_code'),
+            'grand_total' => round((float) $f->amount, 2),
+            'paid'        => $paid,
+            'balance'     => round(max(0, (float) $f->amount - $paid), 2),
+            'accounts'    => $this->chartOf($this->booksOf($request)),
+            'payments'    => $rows->map(fn ($p) => [
+                'id' => $p->id, 'pvoucher_no' => $p->jv_no, 'date' => substr((string) $p->pay_date, 0, 10), 'bank' => $p->bank,
+                'payment_type' => $p->payment_type, 'ref_data' => $p->ref_data, 'amount' => (float) $p->amount, 'attachment' => $p->attachment,
+            ])->values(),
+        ]);
+    }
+
+    /* POST /api/bir/filing/{name}/payments  (multipart) {pv_date, bank, amount, payment_type, ref_data, document_no, particulars, attachment} */
+    public function payStore(Request $request, string $name)
+    {
+        $f = $this->gjFiling($request, $name);
+        $by = $this->booksOf($request);
+        $d = $request->validate([
+            'pv_date'      => ['required', 'date'],
+            'bank'         => ['required', 'string', 'max:20'],
+            'amount'       => ['required', 'numeric', 'gt:0'],
+            'payment_type' => ['nullable', 'string', 'max:50'],
+            'ref_data'     => ['nullable', 'string', 'max:255'],
+            'document_no'  => ['nullable', 'string', 'max:100'],
+            'particulars'  => ['nullable', 'string', 'max:255'],
+            'attachment'   => ['nullable', 'file', 'max:10240', 'mimes:pdf,jpg,jpeg,png,gif,webp,doc,docx,xls,xlsx'],
+        ], ['bank.required' => 'Pick the cash / bank account the money comes from', 'amount.gt' => 'Enter the amount paid', 'attachment.max' => 'Attachment is too big (10 MB max).']);
+
+        $amount = round((float) $d['amount'], 2);
+        $balance = round((float) $f->amount - (float) DB::table(self::PAYMENT)->where('filing_id', $f->id)->sum('amount'), 2);
+        abort_if($amount > $balance + 0.01, 422, 'More than the balance (' . number_format($balance, 2) . ').');
+        $payable = $f->bill_account ?: DB::table('t_general_journal')->where('added_by', $by)->where('jv_no', $f->jv_no)->where('credit', '>', 0)
+            ->orderByDesc('credit')->value('account_code');
+        abort_unless($payable, 422, 'The tax payable account of this return was not found.');
+        abort_if($payable === $d['bank'], 422, 'Pick the cash / bank account, not the tax payable account.');
+
+        $jv = 'BIRPAY-' . date('ymd-His');
+        for ($n = 2; DB::table('t_general_journal')->where('added_by', $by)->where('jv_no', $jv)->exists(); $n++) $jv = 'BIRPAY-' . date('ymd-His') . "-{$n}";
+
+        // attachment → S3 BIR_Return/<form>/<reference>-<file name>
+        $file = null;
+        if ($request->hasFile('attachment')) {
+            $up = $request->file('attachment');
+            $clean = preg_replace('/[^A-Za-z0-9_\.-]/', '_', $up->getClientOriginalName());
+            try {
+                $path = $up->getRealPath() ?: $up->getPathname();
+                \Illuminate\Support\Facades\Storage::disk('s3')->put('BIR_Return/' . $this->birFolder($f->form) . "/{$jv}-{$clean}", @file_get_contents($path) ?: $up->get());
+                $file = $clean;
+            } catch (\Throwable $e) {
+                report($e);
+                abort(422, 'Attachment upload failed: ' . $e->getMessage());
+            }
+        }
+
+        $remarks = mb_substr(trim(($d['particulars'] ?? '') ?: "BIR {$f->form} {$f->return_period} · payment") . ($d['ref_data'] ? " · Ref {$d['ref_data']}" : ''), 0, 255);
+        DB::transaction(function () use ($request, $by, $f, $d, $amount, $jv, $payable, $remarks, $file) {
+            $this->gjInsert($request, $by, $jv, $d['pv_date'], substr($d['pv_date'], 0, 7), [
+                ['account_code' => $payable, 'debit' => $amount, 'credit' => 0, 'remarks' => $remarks],
+                ['account_code' => $d['bank'], 'debit' => 0, 'credit' => $amount, 'remarks' => $remarks],
+            ]);
+            DB::table(self::PAYMENT)->insert([
+                'filing_id' => $f->id, 'added_by' => $by, 'jv_no' => $jv, 'pay_date' => $d['pv_date'], 'amount' => $amount,
+                'bank' => $d['bank'], 'payment_type' => $d['payment_type'] ?? null, 'ref_data' => $d['ref_data'] ?? null,
+                'document_no' => $d['document_no'] ?? null, 'attachment' => $file,
+                'created_at' => now(), 'updated_at' => now(),
+            ]);
+        });
+
+        $left = round($balance - $amount, 2);
+        return response()->json(['jv_no' => $jv, 'balance' => max(0, $left),
+            'message' => $left <= 0.009 ? "{$jv} saved – fully paid" : "{$jv} saved – balance " . number_format($left, 2)]);
+    }
+
+    /* DELETE /api/bir/payments/{id}   removes the payment and its General Journal entry */
+    public function payDelete(Request $request, int $id)
+    {
+        $by = $this->booksOf($request);
+        $p = DB::table(self::PAYMENT)->where('id', $id)->where('added_by', $by)->first();
+        abort_unless($p, 404, 'Payment not found.');
+        DB::transaction(function () use ($by, $p) {
+            DB::table('t_general_journal')->where('added_by', $by)->where('jv_no', $p->jv_no)->delete();
+            DB::table(self::PAYMENT)->where('id', $p->id)->delete();
+        });
+        return response()->json(['message' => "{$p->jv_no} removed"]);
+    }
+
+    /* GET /api/bir/payments/{id}/attachment */
+    public function payAttachment(Request $request, int $id)
+    {
+        $p = DB::table(self::PAYMENT . ' as P')->join(self::FILING . ' as F', 'F.id', '=', 'P.filing_id')
+            ->where('P.id', $id)->where('P.added_by', $this->booksOf($request))->first(['P.jv_no', 'P.attachment', 'F.form']);
+        abort_unless($p && $p->attachment, 404, 'No attachment.');
+        $disk = \Illuminate\Support\Facades\Storage::disk('s3');
+        $key = 'BIR_Return/' . $this->birFolder($p->form) . "/{$p->jv_no}-{$p->attachment}";
+        abort_unless($disk->exists($key), 404, 'File not found on S3.');
+        return $disk->response($key, $p->attachment);
     }
 
     /** the client's items (m_items) for the Expenses lines: [[id, name]] */
