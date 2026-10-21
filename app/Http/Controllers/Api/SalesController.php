@@ -1257,6 +1257,47 @@ class SalesController extends Controller
         ]);
     }
 
+    /**
+     * all the text lines of a scanned receipt on S3 (Amazon Textract).
+     * 1) quick read (DetectDocumentText): one page → answer in 1–3 seconds
+     * 2) only when that can't read it (multi-page PDF): the slow job, polled every second, with more time allowed
+     */
+    protected function scanText(TextractClient $tx, string $key): string
+    {
+        $bucket = config('filesystems.disks.s3.bucket');
+        $lines = fn ($blocks) => implode('', array_map(
+            fn ($b) => ($b['BlockType'] ?? '') === 'LINE' && isset($b['Text']) ? $b['Text'] . "\n" : '',
+            $blocks ?? []
+        ));
+
+        try {
+            $res = $tx->detectDocumentText(['Document' => ['S3Object' => ['Bucket' => $bucket, 'Name' => $key]]]);
+            return $lines($res['Blocks'] ?? []);
+        } catch (\Aws\Textract\Exception\TextractException $e) {
+            // multi-page PDF / not supported by the quick read → the slow job below
+            if (!in_array($e->getAwsErrorCode(), ['UnsupportedDocumentException', 'DocumentTooLargeException', 'InvalidParameterException'], true)) throw $e;
+        }
+
+        @set_time_limit(150);                                // the slow job can take a minute
+        $jobId = $tx->startDocumentTextDetection(['DocumentLocation' => ['S3Object' => ['Bucket' => $bucket, 'Name' => $key]]])['JobId'];
+        $tries = 0;
+        do {
+            sleep(1);
+            $res = $tx->getDocumentTextDetection(['JobId' => $jobId]);
+            $status = $res['JobStatus'];
+        } while ($status === 'IN_PROGRESS' && ++$tries < 120);
+        if ($status !== 'SUCCEEDED') throw new \RuntimeException('Scanning took too long. Please try again.');
+
+        $text = $lines($res['Blocks'] ?? []);
+        $next = $res['NextToken'] ?? null;
+        while ($next) {
+            $res = $tx->getDocumentTextDetection(['JobId' => $jobId, 'NextToken' => $next]);
+            $text .= $lines($res['Blocks'] ?? []);
+            $next = $res['NextToken'] ?? null;
+        }
+        return $text;
+    }
+
     // SCAN: read the receipt (old read_pdf.php)
     public function readScan(Request $request, int $id)
     {
@@ -1273,34 +1314,7 @@ class SalesController extends Controller
         if (!$key) return response()->json(['message' => 'File not found in storage.'], 404);
 
         try {
-            $tx    = $this->textract();
-            $jobId = $tx->startDocumentTextDetection([
-                'DocumentLocation' => ['S3Object' => [
-                    'Bucket' => config('filesystems.disks.s3.bucket'),
-                    'Name'   => $key,
-                ]],
-            ])['JobId'];
-
-            $tries = 0;
-            do {
-                sleep(2);
-                $status = $tx->getDocumentTextDetection(['JobId' => $jobId])['JobStatus'];
-            } while ($status === 'IN_PROGRESS' && ++$tries < 30);
-
-            if ($status !== 'SUCCEEDED') {
-                return response()->json(['message' => 'Scanning failed. Please try again.'], 422);
-            }
-
-            $text = '';
-            $next = null;
-            do {
-                $params = ['JobId' => $jobId] + ($next ? ['NextToken' => $next] : []);
-                $res    = $tx->getDocumentTextDetection($params);
-                foreach ($res['Blocks'] ?? [] as $b) {
-                    if ($b['BlockType'] === 'LINE' && isset($b['Text'])) $text .= $b['Text'] . "\n";
-                }
-                $next = $res['NextToken'] ?? null;
-            } while ($next);
+            $text = $this->scanText($this->textract(), $key);
         } catch (\Throwable $e) {
             report($e);
             return response()->json(['message' => 'Scanning failed: ' . $e->getMessage()], 422);

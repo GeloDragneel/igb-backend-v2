@@ -921,24 +921,7 @@ abstract class ApInvoiceController extends SalesController
         if (!$key) return response()->json(['message' => 'File not found in storage.'], 404);
 
         try {
-            $tx = $this->apTextract();
-            $jobId = $tx->startDocumentTextDetection([
-                'DocumentLocation' => ['S3Object' => ['Bucket' => config('filesystems.disks.s3.bucket'), 'Name' => $key]],
-            ])['JobId'];
-            $tries = 0;
-            do {
-                sleep(2);
-                $status = $tx->getDocumentTextDetection(['JobId' => $jobId])['JobStatus'];
-            } while ($status === 'IN_PROGRESS' && ++$tries < 30);
-            if ($status !== 'SUCCEEDED') return response()->json(['message' => 'Scanning failed. Please try again.'], 422);
-
-            $text = '';
-            $next = null;
-            do {
-                $res = $tx->getDocumentTextDetection(['JobId' => $jobId] + ($next ? ['NextToken' => $next] : []));
-                foreach ($res['Blocks'] ?? [] as $b) if ($b['BlockType'] === 'LINE' && isset($b['Text'])) $text .= $b['Text'] . "\n";
-                $next = $res['NextToken'] ?? null;
-            } while ($next);
+            $text = $this->scanText($this->apTextract(), $key);
         } catch (\Throwable $e) {
             report($e);
             return response()->json(['message' => 'Scanning failed: ' . $e->getMessage()], 422);
