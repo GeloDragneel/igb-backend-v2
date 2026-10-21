@@ -757,7 +757,7 @@ class SalesController extends Controller
         abort_unless($by, 422, 'No client account selected.');
 
         // same supervisors as the Declared Month override (user type 10, active)
-        $sup = UserStaff::where('username', $d['username'])->where('user_type_id', 10)->where('is_active', 1)->first(['id', 'password']);
+        $sup = UserStaff::where('username', $d['username'])->where('user_type_id', 4)->where('is_active', 1)->first(['id', 'password']);
         if (!$sup || !\Illuminate\Support\Facades\Hash::check((string) $d['password'], (string) $sup->getRawOriginal('password'))) {
             return response()->json(['message' => 'User not found'], 422);
         }
