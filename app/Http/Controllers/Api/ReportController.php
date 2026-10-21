@@ -4945,7 +4945,7 @@ class ReportController extends SalesController
             foreach ($sum['sales'] as $r) {
                 foreach ($map as $f => $c) $add($lines['Sales'][$c], $r->m, $r->{$f});
                 $add($other['ov'], $r->m, $r->ov);
-                $outputTotal += (float) $r->ovt;
+                $outputTotal += (float) $r->ov;
             }
             foreach ($sum['grn'] as $r) {
                 foreach ($map as $f => $c) $add($lines['Purchases'][$c], $r->m, $r->{$f});
