@@ -924,6 +924,82 @@ class AdministrationController extends Controller
         ]);
     }
 
+    /**
+     * POST /admin/user-access/{id}/clients/{caid}/login
+     * Generate: create this employee's login in that client account (m_user_client_staff).
+     * Username User<digits>, random password – both returned once so they can be given to the employee.
+     */
+    public function userAccessGenerateLogin(Request $request, int $id, int $caid)
+    {
+        $this->staffOnly($request);
+        abort_unless(Schema::hasTable('m_user_client_staff'), 422, 'Table m_user_client_staff not found.');
+        $staff = DB::table('m_user_staff')->where('id', $id)->first();
+        abort_unless($staff, 404, 'Staff login not found.');
+        $empId = Schema::hasTable('m_employee') && isset($staff->comid)
+            ? (int) DB::table('m_employee')->where('com_id', $staff->comid)->value('id') : 0;
+        abort_unless($empId, 422, 'This staff login is not linked to an employee.');
+        $ca = DB::table('m_client_account')->where('id', $caid)->first();
+        abort_unless($ca, 404, 'Client account not found.');
+
+        $existing = DB::table('m_user_client_staff')->where('employee_id', $empId)->where('caid', $caid)->first();
+        if ($existing) {
+            abort(422, "This employee already has a login in this client account ({$existing->username}).");
+        }
+
+        // username: User + digits, unique in every login table
+        do {
+            $username = 'User' . random_int(100000, 999999) . now()->format('YmdHis');
+        } while (collect(['m_user_client', 'm_user_client_staff', 'm_user_staff'])
+            ->contains(fn ($t) => Schema::hasTable($t) && DB::table($t)->where('username', $username)->exists()));
+        $password = substr(str_replace(['/', '+', '='], '', base64_encode(random_bytes(12))), 0, 10);
+
+        // the client account's master login (old MasterUserID)
+        $masterCa = Schema::hasColumn('m_user_client', 'caid') ? 'caid' : 'ca_id';
+        $masterId = Schema::hasTable('m_user_client')
+            ? DB::table('m_user_client')->where($masterCa, $caid)->orderBy('id')->value('id') : null;
+
+        $by = (int) optional($request->user())->id ?: null;
+        $row = [
+            'user_client_id' => $masterId,
+            'caid'           => $caid,
+            'employee_id'    => $empId,
+            'username'       => $username,
+            'password'       => \Illuminate\Support\Facades\Hash::make($password),
+            'is_active'      => 1,
+            'is_web'         => 1,
+            'is_scan_suite'  => 0,
+            'is_pos'         => 0,
+            'added_by'       => $by,
+            'updated_by'     => $by,
+            'created_at'     => now(),
+            'updated_at'     => now(),
+        ];
+
+        // only columns the table really has; NOT NULL columns without a default get an empty value
+        $cols = collect(Schema::getColumns('m_user_client_staff'))->keyBy('name');
+        $row = array_intersect_key($row, $cols->all());
+        foreach ($cols as $name => $c) {
+            if (array_key_exists($name, $row) || $c['nullable'] || $c['default'] !== null || $c['auto_increment']) continue;
+            $t = strtolower($c['type_name']);
+            $row[$name] = str_contains($t, 'int') || in_array($t, ['decimal', 'double', 'float']) ? 0
+                : (in_array($t, ['date', 'datetime', 'timestamp']) ? now() : '');
+        }
+        $row = $this->fkClean('m_user_client_staff', $row);
+
+        try {
+            $newId = DB::table('m_user_client_staff')->insertGetId($row);
+        } catch (\Illuminate\Database\QueryException $e) {
+            report($e);
+            abort(422, 'Could not generate the login: ' . ($e->errorInfo[2] ?? $e->getMessage()));
+        }
+
+        return response()->json([
+            'message'  => "Login generated for {$ca->trade_name}.",
+            'login'    => ['id' => (int) $newId, 'username' => $username, 'active' => true],
+            'password' => $password,
+        ]);
+    }
+
     /** the sidebar: which Staff pages the logged-in staff can open */
     public function userAccessMine(Request $request)
     {

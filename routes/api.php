@@ -695,7 +695,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::get('/admin/user-access/{id}/clients', [AdministrationController::class, 'userAccessClients']);
     Route::post('/admin/user-access/{id}/clients/{caid}/login', [AdministrationController::class, 'userAccessGenerateLogin']);
-    
+
     // Printing
     Route::get('/print/vat-summary', [PrintController::class, 'vatSummaryPrint']);
     Route::get('/print/esub', [PrintController::class, 'esubPrint']);
