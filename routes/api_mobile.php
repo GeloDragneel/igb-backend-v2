@@ -58,6 +58,7 @@ Route::prefix('mobile')->controller(MobileController::class)->group(function () 
     // scans
     Route::get('expenses', 'expenses');
     Route::match(['get', 'delete'], 'delete_transaction', 'deleteTransaction');
+    Route::get('view_scan', 'viewScan');                         // the scanned PDF (from S3)
 
     // expenses / reports
     Route::get('expense_report', 'expenseReport');

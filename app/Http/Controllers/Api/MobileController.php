@@ -1486,6 +1486,44 @@ class MobileController extends Controller
         }
     }
 
+    /**
+     * GET view_scan?id=&userId=   the scanned file itself (PDF), read from S3 and sent inline.
+     * The app shows it through Google's viewer, so this URL must work without a login;
+     * userId must be the one who uploaded it.
+     */
+    public function viewScan(Request $r)
+    {
+        $row = DB::table('t_mobile_transaction')->where('id', (int) $r->query('id', 0))->first();
+        if (!$row || (int) $row->added_by !== (int) $r->query('userId', 0)) {
+            return response('File not found', 404);
+        }
+        $folder = ['sales' => 'Sales_Invoices', 'purchases' => 'Vendor_Invoices', 'expenses' => 'Expenses_Transaction'][$row->trans_type] ?? null;
+        $name = basename((string) $row->filename);
+        if (!$folder || $name === '') return response('File not found', 404);
+
+        $bucket = config('filesystems.disks.s3.bucket') ?: 'igb-fems-files-singapore';
+        // new uploads: <folder>/<userId>-<file>; very old ones may be <folder>/<file>
+        foreach (["{$folder}/{$row->added_by}-{$name}", "{$folder}/{$name}"] as $key) {
+            try {
+                $obj = $this->s3()->getObject(['Bucket' => $bucket, 'Key' => $key]);
+                return response((string) $obj['Body'], 200, [
+                    'Content-Type' => $obj['ContentType'] ?: 'application/pdf',
+                    'Content-Disposition' => 'inline; filename="' . $name . '"',
+                    'Cache-Control' => 'private, max-age=300',
+                ]);
+            } catch (\Aws\S3\Exception\S3Exception $e) {
+                if ($e->getAwsErrorCode() !== 'NoSuchKey') {
+                    report($e);
+                    return response($this->s3Reason($e), 500);
+                }
+            } catch (Throwable $e) {
+                report($e);
+                return response($this->s3Reason($e), 500);
+            }
+        }
+        return response('File not found', 404);
+    }
+
     /** GET|DELETE delete_transaction?id=   remove a scan */
     public function deleteTransaction(Request $r)
     {
@@ -2729,14 +2767,19 @@ class MobileController extends Controller
         return $data;
     }
 
-    private function putS3(?string $path, string $key, string $contentType, ?string $body = null, ?string $acl = null): ?string
+    private function s3(): S3Client
     {
-        $s3 = new S3Client([
+        return new S3Client([
             'version' => 'latest',
             'region' => config('filesystems.disks.s3.region') ?: 'ap-southeast-1',
             'credentials' => ['key' => config('filesystems.disks.s3.key'), 'secret' => config('filesystems.disks.s3.secret')],
             'suppress_php_deprecation_warning' => true,
         ]);
+    }
+
+    private function putS3(?string $path, string $key, string $contentType, ?string $body = null, ?string $acl = null): ?string
+    {
+        $s3 = $this->s3();
         $args = ['Bucket' => config('filesystems.disks.s3.bucket') ?: 'igb-fems-files-singapore', 'Key' => $key, 'ContentType' => $contentType];
         $body !== null ? $args['Body'] = $body : $args['SourceFile'] = $path;
         if ($acl) $args['ACL'] = $acl;
