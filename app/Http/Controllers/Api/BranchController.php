@@ -64,7 +64,7 @@ class BranchController extends Controller
                   $j->on('D.employee_id', '=', 'A.assigned_auid')->on('D.caid', '=', 'A.id');
               });
         }
-    
+
         return $this->finish($q, function ($r) use ($designation, $seesAll, $empId) {
             return $designation === self::DATA_ANALYST
                 ? (int) $r->assigned_daid
@@ -72,18 +72,31 @@ class BranchController extends Controller
         });
     }
 
-    /* ---------------- ClientStaff: every account with this username ---------------- */
+    /* ---------------- ClientStaff ----------------
+     * Every account with this username, PLUS – when the login is an employee
+     * (employee_id > 0) – every client account assigned to that employee
+     * as DA (m_client_account.assigned_daid) or Auditor (assigned_auid).
+     */
     private function forClientStaff(UserClientStaff $user)
     {
+        $empId = (int) $user->employee_id;
+
         $q = $this->base()
-            ->join('m_user_client_staff as D', function ($j) use ($user) {
+            ->leftJoin('m_user_client_staff as D', function ($j) use ($user) {
                 $j->on('D.caid', '=', 'A.id')
                   ->where('D.username', '=', $user->username)
                   ->where('D.is_active', '=', 1);
             })
-            ->leftJoin('m_employee as C', 'C.id', '=', 'A.assigned_daid');
+            ->leftJoin('m_employee as C', 'C.id', '=', 'A.assigned_daid')
+            ->where(function ($w) use ($empId) {
+                $w->whereNotNull('D.id');
+                if ($empId > 0) {
+                    $w->orWhere('A.assigned_daid', $empId)
+                      ->orWhere('A.assigned_auid', $empId);
+                }
+            });
 
-        return $this->finish($q, fn ($r) => (int) $user->employee_id);
+        return $this->finish($q, fn ($r) => $empId);
     }
 
     /* ---------------- Client: every branch with the same client number ---------------- */
