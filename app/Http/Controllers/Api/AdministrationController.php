@@ -770,6 +770,7 @@ class AdministrationController extends Controller
         $sel[] = DB::raw(($typeName && $this->pick('m_user_staff', ['user_type_id']) ? "T.{$typeName}" : "''") . ' AS user_type');
         $sel[] = DB::raw(($typeName && $hasEmp && $this->pick('m_employee', ['designation_id']) ? "D.{$typeName}" : "''") . ' AS designation');
         $sel[] = DB::raw(($accName && $this->pick('m_user_staff', ['user_access_id']) ? "UA.{$accName}" : "''") . ' AS user_access');
+        $sel[] = DB::raw($hasEmp && $this->pick('m_employee', ['photo_path']) ? 'E.photo_path AS photo' : 'NULL AS photo');
 
         return $q->get($sel)->map(fn ($r) => [
             'id'          => (int) $r->id,
@@ -779,7 +780,21 @@ class AdministrationController extends Controller
             'user_type'   => (string) ($r->user_type ?? ''),
             'user_access' => (string) ($r->user_access ?? ''),
             'is_active'   => (bool) $r->is_active,
+            'photo'       => $this->photoUrl($r->photo ?? null),
         ]);
+    }
+
+    /** employee photo (S3 key in m_employee.photo_path) → link valid for 2 hours */
+    private function photoUrl(?string $key): ?string
+    {
+        $key = trim((string) $key);
+        if ($key === '') return null;
+        if (preg_match('/^https?:\/\//i', $key)) return $key;
+        try {
+            return Storage::disk('s3')->temporaryUrl($key, now()->addHours(2));
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     /** the saved paths: null = never set up */
