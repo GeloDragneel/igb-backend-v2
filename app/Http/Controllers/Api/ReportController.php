@@ -6370,4 +6370,67 @@ class ReportController extends SalesController
         });
         return response()->json(['ok' => true]);
     }
+        public function vatClientsPending(Request $request)
+    {
+        $d = $request->validate([
+            'client_id' => ['required', 'integer', 'min:1'],
+            'from'      => ['required', 'date_format:Y-m'],
+            'to'        => ['required', 'date_format:Y-m'],
+        ]);
+        $ut = $this->vsUndeclaredTable();
+        $list = DB::table($ut)->where('client_id', (int) $d['client_id'])
+            ->whereBetween('old_declared_month', [$d['from'], $d['to']])
+            ->where('is_approved', 0)->where('report', 'EBIR')
+            ->orderBy('old_declared_month')->orderBy('id')->get();
+        if ($list->isEmpty()) return response()->json(['rows' => [], 'total' => 0]);
+ 
+        $refs = $list->pluck('reference_no')->unique()->values()->all();
+        $v = $this->vsVendor();
+        $info = [];
+ 
+        // Sales
+        foreach (DB::table('t_sales_invoice_master as M')->leftJoin('m_vendor_customer as C', 'C.id', '=', 'M.customer_id')
+            ->whereIn('M.invoice_no', $refs)
+            ->get(['M.invoice_no AS ref', 'M.document_no', 'M.transaction_date AS date', "C.{$v} AS name", 'M.total', 'M.sub_total']) as $r) {
+            $info[$r->ref] = ['module' => 'Sales', 'document_no' => $r->document_no, 'date' => $r->date, 'name' => $r->name,
+                'amount' => (float) ($r->total ?? $r->sub_total ?? 0)];
+        }
+        // Purchases / Expenses
+        $peTotal = $this->vsPick('t_purchase_expense_master', ['grand_total', 'total', 'sub_total']) ?? 'total';
+        foreach (DB::table('t_purchase_expense_master as M')->leftJoin('m_vendor_customer as C', 'C.id', '=', 'M.vendor_id')
+            ->whereIn('M.invoice_no', $refs)
+            ->get(['M.invoice_no AS ref', 'M.document_no', 'M.transaction_date AS date', "C.{$v} AS name", "M.{$peTotal} AS amount", 'M.trans_type']) as $r) {
+            $info[$r->ref] ??= ['module' => ucfirst(strtolower((string) $r->trans_type)) ?: 'Purchases', 'document_no' => $r->document_no,
+                'date' => $r->date, 'name' => $r->name, 'amount' => (float) $r->amount];
+        }
+        // Receive Inventory (the E-BIR list uses the GRN's ref_data / grn_no as the reference)
+        if (Schema::hasTable('t_grn_master')) {
+            $grnTotal = $this->vsPick('t_grn_master', ['grand_total', 'total', 'sub_total']);
+            foreach (DB::table('t_grn_master as M')->leftJoin('m_vendor_customer as C', 'C.id', '=', 'M.vendor_id')
+                ->where(fn ($q) => $q->whereIn('M.grn_no', $refs)->orWhereIn('M.ref_data', $refs))
+                ->get(['M.grn_no', 'M.ref_data', 'M.grn_date AS date', "C.{$v} AS name", DB::raw(($grnTotal ? "M.{$grnTotal}" : '0') . ' AS amount')]) as $r) {
+                $row = ['module' => 'Receive Inventory', 'document_no' => $r->ref_data, 'date' => $r->date, 'name' => $r->name, 'amount' => (float) $r->amount];
+                foreach (array_filter([$r->grn_no, $r->ref_data]) as $k) $info[$k] ??= $row;
+            }
+        }
+ 
+        $rows = $list->map(function ($u) use ($info) {
+            $i = $info[$u->reference_no] ?? ['module' => '—', 'document_no' => '', 'date' => null, 'name' => '', 'amount' => 0];
+            return [
+                'id'                    => (int) $u->id,
+                'reference'             => $u->reference_no,
+                'document_no'           => (string) ($i['document_no'] ?? ''),
+                'transaction_date'      => $i['date'] ? substr((string) $i['date'], 0, 10) : null,
+                'fullname'              => (string) ($i['name'] ?? ''),
+                'module'                => $i['module'],
+                'amount'                => round((float) $i['amount'], 2),
+                'old_declared_month'    => substr((string) $u->old_declared_month, 0, 7),
+                'new_declared_month'    => substr((string) $u->new_declared_month, 0, 7),
+                'new_wh_declared_month' => $u->new_wh_declared_month ? substr((string) $u->new_wh_declared_month, 0, 7) : '',
+                'undeclared_at'         => $u->created_at ? substr((string) $u->created_at, 0, 16) : null,
+            ];
+        })->values();
+ 
+        return response()->json(['rows' => $rows, 'total' => round($rows->sum('amount'), 2)]);
+    }
 }
