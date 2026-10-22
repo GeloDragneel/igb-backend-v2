@@ -3327,11 +3327,96 @@ class ReportController extends SalesController
     }
 
     /* GET /api/report-generator/generate?client_num=…&branch=all&filter_type=DM&from=2026-07&to=2026-09&reports[]=P… → ZIP */
+    private function rgPrepare(array $d): array
+    {
+        $type = $d['filter_type'];
+        [$from, $to] = $d['from'] <= $d['to'] ? [$d['from'], $d['to']] : [$d['to'], $d['from']];
+        abort_unless($type === 'DM' ? preg_match('/^\d{4}-\d{2}$/', $from) && preg_match('/^\d{4}-\d{2}$/', $to)
+            : preg_match('/^\d{4}-\d{2}-\d{2}$/', $from) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $to), 422, 'The dates don\'t match the filter type.');
+ 
+        $accounts = ClientAccount::where('client_num', $d['client_num'])->get();
+        abort_if($accounts->isEmpty(), 422, 'Client not found.');
+        $branch = $d['branch'] ?? 'all';
+        $caids = $branch === 'all' ? $accounts->pluck('id')->all() : $accounts->where('id', (int) $branch)->pluck('id')->all();
+        abort_if(!$caids, 422, 'That branch does not belong to this client.');
+        $ids = UserClient::whereIn('caid', $caids)->pluck('id')->all();
+ 
+        $main = $accounts->first(fn ($a) => strtoupper((string) $a->branch_type) === 'MAIN') ?? $accounts->first();
+        $picked = $branch === 'all' ? $main : $accounts->firstWhere('id', (int) $branch);
+        $c = $this->esClient($picked, $accounts->whereIn('id', $caids)->values());
+        $tinText = $c['tin9'] ? implode('-', str_split($c['tin9'], 3)) . '-' . substr($c['branch'], -3) : '';
+        $periodText = $type === 'DM'
+            ? Carbon::parse("{$from}-01")->format('F Y') . ($from !== $to ? ' – ' . Carbon::parse("{$to}-01")->format('F Y') : '')
+            : Carbon::parse($from)->format('M d, Y') . ' – ' . Carbon::parse($to)->format('M d, Y');
+        $head = ['name' => $c['reg_name'] ?: $c['trade_name'], 'tin' => $tinText, 'address' => $c['address'], 'period' => $periodText];
+ 
+        return [$type, $from, $to, $ids, $head];
+    }
+ 
+    private function rgDir(string $token): string
+    {
+        return storage_path('app/tmp/rgp_' . $token);
+    }
+    public function reportGeneratorPart(Request $request)
+    {
+        @set_time_limit(300);
+        @ini_set('memory_limit', '1024M');
+        $d = $request->validate([
+            'client_num'  => ['required', 'string', 'max:60'],
+            'branch'      => ['nullable', 'string', 'max:20'],
+            'filter_type' => ['required', 'in:DM,DT,DE'],
+            'from'        => ['required', 'string', 'max:10'],
+            'to'          => ['required', 'string', 'max:10'],
+            'report'      => ['required', 'string', 'in:' . implode(',', array_keys(self::RG_REPORTS))],
+            'token'       => ['nullable', 'regex:/^[A-Za-z0-9]{20}$/'],
+        ]);
+        [$type, $from, $to, $ids, $head] = $this->rgPrepare($d);
+ 
+        // job folder (old ones – more than a day – are cleared)
+        $token = $d['token'] ?? Str::random(20);
+        $dir = $this->rgDir($token);
+        @mkdir($dir, 0775, true);
+        foreach (glob(storage_path('app/tmp/rgp_*')) ?: [] as $old) {
+            if (is_dir($old) && filemtime($old) < time() - 86400) { array_map('unlink', glob("{$old}/*") ?: []); @rmdir($old); }
+        }
+ 
+        $safe = trim(preg_replace('/[^\w\- .()]+/', '', $head['name'])) ?: 'Client';
+        $zipName = "{$safe} ({$from}).zip";
+ 
+        $reports = $ids ? $this->rgBuild([$d['report']], $ids, $type, $from, $to) : [];
+        $rep = $reports[0] ?? null;
+        if (!$rep) return response()->json(['token' => $token, 'file' => null, 'rows' => 0, 'zip_name' => $zipName]);
+ 
+        $this->rgSheet("{$dir}/{$rep['file']}", $head, $rep);
+        return response()->json(['token' => $token, 'file' => $rep['file'], 'rows' => count($rep['rows'] ?? []), 'zip_name' => $zipName]);
+    }
+ 
+    /* GET /api/report-generator/zip?token=&name= → the ZIP of every report made for this token */
+    public function reportGeneratorZip(Request $request)
+    {
+        $d = $request->validate([
+            'token' => ['required', 'regex:/^[A-Za-z0-9]{20}$/'],
+            'name'  => ['nullable', 'string', 'max:150'],
+        ]);
+        $dir = $this->rgDir($d['token']);
+        $files = glob("{$dir}/*.xlsx") ?: [];
+        abort_if(!$files, 422, 'No reports to put in the ZIP.');
+ 
+        $name = trim(preg_replace('/[^\w\- .()]+/', '', (string) ($d['name'] ?? ''))) ?: 'Reports.zip';
+        if (!str_ends_with(strtolower($name), '.zip')) $name .= '.zip';
+        $zipPath = storage_path('app/tmp/rgp_' . $d['token'] . '.zip');
+ 
+        $zip = new ZipArchive();
+        abort_unless($zip->open($zipPath, ZipArchive::CREATE | ZipArchive::OVERWRITE) === true, 500, 'Could not create the zip file.');
+        foreach ($files as $f) $zip->addFile($f, basename($f));
+        $zip->close();
+        foreach ($files as $f) @unlink($f);
+        @rmdir($dir);
+ 
+        return response()->download($zipPath, $name, ['Content-Type' => 'application/zip'])->deleteFileAfterSend(true);
+    }
     public function reportGeneratorGenerate(Request $request)
     {
-        @set_time_limit(0);
-        @ini_set('memory_limit', '1024M');
-        
         $d = $request->validate([
             'client_num'  => ['required', 'string', 'max:60'],
             'branch'      => ['nullable', 'string', 'max:20'],
