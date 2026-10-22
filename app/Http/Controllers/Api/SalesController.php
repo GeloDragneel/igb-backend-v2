@@ -288,7 +288,7 @@ class SalesController extends Controller
         return response()->json([
             'ticket'  => $ticket,
             'master'  => $master + [
-                'customer_name' => $customer->name ?? 'WALK IN',
+                'customer_name' => $customer->name ?? 'NO CUSTOMER',
                 'account_name'  => $accNames[$master['account_code'] ?? ''] ?? '',
             ],
             'details' => $details->map(fn ($l) => $l + [
@@ -553,8 +553,9 @@ class SalesController extends Controller
             ->first(['id', 'invoice_no', 'declared_month', 'invoice_status_id', 'attachment', 'assigned_daid', 'assigned_auid']);
         if (!$inv) return response()->json(['message' => 'Invoice not found.'], 404);
 
-        if ($this->lockedMonth($caid, [$inv->declared_month, $d['declared_month'], $d['vt_month'] ?? null, $d['it_month'] ?? null])) {
-            return response()->json(['message' => 'Declared Month is disabled'], 422);
+        if ($msg = $this->lockedMessage($caid, ['Declared Month' => $d['declared_month'],
+            '2307 (VT/PT) Declared Month' => $d['vt_month'] ?? null, '2307 (IT) Declared Month' => $d['it_month'] ?? null])) {
+            return response()->json(['message' => $msg], 422);
         }
 
         if (RequestTicket::where('reference_no', $inv->invoice_no)->where('is_status', 0)->exists()) {
@@ -1203,11 +1204,11 @@ class SalesController extends Controller
     // Is one of these months locked for this client account? (m_delared_month_settings)
     private function lockedMonth(?int $caid, array $months): bool
     {
-        $months = array_values(array_filter($months));
+        $months = array_values(array_unique(array_filter(array_map(fn ($m) => substr((string) $m, 0, 7), $months))));
         if (!$caid || !$months) return false;
-
+ 
         return DeclaredMonthSettings::where('ca_id', $caid)
-            ->whereIn('declared_month', $months)
+            ->whereIn(DB::raw('LEFT(declared_month, 7)'), $months)
             ->exists();
     }
     private function invoiceRules(): array
@@ -1629,5 +1630,40 @@ class SalesController extends Controller
         }
 
         return response()->json(['message' => 'blank.pdf not found'], 404);
+    }
+    /* GET /api/declared-months/locked  → { locked: ["2026-07", …] } for the client being worked on
+       (the Sales / Purchases / Expenses pages ask this right when SAVE is pressed) */
+    public function lockedMonthsNow(Request $request)
+    {
+        $caid = $this->caidFor($request);
+        $locked = $caid
+            ? DeclaredMonthSettings::where('ca_id', $caid)->pluck('declared_month')
+                ->map(fn ($m) => substr((string) $m, 0, 7))->unique()->values()
+            : collect();
+        return response()->json(['caid' => $caid, 'locked' => $locked]);
+    }
+ 
+ 
+    /* ============================================================================================
+   ApInvoiceController.php – REPLACE apLocked() with this one (same YYYY-MM compare)
+   ============================================================================================ */
+ 
+    protected function apLocked(?int $caid, array $months): bool
+    {
+        $months = array_values(array_unique(array_filter(array_map(fn ($m) => substr((string) $m, 0, 7), $months))));
+        if (!$caid || !$months) return false;
+        return DeclaredMonthSettings::where('ca_id', $caid)->whereIn(DB::raw('LEFT(declared_month, 7)'), $months)->exists();
+    }
+    protected function lockedMessage(?int $caid, array $labelled): ?string
+    {
+        foreach ($labelled as $label => $m) {
+            $ym = substr((string) $m, 0, 7);
+            if ($ym === '' || !$this->lockedMonth($caid, [$ym])) continue;
+            $name = Carbon::createFromFormat('Y-m', $ym)->format('F Y');
+            return $label === 'saved'
+                ? "This invoice is in {$name}, which is locked – it can't be edited or moved. Unlock {$name} in Declared Month first."
+                : "{$label} is disabled – {$name} is locked.";
+        }
+        return null;
     }
 }

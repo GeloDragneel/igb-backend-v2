@@ -74,6 +74,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/sales/{id}/post', [SalesController::class, 'postInvoice'])->whereNumber('id');
     Route::post('/sales/override', [SalesController::class, 'override']);
     Route::get('/sales/blank-attachment', [SalesController::class, 'blankAttachment']);
+    Route::get('/declared-months/locked', [SalesController::class, 'lockedMonthsNow']);
 
     // routes/api.php – inside the auth:sanctum group.
     // Put them ABOVE any route like /sales/{id} so "document-check" isn't read as an id.

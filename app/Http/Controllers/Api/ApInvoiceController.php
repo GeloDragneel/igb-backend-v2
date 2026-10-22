@@ -554,8 +554,9 @@ abstract class ApInvoiceController extends SalesController
         $inv = $this->apFind($addedBy, 'id', $id);
         if (!$inv) return response()->json(['message' => 'Invoice not found.'], 404);
 
-        if ($this->apLocked($caid, [$inv->declared_month, $d['declared_month'], $d['vt_month'] ?? null, $d['it_month'] ?? null])) {
-            return response()->json(['message' => 'Declared Month is disabled'], 422);
+        if ($msg = $this->lockedMessage($caid, ['Declared Month' => $d['declared_month'],
+            '2307 (VT/PT) Declared Month' => $d['vt_month'] ?? null, '2307 (IT) Declared Month' => $d['it_month'] ?? null])) {
+            return response()->json(['message' => $msg], 422);
         }
         if (RequestTicket::where('reference_no', $inv->invoice_no)->where('is_status', 0)->exists()) {
             return response()->json(['message' => 'Ticket is pending for this invoice. Please wait for approval.'], 422);
