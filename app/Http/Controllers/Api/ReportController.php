@@ -3329,6 +3329,9 @@ class ReportController extends SalesController
     /* GET /api/report-generator/generate?client_num=…&branch=all&filter_type=DM&from=2026-07&to=2026-09&reports[]=P… → ZIP */
     public function reportGeneratorGenerate(Request $request)
     {
+        @set_time_limit(0);
+        @ini_set('memory_limit', '1024M');
+        
         $d = $request->validate([
             'client_num'  => ['required', 'string', 'max:60'],
             'branch'      => ['nullable', 'string', 'max:20'],
