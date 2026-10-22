@@ -2704,7 +2704,8 @@ class ReportController extends SalesController
     private function esParties($ids): array
     {
         $out = [];
-        foreach (VendorCustomer::whereIn('id', collect($ids)->filter()->unique()->values())->get() as $v) {
+        // withoutGlobalScopes: a deleted / hidden customer still has its name and TIN on old invoices
+        foreach (VendorCustomer::withoutGlobalScopes()->whereIn('id', collect($ids)->filter()->unique()->values())->get() as $v) {
             $a = $v->toArray();
             $tinRaw = $this->esFirst($a, ['tin']);
             $nameRaw = $this->esFirst($a, ['name', 'vendor_name', 'registered_name', 'trade_name']);
@@ -2747,7 +2748,7 @@ class ReportController extends SalesController
     }
 
     /* GET /api/reports/esub?type=S&from=2026-07&to=2026-09&name=...   |   type=1604E&year=2026 */
-public function esubReport(Request $request)
+    public function esubReport(Request $request)
     {
         $d = $request->validate([
             'type' => ['required', 'in:P,S,1601EQ_IT,1601EQ_VT,1601EQ_PE,1604E,I'],
@@ -2831,14 +2832,25 @@ public function esubReport(Request $request)
             /* ---------- Sales Summary ---------- */
             case 'S':
                 $ex = 'COALESCE(NULLIF(x.ex_rate,0),1)';
-                $sum = DB::table('t_sales_invoice_detail as x')
+                // the customer is on the invoice (master); older lines often have no customer_id on the detail row,
+                // which made one big line with no TIN / name – take the detail's customer, else the invoice's
+                // inner query: one row per sales line with its customer worked out (pid);
+                // outer query: grouped by that pid – works with MySQL ONLY_FULL_GROUP_BY
+                $lines = DB::table('t_sales_invoice_detail as x')
+                    ->leftJoin('t_sales_invoice_master as sm', function ($j) {
+                        $j->on('sm.invoice_no', '=', 'x.invoice_no')->on('sm.added_by', '=', 'x.added_by');
+                    })
                     ->whereIn('x.added_by', $ids)->where('x.invoice_status_id', '<>', 5)->where('x.trans_type', 'posted')
                     ->whereBetween('x.declared_month', [$from, $to])
-                    ->groupBy('x.customer_id')
-                    ->selectRaw("x.customer_id AS pid,
-                        SUM(COALESCE(x.amount,0)*{$ex}) AS php, SUM(COALESCE(x.net_of_vat,0)*{$ex}) AS net,
-                        SUM(COALESCE(x.input_vat,0)*{$ex}) AS vat, SUM(COALESCE(x.vat_exempt,0)*{$ex}) AS exempt,
-                        SUM(COALESCE(x.zero_rated,0)*{$ex}) AS zero")
+                    ->selectRaw("COALESCE(NULLIF(x.customer_id, 0), sm.customer_id, 0) AS pid, x.invoice_no AS inv,
+                        COALESCE(x.amount,0)*{$ex} AS php, COALESCE(x.net_of_vat,0)*{$ex} AS net,
+                        COALESCE(x.input_vat,0)*{$ex} AS vat, COALESCE(x.vat_exempt,0)*{$ex} AS exempt,
+                        COALESCE(x.zero_rated,0)*{$ex} AS zero");
+                $sum = DB::query()->fromSub($lines, 'l')
+                    ->groupBy('l.pid')
+                    ->selectRaw("l.pid AS pid, COUNT(DISTINCT l.inv) AS ninv,
+                        SUBSTRING_INDEX(GROUP_CONCAT(DISTINCT l.inv ORDER BY l.inv SEPARATOR ', '), ', ', 5) AS invs,
+                        SUM(l.php) AS php, SUM(l.net) AS net, SUM(l.vat) AS vat, SUM(l.exempt) AS exempt, SUM(l.zero) AS zero")
                     ->get();
                 $party = $this->esParties($sum->pluck('pid'));
                 $blank = ['tin' => '', 'name' => '', 'address' => '', 'city' => '', 'tin_raw' => '', 'name_raw' => ''];
@@ -2852,7 +2864,11 @@ public function esubReport(Request $request)
                 ];
                 foreach ($sum as $r) {
                     $v = $party[$r->pid] ?? $blank;
-                    $rows[] = ['tin' => $v['tin'], 'name' => $v['name'], 'address' => $v['address'], 'city' => $v['city'],
+                    if (!isset($party[$r->pid])) {
+                        // still no customer (none on the invoice, or a deleted one): say which invoices, so they can be fixed
+                        $v['name'] = '(NO CUSTOMER) ' . $r->invs . ($r->ninv > 5 ? ' … ' . $r->ninv . ' invoices' : '');
+                    }
+                    $rows[] = ['ref' => $r->invs, 'tin' => $v['tin'], 'name' => $v['name'], 'address' => $v['address'], 'city' => $v['city'],
                         'php' => round($r->php, 2), 'net' => round($r->net, 2), 'vat' => round($r->vat, 2), 'exempt' => round($r->exempt, 2), 'zero' => round($r->zero, 2),
                         '_tin_raw' => $v['tin_raw'], '_name_raw' => $v['name_raw']];
                 }
