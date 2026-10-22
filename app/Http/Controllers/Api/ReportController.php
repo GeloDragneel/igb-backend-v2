@@ -34,12 +34,13 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Cache;
+use App\Http\Controllers\Concerns\EsubValidation;
 class ReportController extends SalesController
 {
+    use EsubValidation;
     /** General Journal (manual JVs + Fixed Asset depreciation posted from Fixed Asset Management) */
     private const GJ_TABLE = 't_general_journal';
     private const CLOSING_PREFIX = 'CE-';      // Closing Entry JVs (CE-2026): shown in the General Ledger only
-
     /*
      * General Journal entry types (t_general_journal.entry_type)
      *   NORMAL    → General Ledger, Trial Balance, Working Trial Balance (DATA columns) and every other report
@@ -2705,12 +2706,16 @@ class ReportController extends SalesController
         $out = [];
         foreach (VendorCustomer::whereIn('id', collect($ids)->filter()->unique()->values())->get() as $v) {
             $a = $v->toArray();
+            $tinRaw = $this->esFirst($a, ['tin']);
+            $nameRaw = $this->esFirst($a, ['name', 'vendor_name', 'registered_name', 'trade_name']);
             $out[$v->id] = [
-                'tin'     => preg_replace('/\D/', '', $this->esFirst($a, ['tin'])),
-                'branch'  => $this->esClean($this->esFirst($a, ['branch_code'])),
-                'name'    => $this->esClean($this->esFirst($a, ['name', 'vendor_name', 'registered_name', 'trade_name'])),
-                'address' => $this->esClean($this->esFirst($a, ['mail_to_address', 'address', 'street'])),
-                'city'    => $this->esClean($this->esFirst($a, ['mail_to_city_country', 'city_country', 'city'])),
+                'tin'      => preg_replace('/\D/', '', $tinRaw),
+                'branch'   => $this->esClean($this->esFirst($a, ['branch_code'])),
+                'name'     => $this->esClean($nameRaw),
+                'address'  => $this->esClean($this->esFirst($a, ['mail_to_address', 'address', 'street'])),
+                'city'     => $this->esClean($this->esFirst($a, ['mail_to_city_country', 'city_country', 'city'])),
+                'tin_raw'  => $tinRaw,
+                'name_raw' => $nameRaw,
             ];
         }
         return $out;
@@ -2752,17 +2757,17 @@ class ReportController extends SalesController
             'name' => ['nullable', 'string', 'max:200'],
         ]);
         abort_if($d['type'] === 'I', 422, "Summary of Importation isn't available yet. The importation tables haven't been moved to the new system.");
-
+ 
         [$ids, $account, $branches] = $this->journalScope($request, 'all');
         $c = $this->esClient($account, $branches);
         abort_if($c['tin9'] === '', 422, "This client has no TIN yet. Add the BIR valid ID to the client's record first.");
-
+ 
         $tin = $c['tin9'];
         $name = $this->esClean($d['name'] ?? '') ?: $c['reg_name'];
         $from = $d['from'] ?? null;
         $to = $d['to'] ?? $from;
         if ($from && $to && $to < $from) [$from, $to] = [$to, $from];
-
+ 
         // period values from the From month (same as old dat.php)
         if ($from) {
             [$y, $mo] = array_map('intval', explode('-', $from));
@@ -2770,10 +2775,13 @@ class ReportController extends SalesController
             $mmYYYY = sprintf('%02d/%04d', $mo, $y);
             $fileDate = sprintf('%02d%04d', $mo, $y);
         }
-
+ 
         $M = fn ($v) => $this->esMoney($v);
+        $X = fn ($v) => $this->esDatText($v);                        // names: upper case, Ñ → N, no commas / quotes
+        $A = fn ($v) => $this->esDatAddress($v);                     // addresses: same + characters RELIEF doesn't take dropped
+        $T = fn ($v) => substr(preg_replace('/\D/', '', (string) $v), 0, 9);   // TIN: 9 digits
         $columns = []; $rows = []; $totals = []; $content = ''; $filename = '';
-
+ 
         switch ($d['type']) {
             /* ---------- Purchase Summary ---------- */
             case 'P':
@@ -2791,8 +2799,8 @@ class ReportController extends SalesController
                     ->get();
                 $lines = $grn->concat($ap);
                 $party = $this->esParties($lines->pluck('pid'));
-                $blank = ['tin' => '', 'name' => '', 'address' => '', 'city' => ''];
-
+                $blank = ['tin' => '', 'name' => '', 'address' => '', 'city' => '', 'tin_raw' => '', 'name_raw' => ''];
+ 
                 $columns = [
                     ['key' => 'ref', 'label' => 'Reference'], ['key' => 'tin', 'label' => 'TIN'], ['key' => 'name', 'label' => 'Registered Name'],
                     ['key' => 'address', 'label' => 'Street and Barangay'], ['key' => 'city', 'label' => 'City'],
@@ -2803,18 +2811,20 @@ class ReportController extends SalesController
                 foreach ($lines as $r) {
                     $v = $party[$r->pid] ?? $blank;
                     $rows[] = ['ref' => $r->ref, 'tin' => $v['tin'], 'name' => $v['name'], 'address' => $v['address'], 'city' => $v['city'],
-                        'php' => round($r->php, 2), 'net' => round($r->net, 2), 'vat' => round($r->vat, 2), 'exempt' => round($r->exempt, 2), 'zero' => round($r->zero, 2)];
+                        'php' => round($r->php, 2), 'net' => round($r->net, 2), 'vat' => round($r->vat, 2), 'exempt' => round($r->exempt, 2), 'zero' => round($r->zero, 2),
+                        '_tin_raw' => $v['tin_raw'], '_name_raw' => $v['name_raw']];
                 }
                 $t = fn ($k) => round(array_sum(array_column($rows, $k)), 2);
                 $totals = ['php' => $t('php'), 'net' => $t('net'), 'vat' => $t('vat'), 'exempt' => $t('exempt'), 'zero' => $t('zero')];
-
-                $content .= "H,P,{$tin},{$name}.,,,,{$c['trade_name']},{$c['address']},0,0,{$M($totals['exempt'])},{$M($totals['zero'])},{$M($totals['net'])},{$M($totals['vat'])},{$M($totals['vat'])},,{$c['rdo']},{$periodEnd},12\n";
-                foreach ($rows as $r) {
-                    $content .= "D,P,{$r['tin']},{$r['name']},,,,{$r['address']},{$r['city']},0,0,{$M($r['exempt'])},{$M($r['zero'])},{$M($r['net'])},{$M($r['vat'])},{$tin},{$periodEnd},,,,\n";
+ 
+                $content .= "H,P,{$tin},{$X($name)}.,,,,{$X($c['trade_name'])},{$A($c['address'])},0,0,{$M($totals['exempt'])},{$M($totals['zero'])},{$M($totals['net'])},{$M($totals['vat'])},{$M($totals['vat'])},,{$c['rdo']},{$periodEnd},12\n";
+                // one DAT line per TIN (RELIEF); the table above keeps one line per reference
+                foreach ($this->esConsolidate($rows, ['php', 'net', 'vat', 'exempt', 'zero']) as $r) {
+                    $content .= "D,P,{$T($r['tin'])},{$X($r['_name_raw'] ?: $r['name'])},,,,{$A($r['address'])},{$A($r['city'])},0,0,{$M($r['exempt'])},{$M($r['zero'])},{$M($r['net'])},{$M($r['vat'])},{$tin},{$periodEnd},,,,\n";
                 }
                 $filename = "{$tin}P{$fileDate}.dat";
                 break;
-
+ 
             /* ---------- Sales Summary ---------- */
             case 'S':
                 $ex = 'COALESCE(NULLIF(x.ex_rate,0),1)';
@@ -2828,8 +2838,8 @@ class ReportController extends SalesController
                         SUM(COALESCE(x.zero_rated,0)*{$ex}) AS zero")
                     ->get();
                 $party = $this->esParties($sum->pluck('pid'));
-                $blank = ['tin' => '', 'name' => '', 'address' => '', 'city' => ''];
-
+                $blank = ['tin' => '', 'name' => '', 'address' => '', 'city' => '', 'tin_raw' => '', 'name_raw' => ''];
+ 
                 $columns = [
                     ['key' => 'tin', 'label' => 'TIN'], ['key' => 'name', 'label' => 'Registered Name'],
                     ['key' => 'address', 'label' => 'Street and Barangay'], ['key' => 'city', 'label' => 'City'],
@@ -2840,31 +2850,32 @@ class ReportController extends SalesController
                 foreach ($sum as $r) {
                     $v = $party[$r->pid] ?? $blank;
                     $rows[] = ['tin' => $v['tin'], 'name' => $v['name'], 'address' => $v['address'], 'city' => $v['city'],
-                        'php' => round($r->php, 2), 'net' => round($r->net, 2), 'vat' => round($r->vat, 2), 'exempt' => round($r->exempt, 2), 'zero' => round($r->zero, 2)];
+                        'php' => round($r->php, 2), 'net' => round($r->net, 2), 'vat' => round($r->vat, 2), 'exempt' => round($r->exempt, 2), 'zero' => round($r->zero, 2),
+                        '_tin_raw' => $v['tin_raw'], '_name_raw' => $v['name_raw']];
                 }
                 $t = fn ($k) => round(array_sum(array_column($rows, $k)), 2);
                 $totals = ['php' => $t('php'), 'net' => $t('net'), 'vat' => $t('vat'), 'exempt' => $t('exempt'), 'zero' => $t('zero')];
-
-                $content .= "H,S,{$tin},{$name},,,,{$c['trade_name']},{$c['address']},{$M($totals['exempt'])},{$M($totals['zero'])},{$M($totals['net'])},{$M($totals['vat'])},{$c['rdo']},{$periodEnd},12,\n";
-                foreach ($rows as $r) {
-                    $content .= "D,S,{$r['tin']},{$r['name']},,,,{$r['address']},{$r['city']},{$M($r['exempt'])},{$M($r['zero'])},{$M($r['net'])},{$M($r['vat'])},{$tin},{$periodEnd},,,\n";
+ 
+                $content .= "H,S,{$tin},{$X($name)},,,,{$X($c['trade_name'])},{$A($c['address'])},{$M($totals['exempt'])},{$M($totals['zero'])},{$M($totals['net'])},{$M($totals['vat'])},{$c['rdo']},{$periodEnd},12,\n";
+                foreach ($this->esConsolidate($rows, ['php', 'net', 'vat', 'exempt', 'zero']) as $r) {
+                    $content .= "D,S,{$T($r['tin'])},{$X($r['_name_raw'] ?: $r['name'])},,,,{$A($r['address'])},{$A($r['city'])},{$M($r['exempt'])},{$M($r['zero'])},{$M($r['net'])},{$M($r['vat'])},{$tin},{$periodEnd},,,\n";
                 }
                 $filename = "{$tin}S{$fileDate}.dat";
                 break;
-
+ 
             /* ---------- 1601EQ (Sales IT / Sales VT / Purchases & Expenses) and 1604E ---------- */
             default:
                 $is1604 = $d['type'] === '1604E';
                 $kind = $is1604 ? 'PE' : substr($d['type'], 7);   // IT | VT | PE
                 $year = $d['year'] ?? null;
-
+ 
                 $list = $this->esWithheld($kind, $ids, $is1604
                     ? fn ($q, $col) => $q->where($col, 'like', "{$year}-%")
                     : fn ($q, $col) => $q->whereBetween($col, [$from, $to]));
                 $party = $this->esParties($list->pluck('pid'));
                 $atc = DB::table('m_atc')->whereIn('id', $list->pluck('atc')->filter()->unique())->get(['id', 'name', 'rate'])->keyBy('id');
-                $blank = ['tin' => '', 'branch' => '', 'name' => ''];
-
+                $blank = ['tin' => '', 'branch' => '', 'name' => '', 'tin_raw' => '', 'name_raw' => ''];
+ 
                 $columns = array_values(array_filter([
                     ['key' => 'tin', 'label' => 'TIN'],
                     $is1604 ? null : ['key' => 'doc', 'label' => 'Document No'],
@@ -2876,38 +2887,44 @@ class ReportController extends SalesController
                     $v = $party[$r->pid] ?? $blank;
                     $a = $atc[$r->atc] ?? null;
                     $rows[] = ['tin' => $v['tin'], 'doc' => $r->doc, 'branch' => $v['branch'], 'name' => $v['name'],
-                        'atc' => $a->name ?? '', 'base' => round($r->base, 2), 'rate' => round($this->esPct($a->rate ?? 0), 2), 'tax' => round($r->tax, 2)];
+                        'atc' => $a->name ?? '', 'base' => round($r->base, 2), 'rate' => round($this->esPct($a->rate ?? 0), 2), 'tax' => round($r->tax, 2),
+                        '_tin_raw' => $v['tin_raw'], '_name_raw' => $v['name_raw']];
                 }
                 $totals = ['base' => round(array_sum(array_column($rows, 'base')), 2), 'tax' => round(array_sum(array_column($rows, 'tax')), 2)];
-
+ 
                 if ($is1604) {
                     $yearEnd = "12/31/{$year}";
                     $content .= "H1604E,{$tin},{$c['branch']},{$yearEnd},N,0,{$c['rdo']},,,,,,,,,\n";
                     foreach ($rows as $i => $r) {
                         $n = $i + 1;
-                        $content .= "D3,1604E,{$tin},0000,{$yearEnd},{$n},{$r['tin']},{$r['branch']},{$r['name']},,,,{$r['atc']},{$M($r['base'])}," . intval($r['rate']) . ",{$M($r['tax'])}\n";
+                        $content .= "D3,1604E,{$tin},0000,{$yearEnd},{$n},{$T($r['tin'])},{$r['branch']},{$X($r['_name_raw'] ?: $r['name'])},,,,{$r['atc']},{$M($r['base'])}," . intval($r['rate']) . ",{$M($r['tax'])}\n";
                     }
                     $content .= "C3,1604E,{$tin},{$c['branch']},{$yearEnd},{$M($totals['tax'])},,,,,,,,,,\n";
                     $filename = "{$tin}00001231{$year}1604E.dat";
                 } else {
-                    $content .= "HQAP,H1601EQ,{$tin},{$c['branch']},{$name},{$mmYYYY},{$c['rdo']},,,,,,,\n";
+                    $content .= "HQAP,H1601EQ,{$tin},{$c['branch']},{$X($name)},{$mmYYYY},{$c['rdo']},,,,,,,\n";
                     foreach ($rows as $i => $r) {
                         $n = $i + 1;
                         $rate = rtrim(rtrim(number_format($r['rate'], 2, '.', ''), '0'), '.');
-                        $content .= "D1,1601EQ,{$n},{$r['tin']},{$r['branch']},{$r['name']},,,,{$mmYYYY},{$r['atc']},{$rate},{$M($r['base'])},{$M($r['tax'])}\n";
+                        $content .= "D1,1601EQ,{$n},{$T($r['tin'])},{$r['branch']},{$X($r['_name_raw'] ?: $r['name'])},,,,{$mmYYYY},{$r['atc']},{$rate},{$M($r['base'])},{$M($r['tax'])}\n";
                     }
                     $content .= "C1,1601EQ,{$tin},{$c['branch']},{$mmYYYY},{$M($totals['base'])},{$M($totals['tax'])},,,,,,,\n";
                     $filename = "{$tin}0000{$fileDate}1601EQ.dat";
                 }
         }
-
+ 
         $titles = [
             'P' => 'Purchase Summary', 'S' => 'Sales Summary',
             '1601EQ_IT' => '1601EQ / Sales / IT', '1601EQ_VT' => '1601EQ / Sales / VT',
             '1601EQ_PE' => '1601EQ / Purchases & Expenses', '1604E' => '1604E',
         ];
-
+ 
+        // RELIEF-style checks; with errors there is no DAT (the screen lists what to fix)
+        $check = $this->esValidate($d['type'], $rows, $c, $from, $to);
+        $rows = array_map(fn ($r) => array_diff_key($r, ['_tin_raw' => 1, '_name_raw' => 1]), $rows);
+ 
         return response()->json([
+            'validation' => $check,
             'company' => [
                 'name' => $name, 'trade_name' => $c['trade_name'],
                 'tin' => $tin . substr($c['branch'], -3), 'address' => $c['address'], 'rdo' => $c['rdo'],
@@ -2917,7 +2934,7 @@ class ReportController extends SalesController
             'columns' => $columns,
             'rows'    => $rows,
             'totals'  => $totals,
-            'dat'     => ['filename' => $filename, 'content' => $content],
+            'dat'     => ['filename' => $filename, 'content' => $check['ok'] ? $content : null],
         ]);
     }
     /* ======================= Income Tax Summary (old Income_Statement.php) ======================= */

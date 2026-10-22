@@ -30,9 +30,18 @@ class BillingController extends Controller
 
     private static array $cols = [];
 
+    /** does the table exist? cached 1 hour (Schema::hasTable asks information_schema, slow on a big MySQL server) */
+    private function hasTable(string $table): bool
+    {
+        static $seen = [];
+        return $seen[$table] ??= (bool) \Illuminate\Support\Facades\Cache::remember("billing:table:{$table}", 3600, fn () => Schema::hasTable($table) ? 1 : 0);
+    }
+
     private function cols(string $table): array
     {
-        return self::$cols[$table] ??= Schema::hasTable($table) ? Schema::getColumnListing($table) : [];
+        // column lists rarely change: keep them 1 hour instead of asking MySQL's information_schema on every request
+        return self::$cols[$table] ??= \Illuminate\Support\Facades\Cache::remember("billing:cols:{$table}", 3600,
+            fn () => $this->hasTable($table) ? Schema::getColumnListing($table) : []);
     }
 
     private function pick(string $table, array $names): ?string
@@ -43,7 +52,7 @@ class BillingController extends Controller
 
     private function firstTable(array $names): ?string
     {
-        foreach ($names as $n) if (Schema::hasTable($n)) return $n;
+        foreach ($names as $n) if ($this->hasTable($n)) return $n;
         return null;
     }
 
@@ -142,7 +151,7 @@ class BillingController extends Controller
             ->orderBy('L.name')
             ->get(['L.id', 'L.name', 'L.ser_type_id', DB::raw('MIN(F.id) AS fee_id'), DB::raw($feeCol ? "COALESCE(MIN(F.{$feeCol}), 0) AS fee" : '0 AS fee')]);
 
-        $list = fn (string $t) => Schema::hasTable($t) ? DB::table($t)->orderBy('id')->get(['id', 'name']) : [];
+        $list = fn (string $t) => $this->hasTable($t) ? DB::table($t)->orderBy('id')->get(['id', 'name']) : [];
 
         return response()->json([
             'services'        => $services,
@@ -150,7 +159,7 @@ class BillingController extends Controller
             'payment_types'   => $list('m_payment_type'),
             'cheque_types'    => $list('m_payment_cheque_type'),
             'receipt_types'   => $list('m_payment_receipt_type'),
-            'col_types'       => Schema::hasTable('m_payment_col_type')
+            'col_types'       => $this->hasTable('m_payment_col_type')
                 ? DB::table('m_payment_col_type')->when(in_array('is_active', $this->cols('m_payment_col_type'), true), fn ($q) => $q->where('is_active', 1))->orderBy('id')->get(['id', 'name'])
                 : [],
             'return_statuses' => $list('m_payment_return_status'),
@@ -232,11 +241,43 @@ class BillingController extends Controller
     {
         return $request->validate([
             'ca_id' => ['nullable', 'integer'],
+            'client_num' => ['nullable', 'string', 'max:50'],          // "Client" view: every account of this client
+            'service_period' => ['nullable', 'string', 'max:60'],      // "Client" view: one period across the accounts
+            'groups' => ['nullable', 'string', 'max:40'],              // pf,eo,returns (any of them)
             'trans_number' => ['nullable', 'string', 'max:60'],
             'status' => ['nullable', 'in:unpaid,partial,paid,void,cancelled,open'],
             'q' => ['nullable', 'string', 'max:100'],
             'limit' => ['nullable', 'integer', 'min:1', 'max:2000'],
         ]);
+    }
+
+    /** every account (m_client_account.id) of one client */
+    private function clientCaids(string $clientNum): array
+    {
+        return DB::table('m_client_account')->where('client_num', $clientNum)->pluck('id')->map(fn ($v) => (int) $v)->all();
+    }
+
+    /** "pf,eo" → the GROUPS picked (empty = all) */
+    private function pickedGroups(?string $groups): array
+    {
+        $keys = array_filter(array_map('trim', explode(',', (string) $groups)));
+        return array_values(array_intersect_key(self::GROUPS, array_flip($keys)));
+    }
+
+    /** the trans numbers of a client's accounts in one service period */
+    private function periodTrans(array $caids, string $period)
+    {
+        return DB::table('t_transaction')->whereIn('ca_id', $caids ?: [0])->where('service_period', $period)->select('trans_number');
+    }
+
+    /* GET /api/billing/clients/{clientNum}/periods   service periods across all the client's accounts (newest first) */
+    public function clientPeriods(string $clientNum)
+    {
+        $rows = DB::table('t_transaction')->whereIn('ca_id', $this->clientCaids($clientNum) ?: [0])->whereNotNull('service_period')
+            ->groupBy('service_period')
+            ->selectRaw('service_period, MAX(date_start) AS d, COUNT(*) AS soas, MIN(COALESCE(is_paid,0)) AS all_paid')
+            ->orderByDesc('d')->get();
+        return response()->json($rows->map(fn ($r) => ['service_period' => $r->service_period, 'soas' => (int) $r->soas, 'closed' => (bool) $r->all_paid])->values());
     }
 
     private function accountJoin($q, string $caCol): void
@@ -251,7 +292,13 @@ class BillingController extends Controller
     public function services(Request $request)
     {
         $f = $this->filters($request);
-        $paidSub = DB::table('t_payment')->whereNotNull('service_id')->groupBy('service_id')
+        $clientCa = !empty($f['client_num']) ? $this->clientCaids($f['client_num']) : null;
+        // payments of THIS account / SOA only – summing every payment in the database made each load slow
+        $paidSub = DB::table('t_payment')->whereNotNull('service_id')
+            ->when(!empty($f['ca_id']), fn ($q) => $q->where('ca_id', $f['ca_id']))
+            ->when($clientCa !== null, fn ($q) => $q->whereIn('ca_id', $clientCa ?: [0]))
+            ->when(!empty($f['trans_number']), fn ($q) => $q->where('trans_number', $f['trans_number']))
+            ->groupBy('service_id')
             ->selectRaw('service_id, SUM(amount) AS paid');
 
         $q = DB::table('t_service as S')
@@ -272,7 +319,10 @@ class BillingController extends Controller
         $this->accountJoin($q, 'S.ca_id');
 
         if (!empty($f['ca_id'])) $q->where('S.ca_id', $f['ca_id']);
+        if ($clientCa !== null) $q->whereIn('S.ca_id', $clientCa ?: [0]);
+        if (!empty($f['service_period'])) $q->where('S.service_period', $f['service_period']);
         if (!empty($f['trans_number'])) $q->where('S.trans_number', $f['trans_number']);
+        if ($g = $this->pickedGroups($f['groups'] ?? null)) $q->whereIn('L.ser_type_id', collect($g)->flatMap(fn ($x) => $x['ser_types'])->all());
         $st = $f['status'] ?? null;
         if ($st) {
             $map = ['paid' => [self::PAID], 'unpaid' => [self::UNPAID], 'partial' => [self::PARTIAL], 'void' => [self::VOID],
@@ -287,7 +337,7 @@ class BillingController extends Controller
 
         $limit = (int) ($f['limit'] ?? 500);
         $rows = $q->orderByDesc('S.prep_target_date')->orderByDesc('S.id')->limit($limit + 1)->get();
-        $logCounts = Schema::hasTable('t_service_override_log')
+        $logCounts = $this->hasTable('t_service_override_log')
             ? DB::table('t_service_override_log')->whereIn('service_id', $rows->pluck('id'))->groupBy('service_id')->selectRaw('service_id, COUNT(*) AS n')->pluck('n', 'service_id')
             : collect();
 
@@ -323,7 +373,11 @@ class BillingController extends Controller
         $this->accountJoin($q, 'P.ca_id');
 
         if (!empty($f['ca_id'])) $q->where('P.ca_id', $f['ca_id']);
+        $clientCa = !empty($f['client_num']) ? $this->clientCaids($f['client_num']) : null;
+        if ($clientCa !== null) $q->whereIn('P.ca_id', $clientCa ?: [0]);
+        if (!empty($f['service_period'])) $q->whereIn('P.trans_number', $this->periodTrans($clientCa ?? array_filter([(int) ($f['ca_id'] ?? 0)]), $f['service_period']));
         if (!empty($f['trans_number'])) $q->where('P.trans_number', $f['trans_number']);
+        if ($g = $this->pickedGroups($f['groups'] ?? null)) $q->whereIn('P.payment_col_type_id', array_column($g, 'col_type'));
         if (!empty($f['q'])) {
             $like = '%' . $f['q'] . '%';
             $q->where(fn ($w) => $w->where('L.name', 'like', $like)->orWhere('P.trans_number', 'like', $like)
@@ -350,18 +404,22 @@ class BillingController extends Controller
        ===================================================================== */
 
     /** PF / Returns / Non-recurring: bill − payments, for one SOA, one account, or nothing (zeros) */
-    private function groupTotals(?int $caid, ?string $transNumber): array
+    private function groupTotals(?int $caid, ?string $transNumber, ?array $caids = null, ?string $period = null): array
     {
         $bills = collect();
         $paid = collect();
-        if ($caid || $transNumber) {
+        if ($caid || $transNumber || $caids !== null) {
             $bills = DB::table('t_service as S')->leftJoin('m_service_list as L', 'L.id', '=', 'S.ser_list_id')
                 ->when($caid, fn ($q) => $q->where('S.ca_id', $caid))
+                ->when($caids !== null, fn ($q) => $q->whereIn('S.ca_id', $caids ?: [0]))
+                ->when($period, fn ($q) => $q->where('S.service_period', $period))
                 ->when($transNumber, fn ($q) => $q->where('S.trans_number', $transNumber))
                 ->whereNotIn(DB::raw('COALESCE(S.invoice_status_id, 0)'), [self::VOID, self::CANCELLED])
                 ->groupBy('L.ser_type_id')->selectRaw('L.ser_type_id AS t, SUM(' . $this->netSql() . ') AS amt')->pluck('amt', 't');
             $paid = DB::table('t_payment')
                 ->when($caid, fn ($q) => $q->where('ca_id', $caid))
+                ->when($caids !== null, fn ($q) => $q->whereIn('ca_id', $caids ?: [0]))
+                ->when($period, fn ($q) => $q->whereIn('trans_number', $this->periodTrans($caids ?? array_filter([(int) $caid]), $period)))
                 ->when($transNumber, fn ($q) => $q->where('trans_number', $transNumber))
                 ->groupBy('payment_col_type_id')->selectRaw('payment_col_type_id AS t, SUM(amount) AS amt')->pluck('amt', 't');
         }
@@ -377,8 +435,10 @@ class BillingController extends Controller
     /* GET /api/billing/totals?ca_id=&trans_number=   (always shown on the page) */
     public function totals(Request $request)
     {
-        $d = $request->validate(['ca_id' => ['nullable', 'integer'], 'trans_number' => ['nullable', 'string', 'max:60']]);
-        return response()->json($this->groupTotals($d['ca_id'] ?? null, $d['trans_number'] ?? null));
+        $d = $request->validate(['ca_id' => ['nullable', 'integer'], 'trans_number' => ['nullable', 'string', 'max:60'],
+            'client_num' => ['nullable', 'string', 'max:50'], 'service_period' => ['nullable', 'string', 'max:60']]);
+        $caids = !empty($d['client_num']) ? $this->clientCaids($d['client_num']) : null;
+        return response()->json($this->groupTotals($d['ca_id'] ?? null, $d['trans_number'] ?? null, $caids, $d['service_period'] ?? null));
     }
 
     /* GET /api/billing/soa/{transNumber} */
@@ -387,8 +447,10 @@ class BillingController extends Controller
         $t = DB::table('t_transaction')->where('trans_number', $transNumber)->first();
         if (!$t) return response()->json(['message' => 'SOA not found.'], 404);
 
-        $logCounts = Schema::hasTable('t_service_override_log')
-            ? DB::table('t_service_override_log')->groupBy('service_id')->selectRaw('service_id, COUNT(*) AS n')->pluck('n', 'service_id')
+        $logCounts = $this->hasTable('t_service_override_log')
+            ? DB::table('t_service_override_log')
+                ->whereIn('service_id', DB::table('t_service')->where('trans_number', $transNumber)->select('id'))
+                ->groupBy('service_id')->selectRaw('service_id, COUNT(*) AS n')->pluck('n', 'service_id')
             : collect();
 
         $services = DB::table('t_service as S')
@@ -648,7 +710,7 @@ class BillingController extends Controller
     /* GET /api/billing/services/{id}/logs */
     public function serviceLogs(int $id)
     {
-        if (!Schema::hasTable('t_service_override_log')) return response()->json([]);
+        if (!$this->hasTable('t_service_override_log')) return response()->json([]);
         return response()->json(
             DB::table('t_service_override_log as A')
                 ->leftJoin('m_employee as E', 'E.id', '=', 'A.override_by')
@@ -699,7 +761,7 @@ class BillingController extends Controller
         ]);
         foreach (['payment_type_id' => ['m_payment_type', 'Payment method'], 'payment_col_type_id' => ['m_payment_col_type', 'Collection type'],
                   'receipt_type_id' => ['m_payment_receipt_type', 'Receipt type'], 'cheque_type_id' => ['m_payment_cheque_type', 'Cheque type']] as $f => [$t, $label]) {
-            if (!empty($d[$f]) && Schema::hasTable($t) && !DB::table($t)->where('id', $d[$f])->exists()) {
+            if (!empty($d[$f]) && $this->hasTable($t) && !DB::table($t)->where('id', $d[$f])->exists()) {
                 return response()->json(['message' => "{$label} #{$d[$f]} doesn't exist in {$t}."], 422);
             }
         }
@@ -1578,7 +1640,7 @@ class BillingController extends Controller
             ->leftJoin('m_payment_col_type as COL', 'COL.id', '=', 'P.payment_col_type_id')
             ->leftJoin('t_service as S', 'S.id', '=', 'P.service_id')
             ->select(['P.*', DB::raw('PT.name AS payment_type'), DB::raw('COL.name AS col_type')]);
-        if ($retCol && Schema::hasTable('m_payment_return_status')) {
+        if ($retCol && $this->hasTable('m_payment_return_status')) {
             $q->leftJoin('m_payment_return_status as RS', 'RS.id', '=', "S.{$retCol}")->addSelect(DB::raw('RS.name AS return_status'));
         } else {
             $q->addSelect(DB::raw('NULL AS return_status'));

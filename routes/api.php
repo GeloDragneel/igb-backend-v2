@@ -437,6 +437,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::get('/billing/return-ar/accounts', [BillingController::class, 'returnArAccounts']);
     Route::put('/billing/return-ar/services/{id}', [BillingController::class, 'updateReturnService'])->whereNumber('id');
+    Route::get('/billing/clients/{clientNum}/periods', [BillingController::class, 'clientPeriods']);
 
     // ---------- Client → Masterlist ----------
     Route::get('/clients/lookups', [ClientController::class, 'lookups']);
