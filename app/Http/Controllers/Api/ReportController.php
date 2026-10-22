@@ -2824,12 +2824,12 @@ class ReportController extends SalesController
                 $t = fn ($k) => round((float) $lines->sum(fn ($x) => (float) $x->{$k}), 2);
                 $totals = ['php' => $t('php'), 'net' => $t('net'), 'vat' => $t('vat'), 'exempt' => $t('exempt'), 'zero' => $t('zero')];
  
-                // H,P,TIN,Name,Last,First,Middle,Trade,Address1,Address2,Exempt,Zero rated,Services,Capital goods,Other goods,Input tax,Creditable,Non-creditable,RDO,Period,Fiscal month
-                $content .= "H,P,{$tin},{$X($name)},,,,{$X($c['trade_name'])},{$addr1},{$addr2},{$M($totals['exempt'])},{$M($totals['zero'])},0.00,0.00,{$M($totals['net'])},{$M($totals['vat'])},{$M($totals['vat'])},0.00,{$c['rdo']},{$periodEnd},12\n";
+                // exactly the old ajax/dat.php layout (Address 1 / Address 2 = the old "street barangay, city province zip" split at the comma)
+                $content .= "H,P,{$tin},{$X($name)}.,,,,{$X($c['trade_name'])},{$addr1},{$addr2},0,0,{$M($totals['exempt'])},{$M($totals['zero'])},{$M($totals['net'])},{$M($totals['vat'])},{$M($totals['vat'])},,{$c['rdo']},{$periodEnd},12\n";
                 // one DAT line per TIN (RELIEF); the table above keeps one line per reference
                 foreach ($this->esConsolidate($rows, ['php', 'net', 'vat', 'exempt', 'zero']) as $r) {
-                    // D,P,TIN,Name,Last,First,Middle,Address1,Address2,Exempt,Zero rated,Services,Capital goods,Other goods,Input tax,Owner TIN,Period
-                    $content .= "D,P,{$T($r['tin'])},{$X($r['_name_raw'] ?: $r['name'])},,,,{$A($r['address'])},{$A($r['city'])},{$M($r['exempt'])},{$M($r['zero'])},0.00,0.00,{$M($r['net'])},{$M($r['vat'])},{$tin},{$periodEnd}\n";
+                    // old layout: D,P,TIN,Name,,,,Address,City,0,0,Exempt,Zero,Net,VAT,Owner TIN,Period,,,,
+                    $content .= "D,P,{$T($r['tin'])},{$X($r['_name_raw'] ?: $r['name'])},,,,{$A($r['address'])},{$A($r['city'])},0,0,{$M($r['exempt'])},{$M($r['zero'])},{$M($r['net'])},{$M($r['vat'])},{$tin},{$periodEnd},,,,\n";
                 }
                 $filename = "{$tin}P{$fileDate}.dat";
                 break;
@@ -2882,10 +2882,10 @@ class ReportController extends SalesController
  
                 // H,S,TIN,Name,Last,First,Middle,Trade,Address1,Address2,Exempt,Zero rated,Taxable,Output tax,RDO,Period,Fiscal month
                 // (Address 2 was missing: every field after it moved one place left → "Invalid RDO CODE" / "Invalid date on Tax Month")
-                $content .= "H,S,{$tin},{$X($name)},,,,{$X($c['trade_name'])},{$addr1},{$addr2},{$M($totals['exempt'])},{$M($totals['zero'])},{$M($totals['net'])},{$M($totals['vat'])},{$c['rdo']},{$periodEnd},12\n";
+                $content .= "H,S,{$tin},{$X($name)},,,,{$X($c['trade_name'])},{$addr1},{$addr2},{$M($totals['exempt'])},{$M($totals['zero'])},{$M($totals['net'])},{$M($totals['vat'])},{$c['rdo']},{$periodEnd},12,\n";
                 foreach ($this->esConsolidate($rows, ['php', 'net', 'vat', 'exempt', 'zero']) as $r) {
-                    // D,S,TIN,Name,Last,First,Middle,Address1,Address2,Exempt,Zero rated,Taxable,Output tax,Owner TIN,Period
-                    $content .= "D,S,{$T($r['tin'])},{$X($r['_name_raw'] ?: $r['name'])},,,,{$A($r['address'])},{$A($r['city'])},{$M($r['exempt'])},{$M($r['zero'])},{$M($r['net'])},{$M($r['vat'])},{$tin},{$periodEnd}\n";
+                    // old layout: D,S,TIN,Name,,,,Address,City,Exempt,Zero,Net,VAT,Owner TIN,Period,,,
+                    $content .= "D,S,{$T($r['tin'])},{$X($r['_name_raw'] ?: $r['name'])},,,,{$A($r['address'])},{$A($r['city'])},{$M($r['exempt'])},{$M($r['zero'])},{$M($r['net'])},{$M($r['vat'])},{$tin},{$periodEnd},,,\n";
                 }
                 $filename = "{$tin}S{$fileDate}.dat";
                 break;
