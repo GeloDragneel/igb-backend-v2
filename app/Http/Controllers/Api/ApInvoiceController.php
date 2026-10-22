@@ -47,7 +47,7 @@ abstract class ApInvoiceController extends SalesController
     protected string $apModule;        // ticket module name
     protected array  $apTransferTo;    // where a scanned receipt can be moved
     protected string $apDefaultItem;   // REGEXP for the default scan line item
-    protected array  $apAccountPrefix = ['5', '6', '8']; // old doGetChartsOfDetails
+    protected array  $apAccountPrefix = ['1', '5', '6', '8']; // 1 = Assets (equipment, supplies, prepaid …) + old doGetChartsOfDetails
 
     /* =====================================================================
        Helpers (prefixed with "ap" so they never clash with SalesController)

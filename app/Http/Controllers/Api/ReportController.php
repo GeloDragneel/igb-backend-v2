@@ -2721,7 +2721,6 @@ class ReportController extends SalesController
         }
         return $out;
     }
-
     // 2307 rows: [pid, atc, doc, base, tax]
     private function esWithheld(string $kind, array $ids, callable $period)
     {
@@ -2786,20 +2785,28 @@ class ReportController extends SalesController
         $addr2 = $A(trim("{$c['city']} {$c['province']} {$c['zip']}"));
         $columns = []; $rows = []; $totals = []; $content = ''; $filename = '';
  
+        // Non VAT is NOT reported (Sales, Purchases, Expenses): lines ticked Non VAT, and lines whose only amount is
+        // Non VAT (Net of VAT, VAT, VAT Exempt and Zero Rated all 0 – Office of the Treasurer, Payroll …)
+        $noNonVat = function ($q, string $table) {
+            if (Schema::hasColumn($table, 'non_vat')) {
+                $q->where(fn ($w) => $w->whereNull('x.non_vat')->orWhere('x.non_vat', 0));
+            }
+            return $q->whereRaw('(ABS(COALESCE(x.net_of_vat,0)) + ABS(COALESCE(x.input_vat,0)) + ABS(COALESCE(x.vat_exempt,0)) + ABS(COALESCE(x.zero_rated,0))) > 0');
+        };
+ 
         switch ($d['type']) {
             /* ---------- Purchase Summary ---------- */
             case 'P':
-                $grn = DB::table('t_grn_detail as x')
+                $grn = $noNonVat(DB::table('t_grn_detail as x'), 't_grn_detail')
                     ->whereIn('x.receive_by', $ids)->where('x.grn_status_id', '<>', 5)
                     ->whereBetween('x.declared_month', [$from, $to])
                     ->selectRaw('x.grn_no AS ref, x.vendor_id AS pid, COALESCE(x.total,0) AS php, COALESCE(x.net_of_vat,0) AS net, COALESCE(x.input_vat,0) AS vat, COALESCE(x.vat_exempt,0) AS exempt, COALESCE(x.zero_rated,0) AS zero')
                     ->get();
-                $ap = DB::table('t_purchase_expense_detail as x')
+                $ap = $noNonVat(DB::table('t_purchase_expense_detail as x'), 't_purchase_expense_detail')
                     ->join('t_purchase_expense_master as m', 'm.invoice_no', '=', 'x.invoice_no')
                     ->whereIn('m.added_by', $ids)->where('m.invoice_status_id', '<>', 5)->where('m.record_status', 'posted')->where('x.record_status', 'posted')
                     ->whereBetween('m.declared_month', [$from, $to])
-                    // same lines as VAT Summary (Purchases + Expenses): Non-VAT lines are NOT left out any more –
-                    // leaving them out made the DAT lower than the VAT Summary / 2550Q
+                    // Purchases + Expenses records only (same as VAT Summary); Non VAT left out (old dat.php: NonVAT = 0)
                     ->whereRaw('LOWER(m.trans_type) IN (?, ?)', ['purchases', 'expenses'])
                     ->selectRaw('m.invoice_no AS ref, m.vendor_id AS pid, COALESCE(x.amount,0) AS php, COALESCE(x.net_of_vat,0) AS net, COALESCE(x.input_vat,0) AS vat, COALESCE(x.vat_exempt,0) AS exempt, COALESCE(x.zero_rated,0) AS zero')
                     ->get();
@@ -2841,7 +2848,7 @@ class ReportController extends SalesController
                 // which made one big line with no TIN / name – take the detail's customer, else the invoice's
                 // inner query: one row per sales line with its customer worked out (pid);
                 // outer query: grouped by that pid – works with MySQL ONLY_FULL_GROUP_BY
-                $lines = DB::table('t_sales_invoice_detail as x')
+                $lines = $noNonVat(DB::table('t_sales_invoice_detail as x'), 't_sales_invoice_detail')
                     ->leftJoin('t_sales_invoice_master as sm', function ($j) {
                         $j->on('sm.invoice_no', '=', 'x.invoice_no')->on('sm.added_by', '=', 'x.added_by');
                     })
