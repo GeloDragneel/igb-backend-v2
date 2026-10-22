@@ -696,6 +696,12 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::get('/admin/user-access/{id}/clients', [AdministrationController::class, 'userAccessClients']);
     Route::post('/admin/user-access/{id}/clients/{caid}/login', [AdministrationController::class, 'userAccessGenerateLogin']);
+    Route::get('/admin/user-access/emp/{empId}/login', [AdministrationController::class, 'userAccessEmpLogin'])->whereNumber('empId');
+    Route::post('/admin/user-access/emp/{empId}/login', [AdministrationController::class, 'userAccessEmpLoginCreate'])->whereNumber('empId');
+    Route::put('/admin/user-access/emp/{empId}/login', [AdministrationController::class, 'userAccessEmpLoginUpdate'])->whereNumber('empId');
+    Route::post('/admin/user-access/emp/{empId}/login/password', [AdministrationController::class, 'userAccessEmpLoginPassword'])->whereNumber('empId');
+    Route::get('/admin/user-access/emp/{empId}/clients', [AdministrationController::class, 'userAccessEmpClients'])->whereNumber('empId');
+    Route::post('/admin/user-access/emp/{empId}/clients/{caid}/login', [AdministrationController::class, 'userAccessEmpGenerateLogin'])->whereNumber('empId')->whereNumber('caid');
 
     // Printing
     Route::get('/print/vat-summary', [PrintController::class, 'vatSummaryPrint']);

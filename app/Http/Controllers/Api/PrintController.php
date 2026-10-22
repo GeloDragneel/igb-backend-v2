@@ -1943,7 +1943,7 @@ class PrintController extends ReportController
             ->whereRaw("{$net} > 0")
             ->get([
                 'S.id', 'S.service_period', 'S.qty', 'S.service_fee', 'S.surcharge', 'S.less', 'TR.ca_id',
-                $DB::raw("{$calWh} AS cal_wh"), $DB::raw("{$net} AS net"),
+                $DB::raw("{$calVat} AS cal_vat"), $DB::raw("{$calWh} AS cal_wh"), $DB::raw("{$disc} AS cal_disc"), $DB::raw("{$net} AS net"),
                 $DB::raw(($this->billingCol('t_service', ['note']) ? 'S.note' : "''") . ' AS note'),
                 $DB::raw("COALESCE(NULLIF(L.name, ''), " . ($this->billingCol('t_service', ['service']) ? 'S.service' : "''") . ", '') AS service"),
                 $DB::raw(($tradeCol ? "A.{$tradeCol}" : "''") . ' AS trade_name'), 'A.branch_code',
@@ -1988,7 +1988,10 @@ class PrintController extends ReportController
 
         /* ---------- old SOA.php / CSOA.php arrays → your ODT templates (resources/templates) ---------- */
         $f2 = fn ($v) => number_format((float) $v, 2);
-        $lessOf = fn ($s) => (float) $s->less + (float) $s->cal_wh;   // old: Less + CalWH
+        // Less column = Less + withholding + discount, VAT column = VAT (Option) -> each row adds up:
+        // unit price x qty + surcharge + VAT - less = amount (same Total as the Billing Dashboard)
+        $lessOf = fn ($s) => (float) $s->less + (float) $s->cal_wh + (float) $s->cal_disc;
+        $vatOf = fn ($s) => (float) $s->cal_vat;
 
         $data2 = $payments->map(function ($p) use ($f2) {
             $ref = strlen((string) ($p->ar_number ?? '')) > 2 ? $p->ar_number
@@ -2010,7 +2013,7 @@ class PrintController extends ReportController
             'TIN' => $this->billingTin($account, $client), 'Address' => $this->billingAddress($account, $client),
             'SOANum' => $soaNo, 'BillingPeriod' => $billingPeriod, 'Note' => $note,
             'TP' => $f2($totalPaid), 'TS' => $f2($totalCharges), 'TC' => $f2($services->sum('service_fee')),
-            'LWT' => $f2($services->sum($lessOf)), 'NAD' => $f2($totalCharges), 'PR' => $f2($totalPaid),
+            'LWT' => $f2($services->sum($lessOf)), 'VAT' => $f2($services->sum($vatOf)), 'NAD' => $f2($totalCharges), 'PR' => $f2($totalPaid),
             'OB' => $f2($balance), 'BT' => $f2($balance), 'TB' => $f2($balance),
             'TB_Text' => $this->billingWords($balance) . ' (' . $f2($balance) . ')',
             'No' => $printNo ?? 1,
@@ -2030,7 +2033,7 @@ class PrintController extends ReportController
                     'matches' => $rows->map(fn ($s) => [
                         'data1' => (string) $s->service_period, 'data2' => (string) $s->service,
                         'data3' => $f2($s->qty), 'data4' => $f2($s->service_fee), 'data5' => $f2($s->surcharge),
-                        'data6' => $f2(0), 'data7' => $f2($lessOf($s)), 'data8' => $f2($s->net),
+                        'data6' => $f2($vatOf($s)), 'data7' => $f2($lessOf($s)), 'data8' => $f2($s->net),
                     ])->values()->all(),
                 ];
             }
@@ -2043,7 +2046,7 @@ class PrintController extends ReportController
             $data = $services->map(fn ($s) => [
                 'data1' => (string) $s->service_period, 'data2' => (string) $s->service,
                 'data3' => (string) (0 + (float) $s->qty), 'data4' => $f2($s->service_fee), 'data5' => $f2($s->surcharge),
-                'data6' => 0, 'data7' => $f2($lessOf($s)), 'data8' => $f2($s->net),
+                'data6' => $f2($vatOf($s)), 'data7' => $f2($lessOf($s)), 'data8' => $f2($s->net),
             ])->values()->all();
             $tbs->LoadTemplate($this->billingTemplate($type === 'SOA2' ? 'SOA_v2_fixed2' : 'SOA_v2_fixed'), OPENTBS_ALREADY_UTF8);
             $tbs->MergeBlock('a', $data);
@@ -2238,9 +2241,6 @@ class PrintController extends ReportController
         }
         return ($amount < 0 ? 'NEGATIVE ' : '') . $s . ' PESOS';
     }
-
-/* ======================= Billing → Return AR: PRINT AR (old merge.php → PrintAR.odt) ======================= */
-    // GET /billing/return-ar/{transNumber}/print?ids=1,2,3   (the ticked services)
     public function returnArPrint(Request $request, string $transNumber)
     {
         try {

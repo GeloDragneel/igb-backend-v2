@@ -762,7 +762,7 @@ class AdministrationController extends Controller
             ->when($id, fn ($q) => $q->where('U.id', $id))
             ->orderBy('U.username');
 
-        $sel = ['U.id', 'U.username'];
+        $sel = ['U.id', 'U.username', DB::raw('U.comid AS comid')];
         $sel[] = DB::raw($this->pick('m_user_staff', ['is_active']) ? 'U.is_active' : '1 AS is_active');
         $sel[] = DB::raw($hasEmp
             ? "TRIM(CONCAT_WS(' ', E.last_name, E.first_name, E.middle_name)) AS name"
@@ -781,6 +781,7 @@ class AdministrationController extends Controller
             'user_access' => (string) ($r->user_access ?? ''),
             'is_active'   => (bool) $r->is_active,
             'photo'       => $this->photoUrl($r->photo ?? null),
+            'comid'       => (string) ($r->comid ?? ''),
         ]);
     }
 
@@ -805,6 +806,11 @@ class AdministrationController extends Controller
         return array_values(array_filter($paths, fn ($p) => $p !== self::ACCESS_NONE));
     }
 
+    /**
+     * GET /admin/user-access
+     * every employee (m_employee) with their staff login (m_user_staff.comid = m_employee.com_id) – or none yet,
+     * plus staff logins that are not linked to any employee
+     */
     public function userAccessList(Request $request)
     {
         $this->staffOnly($request);
@@ -817,10 +823,79 @@ class AdministrationController extends Controller
             ->pluck('n', 'user_staff_id');
         $saved = DB::table(self::ACCESS_TABLE)->distinct()->pluck('user_staff_id')->flip();
 
-        return response()->json($this->staffRows()->map(fn ($u) => $u + [
-            'pages' => (int) ($counts[$u['id']] ?? 0),
-            'saved' => isset($saved[$u['id']]),
-        ])->values());
+        // logins by com_id (active one first when an employee has more than one)
+        $logins = $this->staffRows()->sortByDesc('is_active')->groupBy(fn ($u) => trim($u['comid']));
+        $used = [];
+        $out = [];
+
+        foreach ($this->employeeRows() as $e) {
+            $u = $e['com_id'] !== '' ? ($logins[$e['com_id']] ?? collect())->first() : null;
+            if ($u) $used[$u['id']] = true;
+            $out[] = $this->personRow($e, $u, $counts, $saved);
+        }
+        // logins with no employee behind them
+        foreach ($this->staffRows() as $u) {
+            if (isset($used[$u['id']])) continue;
+            $out[] = $this->personRow(null, $u, $counts, $saved);
+        }
+
+        usort($out, fn ($a, $b) => strcasecmp($a['name'], $b['name']));
+        return response()->json($out);
+    }
+
+    /** m_employee rows → { employee_id, com_id, name, designation, designation_id, photo, active } */
+    private function employeeRows(?int $id = null)
+    {
+        if (!Schema::hasTable('m_employee')) return collect();
+        $typeName = $this->pick('m_user_type', ['name', 'description', 'user_type', 'UserType']);
+        $desig = $this->pick('m_employee', ['designation_id']);
+        $active = $this->pick('m_employee', ['is_active', 'is_status', 'status']);
+
+        return DB::table('m_employee as E')
+            ->when($typeName && $desig, fn ($q) => $q->leftJoin('m_user_type as D', 'D.id', '=', 'E.designation_id'))
+            ->when($id, fn ($q) => $q->where('E.id', $id))
+            ->get([
+                'E.id',
+                DB::raw($this->pick('m_employee', ['com_id']) ? 'E.com_id' : "'' AS com_id"),
+                DB::raw("TRIM(CONCAT_WS(' ', E.last_name, E.first_name, E.middle_name)) AS name"),
+                DB::raw($this->pick('m_employee', ['first_name']) ? 'E.first_name' : "'' AS first_name"),
+                DB::raw($this->pick('m_employee', ['last_name']) ? 'E.last_name' : "'' AS last_name"),
+                DB::raw(($typeName && $desig ? "D.{$typeName}" : "''") . ' AS designation'),
+                DB::raw($desig ? 'E.designation_id' : 'NULL AS designation_id'),
+                DB::raw($this->pick('m_employee', ['photo_path']) ? 'E.photo_path AS photo' : 'NULL AS photo'),
+                DB::raw($active ? "E.{$active} AS active" : '1 AS active'),
+            ])
+            ->map(fn ($r) => [
+                'employee_id'    => (int) $r->id,
+                'com_id'         => trim((string) $r->com_id),
+                'name'           => trim(preg_replace('/\s+/', ' ', (string) $r->name)),
+                'first_name'     => trim((string) $r->first_name),
+                'last_name'      => trim((string) $r->last_name),
+                'designation'    => (string) ($r->designation ?? ''),
+                'designation_id' => $r->designation_id ? (int) $r->designation_id : null,
+                'photo_key'      => $r->photo,
+                'active'         => $r->active === null || (int) $r->active === 1,
+            ]);
+    }
+
+    /** one card: the employee + their login (either may be missing) */
+    private function personRow(?array $e, ?array $u, $counts, $saved): array
+    {
+        return [
+            'key'         => $e ? 'e' . $e['employee_id'] : 's' . $u['id'],
+            'employee_id' => $e['employee_id'] ?? null,
+            'id'          => $u['id'] ?? null,                       // m_user_staff.id (null = no login yet)
+            'has_login'   => (bool) $u,
+            'username'    => $u['username'] ?? '',
+            'name'        => ($e['name'] ?? '') ?: ($u['name'] ?? ''),
+            'designation' => ($e['designation'] ?? '') ?: ($u['designation'] ?? ''),
+            'user_type'   => $u['user_type'] ?? '',
+            'user_access' => $u['user_access'] ?? '',
+            'is_active'   => $u ? $u['is_active'] : ($e['active'] ?? true),
+            'photo'       => $u['photo'] ?? ($e ? $this->photoUrl($e['photo_key']) : null),
+            'pages'       => $u ? (int) ($counts[$u['id']] ?? 0) : 0,
+            'saved'       => $u ? isset($saved[$u['id']]) : false,
+        ];
     }
 
     public function userAccessShow(Request $request, int $id)
@@ -870,11 +945,28 @@ class AdministrationController extends Controller
     public function userAccessClients(Request $request, int $id)
     {
         $this->staffOnly($request);
+        return $this->clientsOfEmployee($this->empOfStaff($id));
+    }
+
+    /** GET /admin/user-access/emp/{empId}/clients – same, for an employee that may have no staff login yet */
+    public function userAccessEmpClients(Request $request, int $empId)
+    {
+        $this->staffOnly($request);
+        abort_unless(DB::table('m_employee')->where('id', $empId)->exists(), 404, 'Employee not found.');
+        return $this->clientsOfEmployee($empId);
+    }
+
+    /** m_user_staff id → m_employee id (0 = not linked) */
+    private function empOfStaff(int $id): int
+    {
         $staff = DB::table('m_user_staff')->where('id', $id)->first();
         abort_unless($staff, 404, 'Staff login not found.');
-        $empId = Schema::hasTable('m_employee') && isset($staff->comid)
+        return Schema::hasTable('m_employee') && trim((string) ($staff->comid ?? '')) !== ''
             ? (int) DB::table('m_employee')->where('com_id', $staff->comid)->value('id') : 0;
+    }
 
+    private function clientsOfEmployee(int $empId)
+    {
         $da = $this->pick('m_client_account', ['assigned_daid', 'assigned_da_id']);
         $au = $this->pick('m_client_account', ['assigned_auid', 'assigned_auditor_id']);
         $hasClient = Schema::hasTable('m_client');
@@ -932,12 +1024,22 @@ class AdministrationController extends Controller
     public function userAccessGenerateLogin(Request $request, int $id, int $caid)
     {
         $this->staffOnly($request);
-        abort_unless(Schema::hasTable('m_user_client_staff'), 422, 'Table m_user_client_staff not found.');
-        $staff = DB::table('m_user_staff')->where('id', $id)->first();
-        abort_unless($staff, 404, 'Staff login not found.');
-        $empId = Schema::hasTable('m_employee') && isset($staff->comid)
-            ? (int) DB::table('m_employee')->where('com_id', $staff->comid)->value('id') : 0;
+        $empId = $this->empOfStaff($id);
         abort_unless($empId, 422, 'This staff login is not linked to an employee.');
+        return $this->generateClientLogin($request, $empId, $caid);
+    }
+
+    /** POST /admin/user-access/emp/{empId}/clients/{caid}/login */
+    public function userAccessEmpGenerateLogin(Request $request, int $empId, int $caid)
+    {
+        $this->staffOnly($request);
+        abort_unless(DB::table('m_employee')->where('id', $empId)->exists(), 404, 'Employee not found.');
+        return $this->generateClientLogin($request, $empId, $caid);
+    }
+
+    private function generateClientLogin(Request $request, int $empId, int $caid)
+    {
+        abort_unless(Schema::hasTable('m_user_client_staff'), 422, 'Table m_user_client_staff not found.');
         $ca = DB::table('m_client_account')->where('id', $caid)->first();
         abort_unless($ca, 404, 'Client account not found.');
 
@@ -975,16 +1077,7 @@ class AdministrationController extends Controller
             'updated_at'     => now(),
         ];
 
-        // only columns the table really has; NOT NULL columns without a default get an empty value
-        $cols = collect(Schema::getColumns('m_user_client_staff'))->keyBy('name');
-        $row = array_intersect_key($row, $cols->all());
-        foreach ($cols as $name => $c) {
-            if (array_key_exists($name, $row) || $c['nullable'] || $c['default'] !== null || $c['auto_increment']) continue;
-            $t = strtolower($c['type_name']);
-            $row[$name] = str_contains($t, 'int') || in_array($t, ['decimal', 'double', 'float']) ? 0
-                : (in_array($t, ['date', 'datetime', 'timestamp']) ? now() : '');
-        }
-        $row = $this->fkClean('m_user_client_staff', $row);
+        $row = $this->fillRow('m_user_client_staff', $row);
 
         try {
             $newId = DB::table('m_user_client_staff')->insertGetId($row);
@@ -998,6 +1091,165 @@ class AdministrationController extends Controller
             'login'    => ['id' => (int) $newId, 'username' => $username, 'active' => true],
             'password' => $password,
         ]);
+    }
+
+    /** only columns the table really has; NOT NULL columns without a default get an empty value */
+    private function fillRow(string $table, array $row): array
+    {
+        $cols = collect(Schema::getColumns($table))->keyBy('name');
+        $row = array_intersect_key($row, $cols->all());
+        foreach ($cols as $name => $c) {
+            if (array_key_exists($name, $row) || $c['nullable'] || $c['default'] !== null || $c['auto_increment']) continue;
+            $t = strtolower($c['type_name']);
+            $row[$name] = str_contains($t, 'int') || in_array($t, ['decimal', 'double', 'float', 'tinyint']) ? 0
+                : (in_array($t, ['date', 'datetime', 'timestamp']) ? now() : '');
+        }
+        return $this->fkClean($table, $row);
+    }
+
+    /* ---------------- popup tab "Login": the employee's staff login (m_user_staff) ---------------- */
+
+    /** employee + their m_user_staff row (null = none yet) */
+    private function empAndLogin(int $empId): array
+    {
+        $e = $this->employeeRows($empId)->first();
+        abort_unless($e, 404, 'Employee not found.');
+        $u = $e['com_id'] !== ''
+            ? DB::table('m_user_staff')->where('comid', $e['com_id'])
+                ->when($this->pick('m_user_staff', ['is_active']), fn ($q) => $q->orderByDesc('is_active'))
+                ->orderBy('id')->first()
+            : null;
+        return [$e, $u];
+    }
+
+    private function usernameTaken(string $username, ?int $exceptStaffId = null): bool
+    {
+        foreach (['m_user_staff', 'm_user_client', 'm_user_client_staff'] as $t) {
+            if (!Schema::hasTable($t)) continue;
+            $q = DB::table($t)->where('username', $username);
+            if ($t === 'm_user_staff' && $exceptStaffId) $q->where('id', '<>', $exceptStaffId);
+            if ($q->exists()) return true;
+        }
+        return false;
+    }
+
+    private function newPassword(): string
+    {
+        return substr(str_replace(['/', '+', '='], '', base64_encode(random_bytes(12))), 0, 10);
+    }
+
+    private function loginPayload(array $e, ?object $u): array
+    {
+        $typeName = $this->pick('m_user_type', ['name', 'description', 'user_type', 'UserType']);
+        $types = $typeName ? DB::table('m_user_type')->orderBy($typeName)->get(['id', DB::raw("{$typeName} AS name")])
+            ->map(fn ($t) => ['id' => (int) $t->id, 'name' => (string) $t->name])->values() : collect();
+
+        // suggestion for a new login: first letter of first name + last name (gelo → gfernandez), unique
+        $base = strtolower(preg_replace('/[^A-Za-z0-9]/', '', mb_substr($e['first_name'], 0, 1) . $e['last_name'])) ?: 'staff' . $e['employee_id'];
+        $suggest = $base;
+        for ($i = 2; $this->usernameTaken($suggest); $i++) $suggest = $base . $i;
+
+        return [
+            'employee' => ['id' => $e['employee_id'], 'name' => $e['name'], 'com_id' => $e['com_id'], 'designation' => $e['designation'], 'designation_id' => $e['designation_id']],
+            'login'    => $u ? [
+                'id'           => (int) $u->id,
+                'username'     => (string) $u->username,
+                'user_type_id' => isset($u->user_type_id) ? (int) $u->user_type_id : null,
+                'is_active'    => !isset($u->is_active) || (int) $u->is_active === 1,
+                'created_at'   => $u->created_at ?? null,
+            ] : null,
+            'types'    => $types,
+            'suggest'  => $suggest,
+        ];
+    }
+
+    /** GET /admin/user-access/emp/{empId}/login */
+    public function userAccessEmpLogin(Request $request, int $empId)
+    {
+        $this->staffOnly($request);
+        [$e, $u] = $this->empAndLogin($empId);
+        return response()->json($this->loginPayload($e, $u));
+    }
+
+    private function loginRules(): array
+    {
+        return [
+            'username'     => ['required', 'string', 'min:3', 'max:50', 'regex:/^[A-Za-z0-9._-]+$/'],
+            'user_type_id' => ['nullable', 'integer'],
+            'password'     => ['nullable', 'string', 'min:6', 'max:100'],
+        ];
+    }
+
+    /** POST /admin/user-access/emp/{empId}/login  { username, user_type_id, password? }  → creates the m_user_staff row */
+    public function userAccessEmpLoginCreate(Request $request, int $empId)
+    {
+        $this->staffOnly($request);
+        $d = $request->validate($this->loginRules(), ['username.regex' => 'Username: letters, numbers, dot, dash or underscore only.']);
+        [$e, $u] = $this->empAndLogin($empId);
+        if ($u) {
+            abort(422, 'This employee already has a login (' . $u->username . ').');
+        }
+        abort_if($e['com_id'] === '', 422, 'This employee has no com_id in m_employee, so a login can\'t be linked to them.');
+        abort_if($this->usernameTaken($d['username']), 422, 'That username is already used.');
+
+        $password = $d['password'] ?? null ?: $this->newPassword();
+        $by = (int) optional($request->user())->id ?: null;
+        $row = $this->fillRow('m_user_staff', [
+            'username'     => $d['username'],
+            'password'     => \Illuminate\Support\Facades\Hash::make($password),
+            'comid'        => $e['com_id'],
+            'user_type_id' => $d['user_type_id'] ?? $e['designation_id'],
+            'is_active'    => 1,
+            'added_by'     => $by,
+            'updated_by'   => $by,
+            'created_at'   => now(),
+            'updated_at'   => now(),
+        ]);
+        try {
+            DB::table('m_user_staff')->insertGetId($row);
+        } catch (\Illuminate\Database\QueryException $ex) {
+            report($ex);
+            abort(422, 'Could not create the login: ' . ($ex->errorInfo[2] ?? $ex->getMessage()));
+        }
+
+        [$e, $u] = $this->empAndLogin($empId);
+        return response()->json(['message' => "Login created for {$e['name']}."] + $this->loginPayload($e, $u) + ['password' => $password]);
+    }
+
+    /** PUT /admin/user-access/emp/{empId}/login  { username, user_type_id, is_active } */
+    public function userAccessEmpLoginUpdate(Request $request, int $empId)
+    {
+        $this->staffOnly($request);
+        $d = $request->validate($this->loginRules() + ['is_active' => ['boolean']], ['username.regex' => 'Username: letters, numbers, dot, dash or underscore only.']);
+        [$e, $u] = $this->empAndLogin($empId);
+        abort_unless($u, 422, 'This employee has no login yet.');
+        abort_if($this->usernameTaken($d['username'], (int) $u->id), 422, 'That username is already used.');
+
+        $set = $this->only('m_user_staff', [
+            'username'     => $d['username'],
+            'user_type_id' => $d['user_type_id'] ?? ($u->user_type_id ?? null),
+            'is_active'    => array_key_exists('is_active', $d) ? (int) $d['is_active'] : ($u->is_active ?? 1),
+            'updated_by'   => (int) optional($request->user())->id ?: null,
+            'updated_at'   => now(),
+        ]);
+        DB::table('m_user_staff')->where('id', $u->id)->update($this->fkClean('m_user_staff', $set));
+
+        [$e, $u] = $this->empAndLogin($empId);
+        return response()->json(['message' => 'Login saved.'] + $this->loginPayload($e, $u));
+    }
+
+    /** POST /admin/user-access/emp/{empId}/login/password  { password? } → new password (shown once) */
+    public function userAccessEmpLoginPassword(Request $request, int $empId)
+    {
+        $this->staffOnly($request);
+        $d = $request->validate(['password' => ['nullable', 'string', 'min:6', 'max:100']]);
+        [, $u] = $this->empAndLogin($empId);
+        abort_unless($u, 422, 'This employee has no login yet.');
+        $password = $d['password'] ?? null ?: $this->newPassword();
+        DB::table('m_user_staff')->where('id', $u->id)->update($this->only('m_user_staff', [
+            'password' => \Illuminate\Support\Facades\Hash::make($password), 'updated_at' => now(),
+        ]));
+        return response()->json(['message' => 'Password changed.', 'username' => $u->username, 'password' => $password]);
     }
 
     /** the sidebar: which Staff pages the logged-in staff can open */
