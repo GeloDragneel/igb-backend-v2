@@ -894,6 +894,42 @@ class HRManagmentController extends Controller
     }
 
     /**
+     * m_employee.com_id is a foreign key to m_client_account.id: every employee has its own account row.
+     * New employee → copy the account row of the latest employee (same client_num, company, types, flags),
+     * put the new employee's name on it, branch_code = next number under that client → its id is the com_id.
+     */
+    private function newEmployeeAccount(array $profile): int
+    {
+        $tpl = DB::table('m_client_account as A')
+            ->join('m_employee as E', 'E.com_id', '=', 'A.id')
+            ->orderByDesc('A.id')->lockForUpdate()->select('A.*')->first();
+        abort_unless($tpl, 422, 'No existing employee account (m_client_account) to copy from.');
+
+        $cols = collect(\Illuminate\Support\Facades\Schema::getColumns('m_client_account'))->keyBy('name');
+        $row = (array) $tpl;
+        unset($row['id']);
+        $name = trim(strtoupper(($profile['last_name'] ?? '') . ', ' . ($profile['first_name'] ?? '')), ' ,');
+        foreach (['trade_name', 'tradename', 'account_name', 'name'] as $c) if ($cols->has($c)) $row[$c] = $name;
+        if ($cols->has('branch_code') && $cols->has('client_num')) {
+            $max = DB::table('m_client_account')->where('client_num', $tpl->client_num)
+                ->selectRaw('MAX(CAST(branch_code AS UNSIGNED)) AS n')->value('n');
+            $len = max(strlen((string) $tpl->branch_code), 5);
+            $row['branch_code'] = str_pad((string) (((int) $max) + 1), $len, '0', STR_PAD_LEFT);
+        }
+        foreach (['created_at', 'updated_at'] as $c) if ($cols->has($c)) $row[$c] = now();
+        if ($cols->has('is_active')) $row['is_active'] = 1;
+
+        $row = $this->fkValid('m_client_account', $row);
+
+        try {
+            return (int) DB::table('m_client_account')->insertGetId($row);
+        } catch (\Illuminate\Database\QueryException $x) {
+            report($x);
+            abort(422, 'Could not create the employee account (m_client_account): ' . ($x->errorInfo[2] ?? $x->getMessage()));
+        }
+    }
+
+    /**
      * POST /hr/employees   add an employee, all in one save:
      *   profile fields + optional shift {…} · salary {…} · banks [{…}] · leave_credits [{…}] · photo (data URL → S3)
      *   everything but the photo is one transaction (nothing is saved when one part fails)
@@ -916,7 +952,10 @@ class HRManagmentController extends Controller
         $me = $this->me($request);
 
         $e = DB::transaction(function () use ($d, $profile, $me) {
-            $e = Employee::create($profile + ['is_active' => $profile['is_active'] ?? true]);
+            // com_id = the new employee's own m_client_account row (foreign key m_employee.com_id → m_client_account.id)
+            $comId = $this->newEmployeeAccount($profile);
+            $e = new Employee();
+            $e->forceFill($this->fkValid('m_employee', $this->notNullSafe('m_employee', $profile + ['is_active' => $profile['is_active'] ?? true, 'com_id' => $comId])))->save();
             if (!empty($d['shift']['shift_id'])) $this->applyShift($e, $d['shift'], $me);
             if (!empty($d['salary'])) $this->insertSalary($e, $d['salary'] + ['is_default' => true], $me);
             foreach ($d['banks'] ?? [] as $b) $this->putBank($b + ['is_active' => true], $e->id, null, $me);
@@ -953,13 +992,58 @@ class HRManagmentController extends Controller
         return response()->json(['message' => 'Photo saved.', 'photo_url' => $this->photoUrl($key)]);
     }
 
+    /**
+     * every single-column foreign key of $table: a value that doesn't exist in its table
+     * (0, empty, or old data like nob_id) → NULL when the column allows it, else the first row of that table
+     */
+    private function fkValid(string $table, array $row): array
+    {
+        $cols = collect(Schema::getColumns($table))->keyBy('name');
+        foreach (Schema::getForeignKeys($table) as $fk) {
+            if (count($fk['columns']) !== 1) continue;
+            $col = $fk['columns'][0];
+            $ref = $fk['foreign_columns'][0];
+            if (!array_key_exists($col, $row)) continue;
+            $v = $row[$col];
+            if ($v !== null && $v !== '' && DB::table($fk['foreign_table'])->where($ref, $v)->exists()) continue;
+            $row[$col] = ($cols[$col]['nullable'] ?? false) ? null : DB::table($fk['foreign_table'])->orderBy($ref)->value($ref);
+        }
+        return $row;
+    }
 
+    /**
+     * NOT NULL columns can't take NULL: an empty field gets the column default,
+     * or 0 for numbers / '' for text when the column has none (allowance, etc.).
+     * Dates without a value are left out. $onlyGiven = true (update): only the fields sent.
+     */
+    private function notNullSafe(string $table, array $row, bool $onlyGiven = false): array
+    {
+        foreach (Schema::getColumns($table) as $c) {
+            $name = $c['name'];
+            if ($c['nullable'] || $c['auto_increment']) continue;
+            if ($onlyGiven && !array_key_exists($name, $row)) continue;
+            if (array_key_exists($name, $row) && $row[$name] !== null && $row[$name] !== '') continue;
+            $type = strtolower($c['type_name']);
+            $isNum = str_contains($type, 'int') || in_array($type, ['decimal', 'double', 'float', 'bit'], true);
+            if ($c['default'] !== null) {
+                if (array_key_exists($name, $row) && $row[$name] === null) unset($row[$name]);
+                continue;
+            }
+            if (in_array($type, ['date', 'datetime', 'timestamp', 'time', 'year'], true)) { unset($row[$name]); continue; }
+            if ($isNum) {
+                $row[$name] = 0;
+            } elseif (!array_key_exists($name, $row) || $row[$name] === null) {
+                $row[$name] = '';
+            }
+        }
+        return $row;
+    }
     /* PUT /hr/employees/{id}   update the profile */
     public function updateEmployee(Request $request, int $id)
     {
         $e = Employee::findOrFail($id);
         $d = $request->validate($this->employeeRules());
-        $e->update($d);
+        $e->update($this->notNullSafe('m_employee', $d, true));
         return response()->json(['message' => "{$e->full_name} updated."]);
     }
 
