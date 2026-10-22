@@ -2747,7 +2747,7 @@ class ReportController extends SalesController
     }
 
     /* GET /api/reports/esub?type=S&from=2026-07&to=2026-09&name=...   |   type=1604E&year=2026 */
-    public function esubReport(Request $request)
+public function esubReport(Request $request)
     {
         $d = $request->validate([
             'type' => ['required', 'in:P,S,1601EQ_IT,1601EQ_VT,1601EQ_PE,1604E,I'],
@@ -2794,7 +2794,9 @@ class ReportController extends SalesController
                     ->join('t_purchase_expense_master as m', 'm.invoice_no', '=', 'x.invoice_no')
                     ->whereIn('m.added_by', $ids)->where('m.invoice_status_id', '<>', 5)->where('m.record_status', 'posted')->where('x.record_status', 'posted')
                     ->whereBetween('m.declared_month', [$from, $to])
-                    ->where(fn ($q) => $q->whereNull('x.non_vat')->orWhere('x.non_vat', 0))
+                    // same lines as VAT Summary (Purchases + Expenses): Non-VAT lines are NOT left out any more –
+                    // leaving them out made the DAT lower than the VAT Summary / 2550Q
+                    ->whereRaw('LOWER(m.trans_type) IN (?, ?)', ['purchases', 'expenses'])
                     ->selectRaw('m.invoice_no AS ref, m.vendor_id AS pid, COALESCE(x.amount,0) AS php, COALESCE(x.net_of_vat,0) AS net, COALESCE(x.input_vat,0) AS vat, COALESCE(x.vat_exempt,0) AS exempt, COALESCE(x.zero_rated,0) AS zero')
                     ->get();
                 $lines = $grn->concat($ap);
@@ -2814,7 +2816,8 @@ class ReportController extends SalesController
                         'php' => round($r->php, 2), 'net' => round($r->net, 2), 'vat' => round($r->vat, 2), 'exempt' => round($r->exempt, 2), 'zero' => round($r->zero, 2),
                         '_tin_raw' => $v['tin_raw'], '_name_raw' => $v['name_raw']];
                 }
-                $t = fn ($k) => round(array_sum(array_column($rows, $k)), 2);
+                // totals from the unrounded amounts (same as VAT Summary), so they match to the centavo
+                $t = fn ($k) => round((float) $lines->sum(fn ($x) => (float) $x->{$k}), 2);
                 $totals = ['php' => $t('php'), 'net' => $t('net'), 'vat' => $t('vat'), 'exempt' => $t('exempt'), 'zero' => $t('zero')];
  
                 $content .= "H,P,{$tin},{$X($name)}.,,,,{$X($c['trade_name'])},{$A($c['address'])},0,0,{$M($totals['exempt'])},{$M($totals['zero'])},{$M($totals['net'])},{$M($totals['vat'])},{$M($totals['vat'])},,{$c['rdo']},{$periodEnd},12\n";
