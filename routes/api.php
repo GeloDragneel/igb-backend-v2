@@ -722,6 +722,9 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/notifications', [NotificationController::class, 'index']);
     Route::put('/notifications/read', [NotificationController::class, 'read']);
     Route::put('/notifications/read-all', [NotificationController::class, 'readAll']);    
+    Route::get('/notifications/all', [NotificationController::class, 'all']);
+    Route::get('/notifications/detail', [NotificationController::class, 'detail']); // the list behind a "work to do" card
+    Route::get('/notifications/pulse', [NotificationController::class, 'pulse']);   // real time check (every 15 s)
 
     Route::get('/ai/messages', [AiAssistantController::class, 'index']);
     Route::post('/ai/messages', [AiAssistantController::class, 'store']);

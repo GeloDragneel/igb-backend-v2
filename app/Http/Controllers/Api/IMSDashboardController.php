@@ -76,6 +76,68 @@ class IMSDashboardController extends MonitoringController
         return array_map(fn ($day, $v) => ['day' => $day] + $v, array_keys($days), $days);
     }
 
+    /* ---------------- Billing period: one month, a month range, or all data ----------------
+       ?mode=range&from=YYYY-MM&to=YYYY-MM   (from = to = one month)
+       ?mode=all                             every bill / payment in the system
+       ?month=YYYY-MM                        old calls: that one month                                            */
+    private function billingPeriod(Request $request): array
+    {
+        $d = $request->validate([
+            'mode'  => ['nullable', 'in:range,all'],
+            'from'  => ['nullable', 'date_format:Y-m'],
+            'to'    => ['nullable', 'date_format:Y-m'],
+            'month' => ['nullable', 'date_format:Y-m'],
+        ]);
+        $mode = $d['mode'] ?? 'range';
+        $from = $d['from'] ?? $d['month'] ?? date('Y-m');
+        $to = $d['to'] ?? $d['month'] ?? $from;
+        return $this->periodFor($mode, $from, $to);
+    }
+
+    /** the period itself: months, first / last second, label, PF periods ("OCTOBER 2026") and EO periods ("EO-2026") */
+    private function periodFor(string $mode, string $from, string $to): array
+    {
+        static $cache = [];
+        $key = $mode . '|' . $from . '|' . $to;
+        if (isset($cache[$key])) return $cache[$key];
+
+        $all = DB::table('t_service')->whereNotNull('service_period')->distinct()->pluck('service_period')
+            ->map(fn ($v) => trim((string) $v))->filter()->unique()->values();
+
+        if ($mode === 'all') {
+            // first month that has a bill or a payment → this month (or the latest bill, if later)
+            $monthsOf = $all->map(function ($v) {
+                if (preg_match('/^EO-(\d{4})$/i', $v, $m)) return $m[1] . '-01';
+                $t = strtotime('1 ' . $v);
+                return $t ? date('Y-m', $t) : null;
+            })->filter()->sort()->values();
+            $firstPay = DB::table('t_payment')->whereNotNull('payment_date')->min('payment_date');
+            $from = collect([$monthsOf->first(), $firstPay ? substr((string) $firstPay, 0, 7) : null])->filter()->min() ?: date('Y-m');
+            $to = collect([$monthsOf->last(), date('Y-m')])->filter()->max();
+            $pfPeriods = $all->reject(fn ($v) => stripos($v, 'EO-') === 0)->values()->all();
+            $eoPeriods = $all->filter(fn ($v) => stripos($v, 'EO-') === 0)->values()->all();
+        } else {
+            if ($from > $to) [$from, $to] = [$to, $from];
+            $pfPeriods = [];
+            $eoPeriods = [];
+            for ($c = new DateTime($from . '-01'), $end = new DateTime($to . '-01'); $c <= $end; $c->modify('+1 month')) {
+                $pfPeriods[] = strtoupper($c->format('F Y'));
+                $eoPeriods['EO-' . $c->format('Y')] = true;
+            }
+            $eoPeriods = array_keys($eoPeriods);
+        }
+
+        $months = [];
+        for ($c = new DateTime($from . '-01'), $end = new DateTime($to . '-01'); $c <= $end; $c->modify('+1 month')) $months[] = $c->format('Y-m');
+        $start = $from . '-01 00:00:00';
+        $end = (new DateTime($to . '-01'))->modify('last day of this month')->format('Y-m-d') . ' 23:59:59';
+        $label = $mode === 'all' ? 'All data'
+            : ($from === $to ? (new DateTime($from . '-01'))->format('F Y')
+                : (new DateTime($from . '-01'))->format('M Y') . ' – ' . (new DateTime($to . '-01'))->format('M Y'));
+
+        return $cache[$key] = compact('mode', 'from', 'to', 'months', 'start', 'end', 'label', 'pfPeriods', 'eoPeriods');
+    }
+
     /* GET /dashboard   who is looking + which tabs */
     public function dashboard(Request $request)
     {
@@ -99,10 +161,15 @@ class IMSDashboardController extends MonitoringController
     public function dashboardBilling(Request $request)
     {
         abort_unless($this->canBilling($request), 403, 'For management and billing only.');
-        $d = $request->validate(['month' => ['required', 'date_format:Y-m']]);
-        $range = $this->monthRange($d['month']);
+        // the 5 tiles (and their popups) follow the picked period (month range / all data);
+        // charts + the clients table stay on ONE month: the last month of the range (All data → this month)
+        $tiles = $this->billingPeriod($request);
+        $chartMonth = $tiles['mode'] === 'all' ? date('Y-m') : $tiles['to'];
+        $p = $this->periodFor('range', $chartMonth, $chartMonth);
+        $range = [$p['start'], $p['end']];
+        $byDay = true;
 
-        // collection + deposit: payments dated this month, grouped by type and deposited
+        // collection + deposit: payments dated in the period, grouped by type and deposited
         $type = 'CASE';
         foreach (self::COLLECTION_TYPES as $t => $g) {
             $ids = implode(',', $this->collectionListIds($g['ser_types']));
@@ -115,13 +182,18 @@ class IMSDashboardController extends MonitoringController
         $zero = ['PF' => 0.0, 'Return' => 0.0, 'EO' => 0.0, 'Others' => 0.0];
         $collection = ['total' => 0.0, 'count' => 0, 'by_type' => $zero];
         $deposit = ['deposited' => 0.0, 'deposited_count' => 0, 'undeposited' => 0.0, 'undeposited_count' => 0];
-        $daily = [];   // day → type → amount
-        for ($c = new DateTime($d['month'] . '-01'), $last = (clone $c)->modify('last day of this month'); $c <= $last; $c->modify('+1 day')) {
-            $daily[$c->format('Y-m-d')] = $zero;
+        $daily = [];   // day (or month) → type → amount
+        if ($byDay) {
+            for ($c = new DateTime($p['from'] . '-01'), $last = (new DateTime($p['to'] . '-01'))->modify('last day of this month'); $c <= $last; $c->modify('+1 day')) {
+                $daily[$c->format('Y-m-d')] = $zero;
+            }
+        } else {
+            foreach ($p['months'] as $ym) $daily[$ym] = $zero;
         }
+        $bucket = $byDay ? 'DATE(P.payment_date)' : "DATE_FORMAT(P.payment_date, '%Y-%m')";
         $rows = DB::table('t_payment as P')->leftJoin('t_service as S', 'S.id', '=', 'P.service_id')
             ->whereBetween('P.payment_date', $range)
-            ->selectRaw("DATE(P.payment_date) AS day, {$type} AS type, {$dep} AS dep, COUNT(*) AS cnt, COALESCE(SUM(P.amount), 0) AS amt")
+            ->selectRaw("{$bucket} AS day, {$type} AS type, {$dep} AS dep, COUNT(*) AS cnt, COALESCE(SUM(P.amount), 0) AS amt")
             ->groupByRaw('day, type, dep')->get();
         foreach ($rows as $r) {
             $amt = (float) $r->amt;
@@ -134,10 +206,14 @@ class IMSDashboardController extends MonitoringController
             $deposit["{$k}_count"] += (int) $r->cnt;
         }
 
-        // last 6 months of collection (for the trend chart)
+        // trend chart: the months of the period (up to the last 24) – one month picked: the 6 months up to it
         $trend = [];
-        $first = (new DateTime($d['month'] . '-01'))->modify('-5 months');
-        for ($c = clone $first, $i = 0; $i < 6; $i++, $c->modify('+1 month')) $trend[$c->format('Y-m')] = $zero;
+        $tMonths = count($p['months']) >= 2 ? array_slice($p['months'], -24) : [];
+        if (!$tMonths) {
+            for ($c = (new DateTime($p['to'] . '-01'))->modify('-5 months'), $i = 0; $i < 6; $i++, $c->modify('+1 month')) $tMonths[] = $c->format('Y-m');
+        }
+        foreach ($tMonths as $ym) $trend[$ym] = $zero;
+        $first = new DateTime($tMonths[0] . '-01');
         foreach (DB::table('t_payment as P')->leftJoin('t_service as S', 'S.id', '=', 'P.service_id')
                      ->whereBetween('P.payment_date', [$first->format('Y-m-d 00:00:00'), $range[1]])
                      ->selectRaw("DATE_FORMAT(P.payment_date, '%Y-%m') AS ym, {$type} AS type, COALESCE(SUM(P.amount), 0) AS amt")
@@ -157,17 +233,18 @@ class IMSDashboardController extends MonitoringController
 
         $series = fn (array $by, string $k) => array_map(fn ($key, $v) => [$k => $key] + array_map(fn ($x) => round($x, 2), $v), array_keys($by), $by);
 
-        // PF / Return / EO billed for the month (EO: the year) + what each account still owes
-        $monthName = strtoupper((new DateTime($d['month'] . '-01'))->format('F Y'));
-        $eoYear = 'EO-' . substr($d['month'], 0, 4);
+        // PF / Return / EO billed in the period (EO: the years of the period) + what each account still owes
+        $firstPf = strtoupper((new DateTime($p['from'] . '-01'))->format('F Y'));
+        $firstEo = 'EO-' . substr($p['from'], 0, 4);
         $billing = [];
         $owed = [];   // ca_id → type → { forwarding, current }
         foreach (self::RF_TYPES as $t => $serType) {
             $eo = $t === 'EO';
-            $period = $eo ? $eoYear : $monthName;
-            $services = $this->rfServices($this->rfListIds($serType), [$period], ['id', 'ca_id', 'is_paid']);
+            $periods = $eo ? $p['eoPeriods'] : $p['pfPeriods'];
+            $period = $eo ? $firstEo : $firstPf;               // forwarding = unpaid BEFORE the period
+            $services = $this->rfServices($this->rfListIds($serType), $periods, ['id', 'ca_id', 'is_paid']);
             $paid = $this->rfPaid($services->pluck('id'));
-            $b = ['period' => $period, 'count' => $services->count(), 'paid' => 0, 'unpaid' => 0, 'billed' => 0.0, 'collected' => 0.0, 'balance' => 0.0];
+            $b = ['period' => $p['label'], 'count' => $services->count(), 'paid' => 0, 'unpaid' => 0, 'billed' => 0.0, 'collected' => 0.0, 'balance' => 0.0];
             foreach ($services as $s) {
                 $net = $this->rfNet($s);
                 $got = (float) ($paid[$s->id]->paid ?? 0);
@@ -182,7 +259,7 @@ class IMSDashboardController extends MonitoringController
                     $b['paid']++;
                 }
             }
-            $fwd = $this->rfForwarding($serType, $period, $eo);
+            $fwd = $p['mode'] === 'all' ? [] : $this->rfForwarding($serType, $period, $eo);   // all data: nothing is "before"
             foreach ($fwd as $ca => $amt) $owed[$ca][$t]['forwarding'] = $amt;
             $b['forwarding'] = array_sum($fwd);
             foreach (['billed', 'collected', 'balance', 'forwarding'] as $k) $b[$k] = round($b[$k], 2);
@@ -220,8 +297,10 @@ class IMSDashboardController extends MonitoringController
         $deposit['undeposited'] = round($deposit['undeposited'], 2);
 
         return response()->json([
-            'month' => $d['month'],
-            'summary' => $this->billingSummary($d['month']),
+            'month' => $chartMonth, 'mode' => $tiles['mode'], 'from' => $tiles['from'], 'to' => $tiles['to'],
+            'label' => $tiles['label'], 'chart_label' => $p['label'],
+            'bucket' => 'day',
+            'summary' => $this->billingSummary($tiles),
             'collection' => $collection, 'deposit' => $deposit, 'billing' => $billing,
             'daily' => $series($daily, 'day'), 'trend' => $series($trend, 'month'),
             'unpaid' => [
@@ -248,19 +327,20 @@ class IMSDashboardController extends MonitoringController
      * PF + EO bills of the month (EO: the year), the payments on them, and the arrears
      * (earlier PF / EO bills whose SOA has no t_payment at all — matched by trans_number).
      */
-    private function billingKpi(string $month): array
+    private function billingKpi(array $per): array
     {
         static $cache = [];
-        if (isset($cache[$month])) return $cache[$month];
+        $ck = $per['mode'] . '|' . $per['from'] . '|' . $per['to'];
+        if (isset($cache[$ck])) return $cache[$ck];
 
-        $monthName = strtoupper((new DateTime($month . '-01'))->format('F Y'));
-        $eoYear = 'EO-' . substr($month, 0, 4);
+        $monthName = strtoupper((new DateTime($per['from'] . '-01'))->format('F Y'));   // arrears = before the period
+        $eoYear = 'EO-' . substr($per['from'], 0, 4);
         $pf = array_map('intval', $this->rfListIds(self::RF_TYPES['PF']));
         $eo = array_map('intval', $this->rfListIds(self::RF_TYPES['EO']));
         $cols = ['id', 'ca_id', 'trans_number', 'service_period', 'ser_list_id', 'is_paid'];
 
-        // bills of the month
-        $bills = $this->rfServices($pf, [$monthName], $cols)->concat($this->rfServices($eo, [$eoYear], $cols))
+        // bills of the period
+        $bills = $this->rfServices($pf, $per['pfPeriods'], $cols)->concat($this->rfServices($eo, $per['eoPeriods'], $cols))
             ->filter(fn ($s) => (float) $s->total_service_fee > 0)->values();
 
         // payments on those bills (+ who collected / deposited them)
@@ -290,10 +370,10 @@ class IMSDashboardController extends MonitoringController
                 }));
         }
 
-        // arrears: earlier bills, no payment on the SOA
+        // arrears: earlier bills (before the period), no payment on the SOA – "all data" has nothing before it
         $sCols = array_map(fn ($c) => "S.{$c}", array_values(array_unique([...$cols, ...self::RF_NET_COLS])));
-        $pfBefore = $this->rfEarlier($monthName, false);
-        $eoBefore = $this->rfEarlier($eoYear, true);
+        $pfBefore = $per['mode'] === 'all' ? [] : $this->rfEarlier($monthName, false);
+        $eoBefore = $per['mode'] === 'all' ? [] : $this->rfEarlier($eoYear, true);
         $arrears = DB::table('t_service as S')->select($sCols)
             ->where(fn ($w) => $w
                 ->where(fn ($x) => $x->whereIn('S.ser_list_id', $pf ?: [0])->whereIn('S.service_period', $pfBefore ?: ['']))
@@ -304,13 +384,13 @@ class IMSDashboardController extends MonitoringController
             ->get();
 
         $type = fn ($s) => in_array((int) $s->ser_list_id, $eo, true) ? 'EO' : 'PF';
-        return $cache[$month] = compact('bills', 'payments', 'arrears', 'type');
+        return $cache[$ck] = compact('bills', 'payments', 'arrears', 'type');
     }
 
     /** the 5 tiles: billed, collected, deposited, outstanding (billed − collected), arrears */
-    private function billingSummary(string $month): array
+    private function billingSummary(array $per): array
     {
-        $k = $this->billingKpi($month);
+        $k = $this->billingKpi($per);
         $billed = round($k['bills']->sum(fn ($s) => $this->rfNet($s)), 2);
         $collected = round($k['payments']->sum('amount'), 2);
         $deposited = $k['payments']->where('deposited', true);
@@ -334,11 +414,9 @@ class IMSDashboardController extends MonitoringController
     public function dashboardBillingDetail(Request $request)
     {
         abort_unless($this->canBilling($request), 403, 'For management and billing only.');
-        $d = $request->validate([
-            'month' => ['required', 'date_format:Y-m'],
-            'kpi'   => ['required', 'in:billed,collected,deposited,outstanding,arrears'],
-        ]);
-        $k = $this->billingKpi($d['month']);
+        $d = $request->validate(['kpi' => ['required', 'in:billed,collected,deposited,outstanding,arrears']]);
+        $p = $this->billingPeriod($request);
+        $k = $this->billingKpi($p);
         $type = $k['type'];
         $paidBy = $k['payments']->groupBy('service_id')->map->sum('amount');
         $services = $d['kpi'] === 'arrears' ? $k['arrears'] : $k['bills'];
@@ -372,7 +450,7 @@ class IMSDashboardController extends MonitoringController
             $dateCol = $this->pick('t_transaction', ['date_start', 'transaction_date', 'created_at']);
             $billedOn = $dateCol ? DB::table('t_transaction')->whereIn('trans_number', $services->pluck('trans_number')->unique()->all() ?: [''])
                 ->pluck($dateCol, 'trans_number') : collect();
-            $monthStart = new DateTime($d['month'] . '-01');
+            $monthStart = new DateTime($p['from'] . '-01');   // months unpaid, counted up to the start of the period
             $rows = $services->map(function ($s) use ($paidBy, $type, $who, $names, $billedOn, $monthStart) {
                 $net = $this->rfNet($s);
                 $paid = (float) ($paidBy[$s->id] ?? 0);
@@ -397,7 +475,7 @@ class IMSDashboardController extends MonitoringController
             'amount' => round($g->sum($d['kpi'] === 'outstanding' ? 'balance' : 'amount'), 2),
         ])->sortBy(fn ($t) => $t['type'] === 'PF' ? 0 : 1)->values();   // PF first, then EO
 
-        return response()->json(['kpi' => $d['kpi'], 'month' => $d['month'], 'by_type' => $byType, 'rows' => $rows]);
+        return response()->json(['kpi' => $d['kpi'], 'month' => $p['to'], 'label' => $p['label'], 'by_type' => $byType, 'rows' => $rows]);
     }
 
     /* GET /dashboard/clients?month=YYYY-MM   scans made by the client himself (employee_id 0 / null) by trans_type (CEO only) */
