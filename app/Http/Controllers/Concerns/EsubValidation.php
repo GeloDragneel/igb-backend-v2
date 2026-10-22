@@ -8,7 +8,7 @@ namespace App\Http\Controllers\Concerns;
  *
  *  Errors   : missing / wrong TIN (letters, special characters, wrong length, all zeros, same as the client's) – not for Sales,
  *             missing registered name, special characters in the name, negative amounts,
- *             one TIN with two different names, missing ATC / amount (1601EQ, 1604E),
+ *             missing ATC / amount (1601EQ, 1604E),
  *             client header without TIN / name / address / RDO, a period longer than one quarter.
  *  Warnings : name longer than 50, VAT not 12% of the net, tax not amount × rate, line with all zero amounts,
  *             RDO not 3 digits.
@@ -110,7 +110,6 @@ trait EsubValidation
 
         /* ---------- every line ---------- */
         $isList = in_array($type, ['P', 'S'], true);
-        $names = [];
         foreach ($rows as $i => $r) {
             $line = $i + 1;
             $tinRaw = (string) ($r['_tin_raw'] ?? $r['tin'] ?? '');
@@ -127,17 +126,6 @@ trait EsubValidation
                 $dat = $this->esDatText($nameRaw);
                 if (strlen($dat) > 50) $add($warnings, $line, $r, 'Registered name', 'Registered name is longer than 50 characters (' . strlen($dat) . ').');
                 if (preg_match('/[,ñÑ]|[^\x20-\x7E]/u', $nameRaw)) $fixed['name'] = 'Names: commas removed, Ñ changed to N, accents removed.';
-            }
-
-            // one TIN, one name
-            $t9 = substr(preg_replace('/\D/', '', $tinRaw), 0, 9);
-            if ($type !== 'S' && strlen($t9) === 9) {
-                $n = $this->esDatText($nameRaw);
-                if (isset($names[$t9]) && $names[$t9]['name'] !== $n && $n !== '') {
-                    $add($errors, $line, $r, 'TIN', "Same TIN as line {$names[$t9]['line']} but a different name (\"{$names[$t9]['name']}\"). Fix the vendor / customer record.");
-                } elseif (!isset($names[$t9])) {
-                    $names[$t9] = ['name' => $n, 'line' => $line];
-                }
             }
 
             if ($isList) {
