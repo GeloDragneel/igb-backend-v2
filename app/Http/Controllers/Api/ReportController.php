@@ -2785,12 +2785,11 @@ class ReportController extends SalesController
         $addr2 = $A(trim("{$c['city']} {$c['province']} {$c['zip']}"));
         $columns = []; $rows = []; $totals = []; $content = ''; $filename = '';
  
-        // Non VAT is NOT reported (Sales, Purchases, Expenses): lines ticked Non VAT, and lines whose only amount is
-        // Non VAT (Net of VAT, VAT, VAT Exempt and Zero Rated all 0 – Office of the Treasurer, Payroll …)
+        // Non VAT is NOT reported (Sales, Purchases, Expenses): a line whose only amount is Non VAT (Net of VAT, VAT,
+        // VAT Exempt and Zero Rated all 0 – Office of the Treasurer, Payroll …) is left out. The Non VAT amount itself
+        // is never in the DAT (it has no column). A line that has a Net of VAT / Exempt / Zero amount stays – even when
+        // its Non VAT box is ticked – so the totals are the SAME as VAT Summary / E-BIR.
         $noNonVat = function ($q, string $table) {
-            if (Schema::hasColumn($table, 'non_vat')) {
-                $q->where(fn ($w) => $w->whereNull('x.non_vat')->orWhere('x.non_vat', 0));
-            }
             return $q->whereRaw('(ABS(COALESCE(x.net_of_vat,0)) + ABS(COALESCE(x.input_vat,0)) + ABS(COALESCE(x.vat_exempt,0)) + ABS(COALESCE(x.zero_rated,0))) > 0');
         };
  
@@ -2800,7 +2799,7 @@ class ReportController extends SalesController
                 $grn = $noNonVat(DB::table('t_grn_detail as x'), 't_grn_detail')
                     ->whereIn('x.receive_by', $ids)->where('x.grn_status_id', '<>', 5)
                     ->whereBetween('x.declared_month', [$from, $to])
-                    ->selectRaw('x.grn_no AS ref, x.vendor_id AS pid, COALESCE(x.total,0) AS php, COALESCE(x.net_of_vat,0) AS net, COALESCE(x.input_vat,0) AS vat, COALESCE(x.vat_exempt,0) AS exempt, COALESCE(x.zero_rated,0) AS zero')
+                    ->selectRaw('x.declared_month AS mon, x.grn_no AS ref, x.vendor_id AS pid, COALESCE(x.total,0) AS php, COALESCE(x.net_of_vat,0) AS net, COALESCE(x.input_vat,0) AS vat, COALESCE(x.vat_exempt,0) AS exempt, COALESCE(x.zero_rated,0) AS zero')
                     ->get();
                 $ap = $noNonVat(DB::table('t_purchase_expense_detail as x'), 't_purchase_expense_detail')
                     ->join('t_purchase_expense_master as m', 'm.invoice_no', '=', 'x.invoice_no')
@@ -2808,7 +2807,7 @@ class ReportController extends SalesController
                     ->whereBetween('m.declared_month', [$from, $to])
                     // Purchases + Expenses records only (same as VAT Summary); Non VAT left out (old dat.php: NonVAT = 0)
                     ->whereRaw('LOWER(m.trans_type) IN (?, ?)', ['purchases', 'expenses'])
-                    ->selectRaw('m.invoice_no AS ref, m.vendor_id AS pid, COALESCE(x.amount,0) AS php, COALESCE(x.net_of_vat,0) AS net, COALESCE(x.input_vat,0) AS vat, COALESCE(x.vat_exempt,0) AS exempt, COALESCE(x.zero_rated,0) AS zero')
+                    ->selectRaw('m.declared_month AS mon, m.invoice_no AS ref, m.vendor_id AS pid, COALESCE(x.amount,0) AS php, COALESCE(x.net_of_vat,0) AS net, COALESCE(x.input_vat,0) AS vat, COALESCE(x.vat_exempt,0) AS exempt, COALESCE(x.zero_rated,0) AS zero')
                     ->get();
                 $lines = $grn->concat($ap);
                 $party = $this->esParties($lines->pluck('pid'));
@@ -2827,8 +2826,8 @@ class ReportController extends SalesController
                         'php' => round($r->php, 2), 'net' => round($r->net, 2), 'vat' => round($r->vat, 2), 'exempt' => round($r->exempt, 2), 'zero' => round($r->zero, 2),
                         '_tin_raw' => $v['tin_raw'], '_name_raw' => $v['name_raw']];
                 }
-                // totals from the unrounded amounts (same as VAT Summary), so they match to the centavo
-                $t = fn ($k) => round((float) $lines->sum(fn ($x) => (float) $x->{$k}), 2);
+                // totals the way VAT Summary / E-BIR add them: each month rounded, then the months added → same to the centavo
+                $t = fn ($k) => round((float) $lines->groupBy('mon')->sum(fn ($g) => round((float) $g->sum(fn ($x) => (float) $x->{$k}), 2)), 2);
                 $totals = ['php' => $t('php'), 'net' => $t('net'), 'vat' => $t('vat'), 'exempt' => $t('exempt'), 'zero' => $t('zero')];
  
                 // exactly the old ajax/dat.php layout (Address 1 / Address 2 = the old "street barangay, city province zip" split at the comma)
