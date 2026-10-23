@@ -657,9 +657,9 @@ class BillingController extends Controller
         ]);
         $s = DB::table('t_service')->where('id', $id)->first();
         if (!$s) return response()->json(['message' => 'Service not found.'], 404);
-        if (in_array((int) $s->invoice_status_id, [self::PAID, self::VOID, self::CANCELLED], true)) {
-            return response()->json(['message' => 'Options can\'t change on a paid, void or cancelled service.'], 422);
-        }
+        // if (in_array((int) $s->invoice_status_id, [self::PAID, self::VOID, self::CANCELLED], true)) {
+        //     return response()->json(['message' => 'Options can\'t change on a paid, void or cancelled service.'], 422);
+        // }
 
         $flags = (object) [
             'd_vat' => (int) ($d['d_vat'] ?? 0), 'd_witholding' => (int) ($d['d_witholding'] ?? 0),
