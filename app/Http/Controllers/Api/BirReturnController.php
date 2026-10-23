@@ -132,7 +132,7 @@ class BirReturnController extends ReportController
         return "COALESCE({$p}net_of_vat,0)+COALESCE({$p}vat_exempt,0)+COALESCE({$p}non_vat,0)+COALESCE({$p}zero_rated,0)";
     }
 
-    private function sales(array $ids, string $from, string $to)
+   private function sales(array $ids, string $from, string $to)
     {
         $t = 't_sales_invoice_detail';
         return SalesInvoiceDetail::whereIn("{$t}.added_by", $ids)
@@ -144,16 +144,32 @@ class BirReturnController extends ReportController
     {
         return DB::table('t_grn_detail as d')
             ->join('t_grn_master as g', 'g.grn_no', '=', 'd.grn_no')
-            ->whereIn('g.receive_by', $ids)
-            ->whereRaw($this->effMonth('g.grn_no', 'g.declared_month', 'g.ref_data') . ' BETWEEN ? AND ?', [$from, $to]);
+            ->where('g.invoice_status_id', '<>', 5)
+            ->whereIn('d.receive_by', $ids)
+            ->whereRaw($this->effMonth('d.grn_no', 'd.declared_month', 'g.ref_data') . ' BETWEEN ? AND ?', [$from, $to]);
     }
 
-    private function ap(array $ids, string $from, string $to)
+    private function ap(array $ids, string $from, string $to, ?array $types = null)
     {
         $t = 't_purchase_expense_detail';
-        return PurchaseExpenseDetail::query()->active()
+        $q = PurchaseExpenseDetail::query()
             ->whereIn("{$t}.added_by", $ids)
+            ->where("{$t}.invoice_status_id", '<>', 5)
             ->whereRaw($this->effMonth("{$t}.invoice_no", "{$t}.declared_month") . ' BETWEEN ? AND ?', [$from, $to]);
+        if ($this->col($t, ['record_status'])) $q->where("{$t}.record_status", 'posted');
+        $mStatus = $this->col('t_purchase_expense_master', ['record_status']);
+        if ($mStatus) {
+            $q->whereExists(fn ($e) => $e->selectRaw('1')->from('t_purchase_expense_master as PM')
+                ->whereColumn('PM.invoice_no', "{$t}.invoice_no")->where("PM.{$mStatus}", 'posted'));
+        }
+        if ($types) {
+            $dType = $this->col($t, ['trans_type', 'payment_type']);
+            $dType
+                ? $q->whereIn("{$t}.{$dType}", $types)
+                : $q->whereExists(fn ($e) => $e->selectRaw('1')->from('t_purchase_expense_master as PT')
+                    ->whereColumn('PT.invoice_no', "{$t}.invoice_no")->whereIn('PT.trans_type', $types));
+        }
+        return $q;
     }
 
     /* ======================= files ======================= */
@@ -409,16 +425,18 @@ class BirReturnController extends ReportController
         $s = $this->sales($ids, $from, $to)->selectRaw(
             "SUM(COALESCE(net_of_vat,0)*{$ex}) AS net, SUM(COALESCE(zero_rated,0)*{$ex}) AS zero, SUM(COALESCE(vat_exempt,0)*{$ex}) AS exempt"
         )->toBase()->first();
-
+ 
+        // E-BIR: Purchases (receive inventory + AP Purchases) + Expenses — only the Purchases / Expenses lines
+        $pe = ['Purchases', 'Expenses'];
         $purchNet = (float) $this->grn($ids, $from, $to)->sum('d.net_of_vat')
-                  + (float) $this->ap($ids, $from, $to)->sum('net_of_vat');
+                  + (float) $this->ap($ids, $from, $to, $pe)->sum('net_of_vat');
         $purchExZero = (float) $this->grn($ids, $from, $to)->sum(DB::raw('COALESCE(d.vat_exempt,0)+COALESCE(d.zero_rated,0)'))
-                     + (float) $this->ap($ids, $from, $to)->sum(DB::raw('COALESCE(vat_exempt,0)+COALESCE(zero_rated,0)'));
-
+                     + (float) $this->ap($ids, $from, $to, $pe)->sum(DB::raw('COALESCE(vat_exempt,0)+COALESCE(zero_rated,0)'));
+ 
         $vtMonth = $this->col('t_sales_invoice_master', ['2307_vt_declared_month', 'declared_month']);
         $withheldQ = fn () => SalesInvoiceMaster::whereIn('added_by', $ids)->where('invoice_status_id', '<>', 5)
             ->where('2307_vt', '>', 0)->whereBetween($vtMonth, [$from, $to]);
-
+ 
         $out = [
             'net_of_vat'            => round((float) ($s->net ?? 0), 2),
             'zero_rated'            => round((float) ($s->zero ?? 0), 2),
@@ -429,21 +447,21 @@ class BirReturnController extends ReportController
             'vat_withheld'          => round((float) $withheldQ()->sum('2307_vt'), 2),
         ];
         if (!$quarterly) return $out;
-
+ 
         // Advance VAT payments: AP lines on "VAT Paid" accounts, up to the month before the quarter ends
         $codes  = ChartsOfAccount::whereIn('added_by', $ids)->where('account_name', 'like', '%vat paid%')->pluck('account_code')->unique();
         $toPrev = Carbon::createFromFormat('Y-m-d', "{$to}-01")->subMonth()->format('Y-m');
         $out['advance_vat'] = ($codes->isEmpty() || $toPrev < $from) ? 0 : round(
             (float) $this->ap($ids, $from, $toPrev)->whereIn('account_code', $codes)->sum(DB::raw($this->net() . '+COALESCE(input_vat,0)')), 2
         );
-
+ 
         // Schedule 3 – creditable VAT withheld, per month per customer
         $base = $this->col('t_sales_invoice_master', ['sub_total', 'grand_total']);
         $sched = $withheldQ()->groupBy($vtMonth, 'customer_id')
             ->selectRaw("`{$vtMonth}` AS m, customer_id, SUM(`2307_vt`) AS tax, SUM(`{$base}`) AS income")
             ->toBase()->get();
         $names = $this->partyNames($sched->pluck('customer_id'));
-
+ 
         $out['schedule3'] = $sched->map(function ($r) use ($names) {
             $d = Carbon::createFromFormat('Y-m-d', "{$r->m}-01");
             return [
@@ -455,7 +473,7 @@ class BirReturnController extends ReportController
                 'tax'    => round((float) $r->tax, 2),
             ];
         })->sortBy([['m', 'asc'], ['name', 'asc']])->values();
-
+ 
         return $out;
     }
 
@@ -1138,7 +1156,7 @@ class BirReturnController extends ReportController
         return response()->json(['account_code' => (string) $code, 'account_name' => $row['account_name'], 'message' => "{$code} – {$row['account_name']} added to Charts of Account"]);
     }
 
-    private function effMonth(string $ref, string $month, ?string $ref2 = null): string
+   private function effMonth(string $ref, string $month, ?string $ref2 = null): string
     {
         static $ut = false;
         if ($ut === false) {
