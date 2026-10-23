@@ -1,7 +1,7 @@
 <?php
 
 namespace App\Http\Controllers\Api;
-
+use Illuminate\Support\Facades\DB;
 /** Importation (old Importation page: tbl2_importation_master / _detail) */
 class ImportationController extends TradeController
 {
@@ -52,6 +52,18 @@ class ImportationController extends TradeController
 
     protected function listTotal(object $m): float
     {
-        return (float) $m->total_landed_cost;
+        static $lineSums = null;
+        if ((float) $m->total_landed_cost != 0) return (float) $m->total_landed_cost;
+ 
+        if ($lineSums === null) {
+            $lineSums = DB::table('t_importation_detail as D')
+                ->join('t_importation_master as M', 'M.id', '=', 'D.importation_master_id')
+                ->whereRaw('COALESCE(M.total_landed_cost, 0) = 0')
+                ->where('M.added_by', $m->added_by)
+                ->groupBy('D.importation_master_id')
+                ->selectRaw('D.importation_master_id AS id, SUM(D.total_landed_cost) AS t')
+                ->pluck('t', 'id')->all();
+        }
+        return round((float) ($lineSums[$m->id] ?? 0), 4);
     }
 }

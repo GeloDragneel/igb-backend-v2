@@ -1482,7 +1482,7 @@ class MonitoringController extends Controller
     {
         $d = $this->collectionInput($request);
         $cols = $this->collectionCols();
- 
+
         // 1) count + total in ONE query
         $agg = $this->collectionBase($d)->selectRaw('COUNT(*) AS c, COALESCE(SUM(P.amount), 0) AS s')->first();
         // Less / WH total: each service once (a service paid in 2 payments is not counted twice)
@@ -1490,14 +1490,16 @@ class MonitoringController extends Controller
             $this->collectionBase($d)->whereNotNull('S.id')->select(['S.id', DB::raw($this->collectionLessSql() . ' AS v')])->distinct(), 'X'
         )->sum('v');
         $total = (int) $agg->c;
-        $per = !empty($d['export']) ? max(1, min($total, 50000)) : (int) ($d['per_page'] ?? 50);   // export = every row (max 50,000)
+        // export / Rows = All → every row on one page (max 50,000)
+        $all = !empty($d['export']) || $request->boolean('all');
+        $per = $all ? max(1, min($total, 50000)) : (int) ($d['per_page'] ?? 50);
         $last = max(1, (int) ceil($total / $per));
         $page = min((int) ($d['page'] ?? 1), $last);
- 
+
         // 2) the ids of this page only
         $ids = $this->collectionBase($d)->orderByDesc('P.payment_date')->orderByDesc('P.id')
             ->offset(($page - 1) * $per)->limit($per)->pluck('P.id')->all();
- 
+
         // 3) all the display columns for just those rows
         $rows = collect();
         if ($ids) {
@@ -1514,7 +1516,7 @@ class MonitoringController extends Controller
                 return $r;
             })->values();
         }
- 
+
         return response()->json([
             'rows' => $rows, 'total' => $total, 'sum' => round((float) $agg->s, 2), 'less_sum' => round($lessSum, 2),
             'page' => $page, 'per_page' => $per, 'last_page' => $last,
