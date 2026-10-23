@@ -1484,7 +1484,11 @@ class MonitoringController extends Controller
         $cols = $this->collectionCols();
  
         // 1) count + total in ONE query
-        $agg = $this->collectionBase($d)->selectRaw('COUNT(*) AS c, COALESCE(SUM(P.amount), 0) AS s, COALESCE(SUM(' . $this->collectionLessSql() . '), 0) AS l')->first();
+        $agg = $this->collectionBase($d)->selectRaw('COUNT(*) AS c, COALESCE(SUM(P.amount), 0) AS s')->first();
+        // Less / WH total: each service once (a service paid in 2 payments is not counted twice)
+        $lessSum = (float) DB::query()->fromSub(
+            $this->collectionBase($d)->whereNotNull('S.id')->select(['S.id', DB::raw($this->collectionLessSql() . ' AS v')])->distinct(), 'X'
+        )->sum('v');
         $total = (int) $agg->c;
         $per = !empty($d['export']) ? max(1, min($total, 50000)) : (int) ($d['per_page'] ?? 50);   // export = every row (max 50,000)
         $last = max(1, (int) ceil($total / $per));
@@ -1512,7 +1516,7 @@ class MonitoringController extends Controller
         }
  
         return response()->json([
-            'rows' => $rows, 'total' => $total, 'sum' => round((float) $agg->s, 2), 'less_sum' => round((float) $agg->l, 2),
+            'rows' => $rows, 'total' => $total, 'sum' => round((float) $agg->s, 2), 'less_sum' => round($lessSum, 2),
             'page' => $page, 'per_page' => $per, 'last_page' => $last,
         ]);
     }
@@ -1841,18 +1845,29 @@ class MonitoringController extends Controller
     }
     private function collectionLessSql(): string
     {
-        $wh = $this->pick('t_service', ['inherited_wh']);
-        $disc = $this->pick('t_service', ['inherited_discount_amount']);
-        $sum = implode(' + ', array_filter([$wh ? "COALESCE(S.{$wh}, 0)" : null, $disc ? "COALESCE(S.{$disc}, 0)" : null])) ?: '0';
-        return "(CASE WHEN P.service_id IS NOT NULL AND P.id = (SELECT MIN(P2.id) FROM t_payment P2 WHERE P2.service_id = P.service_id) THEN {$sum} ELSE 0 END)";
+        $c = fn ($n) => $this->pick('t_service', [$n]);
+        $parts = [];
+        if ($c('less')) $parts[] = 'COALESCE(S.less, 0)';
+        if ($c('inherited_wh')) {
+            $parts[] = $c('d_witholding')
+                ? 'CASE WHEN COALESCE(S.inherited_wh, 0) <> 0 THEN S.inherited_wh WHEN S.d_witholding = 1 THEN ROUND(COALESCE(S.total_service_fee, 0) * 0.05, 2) ELSE 0 END'
+                : 'COALESCE(S.inherited_wh, 0)';
+        }
+        if ($c('inherited_discount_amount')) $parts[] = 'COALESCE(S.inherited_discount_amount, 0)';
+        return '(' . ($parts ? implode(' + ', $parts) : '0') . ')';
     }
     private function collectionLessParts(): string
     {
-        $wh = $this->pick('t_service', ['inherited_wh']);
-        $disc = $this->pick('t_service', ['inherited_discount_amount']);
+        $c = fn ($n) => $this->pick('t_service', [$n]);
+        $wh = $c('inherited_wh')
+            ? ($c('d_witholding')
+                ? 'CASE WHEN COALESCE(S.inherited_wh, 0) <> 0 THEN S.inherited_wh WHEN S.d_witholding = 1 THEN ROUND(COALESCE(S.total_service_fee, 0) * 0.05, 2) ELSE 0 END'
+                : 'COALESCE(S.inherited_wh, 0)')
+            : null;
         $parts = array_filter([
-            $wh ? "CASE WHEN COALESCE(S.{$wh}, 0) <> 0 THEN CONCAT('WH ', FORMAT(S.{$wh}, 2)) END" : null,
-            $disc ? "CASE WHEN COALESCE(S.{$disc}, 0) <> 0 THEN CONCAT('Disc. ', FORMAT(S.{$disc}, 2)) END" : null,
+            $c('less') ? "CASE WHEN COALESCE(S.less, 0) <> 0 THEN CONCAT('Less ', FORMAT(S.less, 2)) END" : null,
+            $wh ? "CASE WHEN ({$wh}) <> 0 THEN CONCAT('WH ', FORMAT({$wh}, 2)) END" : null,
+            $c('inherited_discount_amount') ? "CASE WHEN COALESCE(S.inherited_discount_amount, 0) <> 0 THEN CONCAT('Disc. ', FORMAT(S.inherited_discount_amount, 2)) END" : null,
         ]);
         return $parts ? "COALESCE(CONCAT_WS(' · ', " . implode(', ', $parts) . "), '')" : "''";
     }
