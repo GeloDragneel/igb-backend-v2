@@ -134,9 +134,10 @@ class BirReturnController extends ReportController
 
     private function sales(array $ids, string $from, string $to)
     {
-        return SalesInvoiceDetail::whereIn('added_by', $ids)
-            ->where('invoice_status_id', '<>', 5)->where('trans_type', 'posted')
-            ->whereBetween('declared_month', [$from, $to]);
+        $t = 't_sales_invoice_detail';
+        return SalesInvoiceDetail::whereIn("{$t}.added_by", $ids)
+            ->where("{$t}.invoice_status_id", '<>', 5)->where("{$t}.trans_type", 'posted')
+            ->whereRaw($this->effMonth("{$t}.invoice_no", "{$t}.declared_month") . ' BETWEEN ? AND ?', [$from, $to]);
     }
 
     private function grn(array $ids, string $from, string $to)
@@ -144,14 +145,15 @@ class BirReturnController extends ReportController
         return DB::table('t_grn_detail as d')
             ->join('t_grn_master as g', 'g.grn_no', '=', 'd.grn_no')
             ->whereIn('g.receive_by', $ids)
-            ->whereBetween('g.declared_month', [$from, $to]);
+            ->whereRaw($this->effMonth('g.grn_no', 'g.declared_month', 'g.ref_data') . ' BETWEEN ? AND ?', [$from, $to]);
     }
 
     private function ap(array $ids, string $from, string $to)
     {
+        $t = 't_purchase_expense_detail';
         return PurchaseExpenseDetail::query()->active()
-            ->whereIn('added_by', $ids)
-            ->whereBetween('declared_month', [$from, $to]);
+            ->whereIn("{$t}.added_by", $ids)
+            ->whereRaw($this->effMonth("{$t}.invoice_no", "{$t}.declared_month") . ' BETWEEN ? AND ?', [$from, $to]);
     }
 
     /* ======================= files ======================= */
@@ -1135,4 +1137,20 @@ class BirReturnController extends ReportController
 
         return response()->json(['account_code' => (string) $code, 'account_name' => $row['account_name'], 'message' => "{$code} – {$row['account_name']} added to Charts of Account"]);
     }
+
+    private function effMonth(string $ref, string $month, ?string $ref2 = null): string
+    {
+        static $ut = false;
+        if ($ut === false) {
+            $ut = null;
+            foreach (['t_undeclared_trans', 'tbl2_undeclared_trans'] as $t) if (Schema::hasTable($t)) { $ut = $t; break; }
+        }
+        if (!$ut) return "LEFT({$month}, 7)";
+        $match = $ref2 ? "(U.reference_no = {$ref} OR U.reference_no = {$ref2})" : "U.reference_no = {$ref}";
+        return "COALESCE((SELECT LEFT(U.new_declared_month, 7) FROM {$ut} U
+                  WHERE {$match} AND U.is_approved = 0 AND U.report = 'EBIR'
+                    AND U.old_declared_month = LEFT({$month}, 7)
+                  ORDER BY U.id DESC LIMIT 1), LEFT({$month}, 7))";
+    }
+
 }

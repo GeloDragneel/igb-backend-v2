@@ -731,6 +731,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/billing/soa/{transNumber}/print/{type}', [PrintController::class, 'billingSoaPrint']);
     Route::get('/billing/return-ar/{transNumber}/print', [PrintController::class, 'returnArPrint']);
     Route::get('/billing/deposit/r1', [PrintController::class, 'depositR1Print']);
+    Route::post('/print/collection-monitoring', [PrintController::class, 'collectionExcelPrepare']);
+    Route::get('/print/collection-monitoring/{token}', [PrintController::class, 'collectionExcel']);
 
     Route::get('/notifications', [NotificationController::class, 'index']);
     Route::put('/notifications/read', [NotificationController::class, 'read']);

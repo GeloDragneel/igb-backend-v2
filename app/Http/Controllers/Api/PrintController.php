@@ -2413,5 +2413,128 @@ class PrintController extends ReportController
             ], 422);
         }
     }
+    /* ======================= Monitoring → Collection Monitoring: Excel ======================= */
 
+    /* POST /api/print/collection-monitoring — all rows of the current filters (from ?export=1) → { token } */
+    public function collectionExcelPrepare(Request $request)
+    {
+        $d = $request->validate([
+            'from'   => ['required', 'date'],
+            'to'     => ['required', 'date'],
+            'type'   => ['nullable', 'string', 'max:20'],
+            'head'   => ['required', 'array', 'max:30'],
+            'rows'   => ['present', 'array', 'max:100000'],
+            'rows.*' => ['array', 'max:30'],
+            'total'  => ['nullable', 'array', 'max:30'],
+        ]);
+        $clean = fn ($r) => array_map(fn ($v) => is_int($v) || is_float($v) ? (float) $v : mb_substr((string) ($v ?? ''), 0, 500), array_values($r));
+
+        $token = \Illuminate\Support\Str::random(32);
+        \Illuminate\Support\Facades\Cache::put($this->collectionExcelKey($request, $token), [
+            'from'  => $d['from'],
+            'to'    => $d['to'],
+            'type'  => $d['type'] ?? 'All',
+            'head'  => array_map('strval', $d['head']),
+            'rows'  => array_map($clean, $d['rows']),
+            'total' => $clean($d['total'] ?? []),
+        ], now()->addMinutes(10));
+
+        return response()->json(['token' => $token]);
+    }
+
+    /* GET /api/print/collection-monitoring/{token} → CollectionMonitoring-{Username}.xlsx */
+    public function collectionExcel(Request $request, string $token)
+    {
+        $s = \Illuminate\Support\Facades\Cache::pull($this->collectionExcelKey($request, $token));
+        abort_if(!$s, 404, 'This export has expired. Press Excel again.');
+        $who = $request->user()?->username ?? 'report';
+
+        // old Print: CollectionMonitoring.xlsx, [b.data1] … [b.data13] (# … Deposited; no Status), totals line at the end
+        $template = method_exists($this, 'template') ? $this->template('CollectionMonitoring.xlsx') : '';
+        if (is_file($template) && method_exists($this, 'fillTemplate')) {
+            $h = [];
+            if (method_exists($this, 'journalScope') && method_exists($this, 'companyHeader')) {
+                [, $account] = $this->journalScope($request, 'current');
+                $h = $this->companyHeader($account) ?? [];
+            }
+            $data = array_map(fn ($r) => array_slice($r, 0, 13), $s['rows']);
+            if ($s['total']) $data[] = array_slice($s['total'], 0, 13);
+            $ss = $this->fillTemplate($template, ['m' => [
+                'TradeName' => (string) ($h['trade_name'] ?? ''), 'TIN' => (string) ($h['tin'] ?? ''),
+                'Street' => (string) ($h['address'] ?? ''), 'RDateRange' => "{$s['from']} - {$s['to']}",
+            ]], $data);
+            $xlsx = method_exists($this, 'tempFile') ? $this->tempFile('xlsx') : tempnam(sys_get_temp_dir(), 'col') . '.xlsx';
+            (new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($ss))->save($xlsx);
+            $ss->disconnectWorksheets();
+            return response()->download($xlsx, "CollectionMonitoring-{$who}.xlsx", [
+                'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            ])->deleteFileAfterSend(true);
+        }
+
+        // no template: full sheet (all columns incl. Status)
+        $ss = new \PhpOffice\PhpSpreadsheet\Spreadsheet();
+        $sh = $ss->getActiveSheet();
+        $sh->setTitle('Collection Monitoring');
+        $n = max(1, count($s['head']));
+        $last = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($n);
+        $amountCol = array_search('Amount received', $s['head'], true);
+
+        $sh->setCellValue('A1', 'Collection Monitoring');
+        $sh->getStyle('A1')->getFont()->setBold(true)->setSize(14);
+        $sh->setCellValueExplicit('A2', "PF · Return · EO payments  ·  Type: {$s['type']}  ·  {$s['from']} to {$s['to']}", \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
+
+        $hr = 4;
+        foreach ($s['head'] as $c => $t) $sh->setCellValueExplicit(\PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($c + 1) . $hr, $t, \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
+        $sh->getStyle("A{$hr}:{$last}{$hr}")->applyFromArray([
+            'font'      => ['bold' => true, 'color' => ['rgb' => 'FFFFFF']],
+            'fill'      => ['fillType' => \PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID, 'startColor' => ['rgb' => '1D4ED8']],
+            'alignment' => ['vertical' => 'center'],
+        ]);
+
+        $r = $hr + 1;
+        $put = function (array $line, int $r) use ($sh) {
+            foreach ($line as $c => $val) {
+                $cell = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($c + 1) . $r;
+                if (is_float($val) || is_int($val)) $sh->setCellValue($cell, $val);
+                elseif ($val !== '') $sh->setCellValueExplicit($cell, (string) $val, \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
+            }
+        };
+        foreach ($s['rows'] as $line) $put($line, $r++);
+        $lastData = $r - 1;
+        if ($s['total']) {
+            $put($s['total'], $r);
+            $sh->getStyle("A{$r}:{$last}{$r}")->applyFromArray([
+                'font'    => ['bold' => true],
+                'fill'    => ['fillType' => \PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID, 'startColor' => ['rgb' => 'EEF2FF']],
+                'borders' => ['top' => ['borderStyle' => \PhpOffice\PhpSpreadsheet\Style\Border::BORDER_THIN], 'bottom' => ['borderStyle' => \PhpOffice\PhpSpreadsheet\Style\Border::BORDER_DOUBLE]],
+            ]);
+            $r++;
+        }
+        $end = max($hr, $r - 1);
+
+        if ($amountCol !== false) {
+            $col = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($amountCol + 1);
+            $sh->getStyle("{$col}" . ($hr + 1) . ":{$col}{$end}")->getNumberFormat()->setFormatCode('#,##0.00;(#,##0.00)');
+            $sh->getStyle("{$col}{$hr}:{$col}{$end}")->getAlignment()->setHorizontal('right');
+        }
+        $sh->getStyle("A{$hr}:{$last}{$end}")->getBorders()->getAllBorders()->setBorderStyle(\PhpOffice\PhpSpreadsheet\Style\Border::BORDER_THIN)->getColor()->setRGB('CBD5E1');
+        for ($c = 1; $c <= $n; $c++) $sh->getColumnDimension(\PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($c))->setAutoSize(true);
+        $sh->freezePane('A' . ($hr + 1));
+        $sh->setAutoFilter("A{$hr}:{$last}" . max($hr, $lastData));
+
+        $name = "CollectionMonitoring-{$who}.xlsx";
+        $xlsx = method_exists($this, 'tempFile') ? $this->tempFile('xlsx') : tempnam(sys_get_temp_dir(), 'col') . '.xlsx';
+        (new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($ss))->save($xlsx);
+        $ss->disconnectWorksheets();
+
+        return response()->download($xlsx, $name, [
+            'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        ])->deleteFileAfterSend(true);
+    }
+
+    private function collectionExcelKey(Request $request, string $token): string
+    {
+        $u = $request->user();
+        return 'print:col:' . ($u ? class_basename($u) . ':' . $u->getKey() : 'guest') . ':' . preg_replace('/\W/', '', $token);
+    }
 }
