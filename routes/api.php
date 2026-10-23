@@ -669,6 +669,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/reports/vat-clients/pending', [ReportController::class, 'vatClientsPending']);
     Route::post('/report-generator/part', [ReportController::class, 'reportGeneratorPart']);
     Route::get('/report-generator/zip',   [ReportController::class, 'reportGeneratorZip']);
+    Route::get('/reports/vat-clients/history', [ReportController::class, 'vatClientsHistory']);
 
     // Administration → Ticket
     Route::get('/admin/tickets', [AdministrationController::class, 'ticketList']);

@@ -4611,17 +4611,19 @@ class ReportController extends SalesController
 
     /* ---------------- lookups ---------------- */
 
-    public function vatClientsLookups()
+    public function vatClientsLookups(Request $request)
     {
         $sl = $this->vsStatusLabel();
         $active = $this->vsPick('m_employee', ['is_active', 'active']);
+        $myDa = $this->reportDaOnly($request);
         return response()->json([
             'statuses' => $sl ? DB::table('m_client_account_status')->orderBy($sl)->get(['id', "{$sl} as name"]) : [],
             // old: tbl_employee WHERE DesignationID = 3
             'analysts' => DB::table('m_employee')->where('designation_id', 3)
-                ->when($active, fn ($q) => $q->where($active, 1))
+                ->when($myDa, fn ($q) => $q->where('id', $myDa), fn ($q) => $q->when($active, fn ($q) => $q->where($active, 1)))
                 ->orderBy('last_name')->orderBy('first_name')
                 ->get(['id', DB::raw("TRIM(CONCAT_WS(' ', last_name, first_name, middle_name)) AS name")]),
+            'my_da'    => $myDa ?: null,
         ]);
     }
 
@@ -4639,6 +4641,7 @@ class ReportController extends SalesController
         $to = $d['to'];
         $statusId = (int) ($d['status_id'] ?? 0);
         $daId = (int) ($d['da_id'] ?? 0);
+        if ($mine = $this->reportDaOnly($request)) $daId = $mine;
         $ca = $this->vsUserCa();
         $sl = $this->vsStatusLabel();
         $active = $this->vsPick('m_client', ['active', 'is_active']);
@@ -5196,11 +5199,11 @@ class ReportController extends SalesController
     /** old doGetUndeclaredAmount: sales invoices waiting to be moved */
     private function vsUndeclaredAmount(int $clientId, string $from, string $to): float
     {
-        $ut = $this->vsUndeclaredTable();
-        return (float) DB::selectOne("
-            SELECT COALESCE(SUM(B.total), 0) AS v
-            FROM {$ut} A INNER JOIN t_sales_invoice_master B ON B.invoice_no = A.reference_no
-            WHERE A.client_id = ? AND A.old_declared_month BETWEEN ? AND ? AND A.is_approved = 0{$this->vsSalesPosted('B', 't_sales_invoice_master')}", [$clientId, $from, $to])->v;
+        $refs = DB::table($this->vsUndeclaredTable())->where('client_id', $clientId)
+            ->whereBetween('old_declared_month', [$from, $to])
+            ->where('is_approved', 0)->where('report', 'EBIR')
+            ->distinct()->pluck('reference_no')->all();
+        return round(array_sum(array_column($this->vsPendingNet($refs), 'net')), 2);
     }
 
     /* ---------------- documents behind one E-BIR cell ---------------- */
@@ -5308,6 +5311,7 @@ class ReportController extends SalesController
 
     public function vatClientsUndeclare(Request $request)
     {
+        $this->vsDaCannot($request);
         $d = $request->validate([
             'reference_no'          => ['required', 'string', 'max:100'],
             'old_declared_month'    => ['required', 'date_format:Y-m'],
@@ -5323,6 +5327,11 @@ class ReportController extends SalesController
             return response()->json(['message' => 'Declared Month is disabled'], 422);
         }
         $t = $this->vsUndeclaredTable();
+        // already waiting → no second copy (that doubled the printed list)
+        $exists = DB::table($t)->where('reference_no', $d['reference_no'])->where('old_declared_month', $d['old_declared_month'])
+            ->where('is_approved', 0)->where('report', 'EBIR')->value('id');
+        if ($exists) return response()->json(['message' => 'This document is already undeclared.'], 422);
+ 
         $now = now();
         $id = DB::table($t)->insertGetId($this->vsOnly($t, [
             'report'                => 'EBIR',
@@ -5334,18 +5343,20 @@ class ReportController extends SalesController
             'is_approved'           => 0,
             'created_at'            => $now,
             'updated_at'            => $now,
-        ]));
+        ]) + $this->vsAudit(['undeclared_by' => (int) $request->user()->id]));
         return response()->json(['id' => $id]);
     }
 
     public function vatClientsUndo(Request $request)
     {
+        $this->vsDaCannot($request);
         $d = $request->validate([
             'reference_no'       => ['required', 'string', 'max:100'],
             'old_declared_month' => ['required', 'date_format:Y-m'],
         ]);
+        // only the one still waiting — approved rows are the history, never deleted
         $n = DB::table($this->vsUndeclaredTable())->where('reference_no', $d['reference_no'])
-            ->where('old_declared_month', $d['old_declared_month'])->delete();
+            ->where('old_declared_month', $d['old_declared_month'])->where('is_approved', 0)->delete();
         return response()->json(['deleted' => $n]);
     }
 
@@ -5357,6 +5368,7 @@ class ReportController extends SalesController
 
     public function vatClientsApprove(Request $request)
     {
+        $this->vsDaCannot($request);
         $d = $request->validate([
             'client_id' => ['required', 'integer', 'min:1'],
             'from'      => ['required', 'date_format:Y-m'],
@@ -5366,15 +5378,17 @@ class ReportController extends SalesController
         $list = DB::table($t)->where('client_id', (int) $d['client_id'])->whereBetween('old_declared_month', [$d['from'], $d['to']])
             ->where('is_approved', 0)->where('report', 'EBIR')->orderBy('id')->get();
         if ($list->isEmpty()) return response()->json(['message' => 'No adjustment in this transaction'], 422);
-
+ 
         $ticket = $this->vsTable(['t_request_ticket']);
         $tStatus = $ticket ? $this->vsPick($ticket, ['is_status', 'status']) : null;
         $history = $this->vsTable(['t_history', 't_ticket_history', 'tbl2_history']);
         $hData = $history ? $this->vsPick($history, ['table_data', 'data']) : null;
         $hRef = $history ? $this->vsPick($history, ['reference_no', 'reference']) : null;
         $now = now();
+        $me = (int) $request->user()->id;
+        $batch = 'APV' . $now->format('ymdHis') . random_int(100, 999);
         $remarks = 'Undeclared from VAT Summary';
-
+ 
         // the declared months on the invoice and its lines; a VT / IT month only changes when it was set
         $moveSql = function (string $table, string $refCol): string {
             $set = ['declared_month = ?'];
@@ -5391,8 +5405,8 @@ class ReportController extends SalesController
             $b[] = $row->reference_no;
             return $b;
         };
-
-        DB::transaction(function () use ($list, $t, $ticket, $tStatus, $history, $hData, $hRef, $now, $remarks, $moveSql, $moveBind) {
+ 
+        DB::transaction(function () use ($list, $t, $ticket, $tStatus, $history, $hData, $hRef, $now, $me, $batch, $remarks, $moveSql, $moveBind) {
             foreach ($list as $row) {
                 $ref = $row->reference_no;
                 // a ticket + a copy of the invoice before the change (old tbl2_request_ticket / tbl2_history)
@@ -5419,10 +5433,11 @@ class ReportController extends SalesController
                              ['t_purchase_expense_master', 'invoice_no'], ['t_purchase_expense_detail', 'invoice_no']] as [$table, $col]) {
                     DB::update($moveSql($table, $col), $moveBind($table, $row));
                 }
-                DB::table($t)->where('id', $row->id)->update($this->vsOnly($t, ['is_approved' => 1, 'updated_at' => $now]));
+                DB::table($t)->where('id', $row->id)->update($this->vsOnly($t, ['is_approved' => 1, 'updated_at' => $now])
+                    + $this->vsAudit(['approved_by' => $me, 'approved_at' => $now, 'approval_no' => $batch]));
             }
         });
-        return response()->json(['approved' => $list->count()]);
+        return response()->json(['approved' => $list->count(), 'approval_no' => $batch]);
     }
 
     /* ---------------- print: undeclared list + client info ---------------- */
@@ -5444,29 +5459,34 @@ class ReportController extends SalesController
         $acName = $this->vsPick('m_charts_of_account', ['account_name', 'name']) ?? 'account_name';
         $acBy = $this->vsPick('m_charts_of_account', ['added_by']);
         $nonVat = fn (string $t) => $this->vsPick($t, ['non_vat']) ? 'A.non_vat' : '0';
+        // one row per waiting document (DISTINCT: a document undeclared twice prints once)
+        $waiting = "(SELECT DISTINCT reference_no FROM {$ut}
+                     WHERE client_id = ? AND old_declared_month BETWEEN ? AND ? AND is_approved = 0 AND report = 'EBIR') B";
         $common = fn (string $detail) => "
             LEFT JOIN m_vendor_customer C ON C.id = A." . ($detail === 't_sales_invoice_detail' ? 'customer_id' : 'vendor_id') . "
             LEFT JOIN m_charts_of_account D ON D.account_code = A.account_code" . ($acBy ? ' AND D.added_by = A.added_by' : '') . "
             INNER JOIN m_user_client E ON E.id = A.added_by
             INNER JOIN m_client_account F ON F.id = E.{$ca}
-            WHERE B.client_id = ? AND B.old_declared_month BETWEEN ? AND ?";
+            WHERE 1 = 1";
         $head = "A.id, " . ($vBr ? "C.{$vBr}" : "''") . " AS branch_code, F.branch_code AS branch_code2,
                  DATE_FORMAT(A.transaction_date, '%d-%b-%y') AS po_date, A.invoice_no, A.declared_month, " . ($vTin ? "C.{$vTin}" : "''") . " AS tin,
                  C.{$v} AS vendor_name, COALESCE(A.document_no, '') AS document_no, A.account_code, D.{$acName} AS account_name";
+        $bind = [(int) $d['client_id'], $d['from'], $d['to']];
         if ($d['type'] === 'sales') {
             $sql = "SELECT {$head}, A.amount AS total, A.currency, A.ex_rate, A.created_at AS date_added, A.amount * A.ex_rate AS total2,
                            A.net_of_vat * A.ex_rate AS net_of_vat, A.input_vat * A.ex_rate AS input_vat, A.vat_exempt * A.ex_rate AS vat_exempt,
                            A.zero_rated * A.ex_rate AS zero_rated, {$nonVat('t_sales_invoice_detail')} * A.ex_rate AS non_vat
-                    FROM {$ut} B LEFT JOIN t_sales_invoice_detail A ON A.invoice_no = B.reference_no {$common('t_sales_invoice_detail')}{$this->vsSalesPosted('A')}";
-            $bind = [(int) $d['client_id'], $d['from'], $d['to']];
+                    FROM {$waiting} INNER JOIN t_sales_invoice_detail A ON A.invoice_no = B.reference_no {$common('t_sales_invoice_detail')}{$this->vsSalesPosted('A')}
+                    ORDER BY A.transaction_date, A.invoice_no, A.id";
         } else {
             [$peJoin, $peType] = $this->vsPeType();
             $total = $this->vsPeTotal();
             $sql = "SELECT {$head}, {$total} AS total, 'PHP' AS currency, 1 AS ex_rate, A.created_at AS date_added, {$total} AS total2,
                            A.net_of_vat, A.input_vat, A.vat_exempt, A.zero_rated, {$nonVat('t_purchase_expense_detail')} AS non_vat
-                    FROM {$ut} B LEFT JOIN t_purchase_expense_detail A ON A.invoice_no = B.reference_no {$peJoin} {$common('t_purchase_expense_detail')}
-                      AND {$peType} = ?";
-            $bind = [(int) $d['client_id'], $d['from'], $d['to'], $d['type'] === 'purchases' ? 'Purchases' : 'Expenses'];
+                    FROM {$waiting} INNER JOIN t_purchase_expense_detail A ON A.invoice_no = B.reference_no {$peJoin} {$common('t_purchase_expense_detail')}
+                      AND {$peType} = ?
+                    ORDER BY A.transaction_date, A.invoice_no, A.id";
+            $bind[] = $d['type'] === 'purchases' ? 'Purchases' : 'Expenses';
         }
         $rows = DB::select($sql, $bind);
         return response()->json(['client' => $this->vsClientInfo($d['client_num']), 'rows' => $rows]);
@@ -5566,6 +5586,7 @@ class ReportController extends SalesController
         ]);
         $statusId = (int) ($d['status_id'] ?? 0);
         $daId = (int) ($d['da_id'] ?? 0);
+        if ($mine = $this->reportDaOnly($request)) $daId = $mine;
         $ca = $this->vsUserCa();
         $sl = $this->vsStatusLabel();
         $active = $this->vsPick('m_client', ['active', 'is_active']);
@@ -5952,6 +5973,7 @@ class ReportController extends SalesController
         ]);
         $statusId = (int) ($d['status_id'] ?? 0);
         $daId = (int) ($d['da_id'] ?? 0);
+        if ($mine = $this->reportDaOnly($request)) $daId = $mine;
         $ca = $this->vsUserCa();
         $sl = $this->vsStatusLabel();
         $active = $this->vsPick('m_client', ['active', 'is_active']);
@@ -6084,7 +6106,13 @@ class ReportController extends SalesController
         $d = $request->validate(['from' => ['required', 'date_format:Y-m'], 'to' => ['required', 'date_format:Y-m']]);
         $ca = $this->vsUserCa();
         $active = $this->vsPick('m_client', ['active', 'is_active']);
-        // every active client (old: no status / analyst filter here)
+        $mine = $this->reportDaOnly($request);
+ 
+        $where = [];
+        $bind = [];
+        if ($active) $where[] = "A.{$active} = 1";
+        if ($mine) { $where[] = 'B.assigned_daid = ?'; $bind[] = $mine; }   // data analyst → his clients only
+ 
         $clients = DB::select("
             SELECT A.client_num, MIN(A.id) AS client_id, MIN(A.last_name) AS sort_name,
                    MAX(TRIM(CONCAT_WS(' ', A.last_name, A.first_name, A.middle_name))) AS client_name,
@@ -6092,12 +6120,19 @@ class ReportController extends SalesController
             FROM m_client A
             INNER JOIN m_client_account B ON B.client_num = A.client_num
             INNER JOIN m_user_client C ON C.{$ca} = B.id
-            " . ($active ? "WHERE A.{$active} = 1" : '') . '
+            " . ($where ? 'WHERE ' . implode(' AND ', $where) : '') . '
             GROUP BY A.client_num
-            ORDER BY sort_name, A.client_num');
-
-        $by = $this->ewtByUser(null, $d['from'], $d['to']);
-
+            ORDER BY sort_name, A.client_num', $bind);
+ 
+        // a DA only needs his own logins' amounts; everyone else → all (null)
+        $users = null;
+        if ($mine) {
+            $users = [];
+            foreach ($clients as $c) foreach ($this->vsIds($c->user_ids) as $u) $users[$u] = true;
+            $users = array_keys($users);
+        }
+        $by = $this->ewtByUser($users, $d['from'], $d['to']);
+ 
         $out = [];
         foreach ($clients as $c) {
             $tw = $amt = 0.0;
@@ -6457,7 +6492,7 @@ class ReportController extends SalesController
         });
         return response()->json(['ok' => true]);
     }
-        public function vatClientsPending(Request $request)
+   public function vatClientsPending(Request $request)
     {
         $d = $request->validate([
             'client_id' => ['required', 'integer', 'min:1'],
@@ -6469,40 +6504,49 @@ class ReportController extends SalesController
             ->whereBetween('old_declared_month', [$d['from'], $d['to']])
             ->where('is_approved', 0)->where('report', 'EBIR')
             ->orderBy('old_declared_month')->orderBy('id')->get();
-        if ($list->isEmpty()) return response()->json(['rows' => [], 'total' => 0]);
+        if ($list->isEmpty()) return response()->json(['rows' => [], 'total' => 0, 'vat' => 0]);
  
+        $rows = $this->vsUndeclaredRows($list);
+        return response()->json([
+            'rows'  => $rows,
+            'total' => round(array_sum(array_column($rows, 'amount')), 2),
+            'vat'   => round(array_sum(array_column($rows, 'vat')), 2),
+        ]);
+    }
+    private function vsUndeclaredRows($list): array
+    {
         $refs = $list->pluck('reference_no')->unique()->values()->all();
         $v = $this->vsVendor();
         $info = [];
  
-        // Sales
         foreach (DB::table('t_sales_invoice_master as M')->leftJoin('m_vendor_customer as C', 'C.id', '=', 'M.customer_id')
             ->whereIn('M.invoice_no', $refs)
-            ->get(['M.invoice_no AS ref', 'M.document_no', 'M.transaction_date AS date', "C.{$v} AS name", 'M.total', 'M.sub_total']) as $r) {
-            $info[$r->ref] = ['module' => 'Sales', 'document_no' => $r->document_no, 'date' => $r->date, 'name' => $r->name,
-                'amount' => (float) ($r->total ?? $r->sub_total ?? 0)];
+            ->get(['M.invoice_no AS ref', 'M.document_no', 'M.transaction_date AS date', "C.{$v} AS name"]) as $r) {
+            $info[$r->ref] = ['module' => 'Sales', 'document_no' => $r->document_no, 'date' => $r->date, 'name' => $r->name];
         }
-        // Purchases / Expenses
-        $peTotal = $this->vsPick('t_purchase_expense_master', ['grand_total', 'total', 'sub_total']) ?? 'total';
         foreach (DB::table('t_purchase_expense_master as M')->leftJoin('m_vendor_customer as C', 'C.id', '=', 'M.vendor_id')
             ->whereIn('M.invoice_no', $refs)
-            ->get(['M.invoice_no AS ref', 'M.document_no', 'M.transaction_date AS date', "C.{$v} AS name", "M.{$peTotal} AS amount", 'M.trans_type']) as $r) {
+            ->get(['M.invoice_no AS ref', 'M.document_no', 'M.transaction_date AS date', "C.{$v} AS name", 'M.trans_type']) as $r) {
             $info[$r->ref] ??= ['module' => ucfirst(strtolower((string) $r->trans_type)) ?: 'Purchases', 'document_no' => $r->document_no,
-                'date' => $r->date, 'name' => $r->name, 'amount' => (float) $r->amount];
+                'date' => $r->date, 'name' => $r->name];
         }
-        // Receive Inventory (the E-BIR list uses the GRN's ref_data / grn_no as the reference)
-        if (Schema::hasTable('t_grn_master')) {
-            $grnTotal = $this->vsPick('t_grn_master', ['grand_total', 'total', 'sub_total']);
+        if ($this->vsCols('t_grn_master')) {
             foreach (DB::table('t_grn_master as M')->leftJoin('m_vendor_customer as C', 'C.id', '=', 'M.vendor_id')
                 ->where(fn ($q) => $q->whereIn('M.grn_no', $refs)->orWhereIn('M.ref_data', $refs))
-                ->get(['M.grn_no', 'M.ref_data', 'M.grn_date AS date', "C.{$v} AS name", DB::raw(($grnTotal ? "M.{$grnTotal}" : '0') . ' AS amount')]) as $r) {
-                $row = ['module' => 'Receive Inventory', 'document_no' => $r->ref_data, 'date' => $r->date, 'name' => $r->name, 'amount' => (float) $r->amount];
+                ->get(['M.grn_no', 'M.ref_data', 'M.grn_date AS date', "C.{$v} AS name"]) as $r) {
+                $row = ['module' => 'Receive Inventory', 'document_no' => $r->ref_data, 'date' => $r->date, 'name' => $r->name];
                 foreach (array_filter([$r->grn_no, $r->ref_data]) as $k) $info[$k] ??= $row;
             }
         }
  
-        $rows = $list->map(function ($u) use ($info) {
-            $i = $info[$u->reference_no] ?? ['module' => '—', 'document_no' => '', 'date' => null, 'name' => '', 'amount' => 0];
+        $money = $this->vsPendingNet($refs);
+        $ids = [];
+        foreach ($list as $u) { $ids[] = $u->undeclared_by ?? 0; $ids[] = $u->approved_by ?? 0; }
+        $who = $this->vsStaffNames($ids);
+        $m7 = fn ($x) => $x ? substr((string) $x, 0, 7) : '';
+ 
+        return $list->map(function ($u) use ($info, $money, $who, $m7) {
+            $i = $info[$u->reference_no] ?? ['module' => '—', 'document_no' => '', 'date' => null, 'name' => ''];
             return [
                 'id'                    => (int) $u->id,
                 'reference'             => $u->reference_no,
@@ -6510,14 +6554,152 @@ class ReportController extends SalesController
                 'transaction_date'      => $i['date'] ? substr((string) $i['date'], 0, 10) : null,
                 'fullname'              => (string) ($i['name'] ?? ''),
                 'module'                => $i['module'],
-                'amount'                => round((float) $i['amount'], 2),
-                'old_declared_month'    => substr((string) $u->old_declared_month, 0, 7),
-                'new_declared_month'    => substr((string) $u->new_declared_month, 0, 7),
-                'new_wh_declared_month' => $u->new_wh_declared_month ? substr((string) $u->new_wh_declared_month, 0, 7) : '',
-                'undeclared_at'         => $u->created_at ? substr((string) $u->created_at, 0, 16) : null,
+                'amount'                => round($money[$u->reference_no]['net'] ?? 0, 2),   // NET (no VAT)
+                'vat'                   => round($money[$u->reference_no]['vat'] ?? 0, 2),
+                'old_declared_month'    => $m7($u->old_declared_month),
+                'new_declared_month'    => $m7($u->new_declared_month),
+                'new_wh_declared_month' => $m7($u->new_wh_declared_month),
+                'undeclared_at'         => $this->vsLocalTime($u->created_at),
+                'undeclared_by'         => $who[(int) ($u->undeclared_by ?? 0)] ?? '',
+                'approved_at'           => $this->vsLocalTime(($u->approved_at ?? null) ?: ((int) $u->is_approved === 1 ? $u->updated_at : null)),
+                'approved_by'           => $who[(int) ($u->approved_by ?? 0)] ?? '',
             ];
-        })->values();
- 
-        return response()->json(['rows' => $rows, 'total' => round($rows->sum('amount'), 2)]);
+        })->values()->all();
     }
+    public function vatClientsHistory(Request $request)
+    {
+        $d = $request->validate([
+            'client_id' => ['required', 'integer', 'min:1'],
+            'from'      => ['required', 'date_format:Y-m'],
+            'to'        => ['required', 'date_format:Y-m'],
+        ]);
+        $ut = $this->vsUndeclaredTable();
+        $hasNo = Schema::hasColumn($ut, 'approval_no');
+        $hasAt = Schema::hasColumn($ut, 'approved_at');
+        $list = DB::table($ut)->where('client_id', (int) $d['client_id'])->where('is_approved', 1)->where('report', 'EBIR')
+            ->where(fn ($q) => $q->whereBetween('old_declared_month', [$d['from'], $d['to']])
+                ->orWhereBetween('new_declared_month', [$d['from'], $d['to']]))
+            ->orderByDesc($hasAt ? DB::raw('COALESCE(approved_at, updated_at)') : 'updated_at')->orderBy('id')
+            ->get();
+        if ($list->isEmpty()) return response()->json(['groups' => []]);
+ 
+        $rows = $this->vsUndeclaredRows($list);
+        $groups = [];
+        foreach ($list->values() as $i => $u) {
+            $r = $rows[$i];
+            // one approval = same approval_no; older rows (before the migration) = same minute
+            $key = ($hasNo && !empty($u->approval_no)) ? $u->approval_no : 'T' . ($r['approved_at'] ?? '?');
+            $groups[$key] ??= ['key' => $key, 'approval_no' => $hasNo ? ($u->approval_no ?: null) : null,
+                'approved_at' => $r['approved_at'], 'approved_by' => $r['approved_by'], 'count' => 0, 'net' => 0.0, 'vat' => 0.0, 'rows' => []];
+            $groups[$key]['count']++;
+            $groups[$key]['net'] += $r['amount'];
+            $groups[$key]['vat'] += $r['vat'];
+            $groups[$key]['rows'][] = $r;
+        }
+        foreach ($groups as &$g) { $g['net'] = round($g['net'], 2); $g['vat'] = round($g['vat'], 2); }
+        return response()->json(['groups' => array_values($groups)]);
+    }
+    private function reportDaOnly(Request $request): int
+    {
+        static $cache = [];
+        $u = $request->user();
+        if (!$u) return 0;
+        $key = get_class($u) . ':' . $u->id;
+        if (array_key_exists($key, $cache)) return $cache[$key];
+ 
+        // the employee behind this login: employee_id, else m_user_staff.comid = m_employee.com_id
+        $empId = (int) ($u->employee_id ?? 0);
+        if ($empId <= 0 && !empty($u->comid)) {
+            $empId = (int) DB::table('m_employee')->where('com_id', $u->comid)->value('id');
+        }
+        if ($empId <= 0) return $cache[$key] = 0;
+ 
+        $type = (int) ($u->user_type_id ?? 0);
+        $designation = (int) DB::table('m_employee')->where('id', $empId)->value('designation_id');
+        $isDa = $type === 3 || (!$type && $designation === 3);
+ 
+        return $cache[$key] = $isDa ? $empId : 0;
+    }
+    private function vsDaCannot(Request $request): void
+    {
+        abort_if($this->reportDaOnly($request) > 0, 403, 'Data analysts can view only — undeclare, undo and approve are not allowed.');
+    }
+
+    private function vsPendingNet(array $refs): array
+    {
+        $refs = array_values(array_unique(array_filter(array_map('strval', $refs), 'strlen')));
+        if (!$refs) return [];
+        $q = implode(',', array_fill(0, count($refs), '?'));
+        $net = 'COALESCE(A.net_of_vat, 0) + COALESCE(A.vat_exempt, 0) + COALESCE(A.zero_rated, 0)';
+        $out = [];
+        $put = function ($ref, $n, $v) use (&$out) {
+            $out[$ref] ??= ['net' => 0.0, 'vat' => 0.0];
+            $out[$ref]['net'] += (float) $n;
+            $out[$ref]['vat'] += (float) $v;
+        };
+ 
+        // Sales
+        $rate = $this->vsPick('t_sales_invoice_detail', ['ex_rate']) ? 'COALESCE(NULLIF(A.ex_rate, 0), 1)' : '1';
+        foreach (DB::select("
+            SELECT A.invoice_no AS ref, SUM(({$net}) * {$rate}) AS n, SUM(COALESCE(A.input_vat, 0) * {$rate}) AS v
+            FROM t_sales_invoice_detail A
+            WHERE A.invoice_no IN ({$q}){$this->vsSalesPosted('A')}
+            GROUP BY A.invoice_no", $refs) as $r) $put($r->ref, $r->n, $r->v);
+ 
+        // Purchases / Expenses (AP invoices)
+        $posted = $this->vsPick('t_purchase_expense_detail', ['record_status']) ? " AND A.record_status = 'posted'" : '';
+        foreach (DB::select("
+            SELECT A.invoice_no AS ref, SUM({$net}) AS n, SUM(COALESCE(A.input_vat, 0)) AS v
+            FROM t_purchase_expense_detail A
+            WHERE A.invoice_no IN ({$q}){$posted}
+            GROUP BY A.invoice_no", $refs) as $r) $put($r->ref, $r->n, $r->v);
+ 
+        // Receive Inventory
+        if ($this->vsCols('t_grn_detail') && $this->vsCols('t_grn_master')) {
+            foreach (DB::select("
+                SELECT M.grn_no, M.ref_data, SUM({$net}) AS n, SUM(COALESCE(A.input_vat, 0)) AS v
+                FROM t_grn_detail A INNER JOIN t_grn_master M ON M.grn_no = A.grn_no
+                WHERE M.grn_no IN ({$q}) OR M.ref_data IN ({$q})
+                GROUP BY M.grn_no, M.ref_data", [...$refs, ...$refs]) as $r) {
+                foreach (array_unique(array_filter([$r->grn_no, $r->ref_data])) as $k) {
+                    if (in_array((string) $k, $refs, true) && !isset($out[$k])) $put($k, $r->n, $r->v);
+                }
+            }
+        }
+        return $out;
+    }
+    private function vsStaffNames(array $ids): array
+    {
+        $ids = array_values(array_unique(array_filter(array_map('intval', $ids))));
+        if (!$ids || !$this->vsCols('m_user_staff')) return [];
+        $user = $this->vsPick('m_user_staff', ['username', 'user_name']);
+        $rows = DB::table('m_user_staff as U')
+            ->leftJoin('m_employee as E', 'E.com_id', '=', 'U.comid')
+            ->whereIn('U.id', $ids)
+            ->get(['U.id', DB::raw("NULLIF(TRIM(CONCAT_WS(' ', E.last_name, E.first_name)), '') AS name"),
+                DB::raw(($user ? "U.{$user}" : "''") . ' AS username')]);
+        $out = [];
+        foreach ($rows as $r) $out[(int) $r->id] ??= $r->name ?: ($r->username ?: "User #{$r->id}");
+        return $out;
+    }
+    /** saves the new who / when columns — checked live, not the 1-day vsCols cache */
+    private function vsAudit(array $values): array
+    {
+        static $has = null;
+        $t = $this->vsUndeclaredTable();
+        $has ??= array_flip(array_filter(['undeclared_by', 'approved_by', 'approved_at', 'approval_no'], fn ($c) => Schema::hasColumn($t, $c)));
+        return array_intersect_key($values, $has);
+    }
+
+    /** Laravel saves now() in UTC → show Philippine time */
+    private function vsLocalTime($ts): ?string
+    {
+        if (!$ts) return null;
+        try {
+            return Carbon::parse((string) $ts, config('app.timezone') ?: 'UTC')->setTimezone('Asia/Manila')->format('Y-m-d H:i');
+        } catch (\Throwable $e) {
+            return substr((string) $ts, 0, 16);
+        }
+    }
+
 }
