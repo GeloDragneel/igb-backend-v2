@@ -5373,12 +5373,17 @@ class ReportController extends SalesController
             'client_id' => ['required', 'integer', 'min:1'],
             'from'      => ['required', 'date_format:Y-m'],
             'to'        => ['required', 'date_format:Y-m'],
+            'user_ids'  => ['nullable', 'string'],      // for the before / after snapshot
+            'caid'      => ['nullable', 'integer'],
         ]);
         $t = $this->vsUndeclaredTable();
         $list = DB::table($t)->where('client_id', (int) $d['client_id'])->whereBetween('old_declared_month', [$d['from'], $d['to']])
             ->where('is_approved', 0)->where('report', 'EBIR')->orderBy('id')->get();
         if ($list->isEmpty()) return response()->json(['message' => 'No adjustment in this transaction'], 422);
- 
+
+        // E-BIR table BEFORE (Original) and AFTER (Adjusted) this approval → History shows old vs new
+        $snap = $this->vsApprovalSnapshot($request, $d, $list);
+
         $ticket = $this->vsTable(['t_request_ticket']);
         $tStatus = $ticket ? $this->vsPick($ticket, ['is_status', 'status']) : null;
         $history = $this->vsTable(['t_history', 't_ticket_history', 'tbl2_history']);
@@ -5388,7 +5393,7 @@ class ReportController extends SalesController
         $me = (int) $request->user()->id;
         $batch = 'APV' . $now->format('ymdHis') . random_int(100, 999);
         $remarks = 'Undeclared from VAT Summary';
- 
+
         // the declared months on the invoice and its lines; a VT / IT month only changes when it was set
         $moveSql = function (string $table, string $refCol): string {
             $set = ['declared_month = ?'];
@@ -5405,8 +5410,8 @@ class ReportController extends SalesController
             $b[] = $row->reference_no;
             return $b;
         };
- 
-        DB::transaction(function () use ($list, $t, $ticket, $tStatus, $history, $hData, $hRef, $now, $me, $batch, $remarks, $moveSql, $moveBind) {
+
+        DB::transaction(function () use ($list, $t, $ticket, $tStatus, $history, $hData, $hRef, $now, $me, $batch, $remarks, $moveSql, $moveBind, $snap, $d) {
             foreach ($list as $row) {
                 $ref = $row->reference_no;
                 // a ticket + a copy of the invoice before the change (old tbl2_request_ticket / tbl2_history)
@@ -5436,6 +5441,13 @@ class ReportController extends SalesController
                 DB::table($t)->where('id', $row->id)->update($this->vsOnly($t, ['is_approved' => 1, 'updated_at' => $now])
                     + $this->vsAudit(['approved_by' => $me, 'approved_at' => $now, 'approval_no' => $batch]));
             }
+            if ($snap) {
+                DB::table('t_undeclared_approval')->insert([
+                    'approval_no' => $batch, 'client_id' => (int) $d['client_id'], 'period_from' => $d['from'], 'period_to' => $snap['to'],
+                    'old_data' => json_encode($snap['old']), 'new_data' => json_encode($snap['new']),
+                    'approved_by' => $me, 'created_at' => $now, 'updated_at' => $now,
+                ]);
+            }
         });
         return response()->json(['approved' => $list->count(), 'approval_no' => $batch]);
     }
@@ -5450,6 +5462,7 @@ class ReportController extends SalesController
             'from'       => ['required', 'date_format:Y-m'],
             'to'         => ['required', 'date_format:Y-m'],
             'type'       => ['required', 'in:sales,purchases,expenses'],
+            'approval_no' => ['nullable', 'string', 'max:30'],   // History → print the documents of one approval
         ]);
         $ut = $this->vsUndeclaredTable();
         $ca = $this->vsUserCa();
@@ -5460,7 +5473,11 @@ class ReportController extends SalesController
         $acBy = $this->vsPick('m_charts_of_account', ['added_by']);
         $nonVat = fn (string $t) => $this->vsPick($t, ['non_vat']) ? 'A.non_vat' : '0';
         // one row per waiting document (DISTINCT: a document undeclared twice prints once)
-        $waiting = "(SELECT DISTINCT reference_no FROM {$ut}
+        // or, with approval_no: the documents of that approval (already approved)
+        $byApproval = !empty($d['approval_no']) && Schema::hasColumn($ut, 'approval_no');
+        $waiting = $byApproval
+            ? "(SELECT DISTINCT reference_no FROM {$ut} WHERE client_id = ? AND approval_no = ? AND is_approved = 1 AND report = 'EBIR') B"
+            : "(SELECT DISTINCT reference_no FROM {$ut}
                      WHERE client_id = ? AND old_declared_month BETWEEN ? AND ? AND is_approved = 0 AND report = 'EBIR') B";
         $common = fn (string $detail) => "
             LEFT JOIN m_vendor_customer C ON C.id = A." . ($detail === 't_sales_invoice_detail' ? 'customer_id' : 'vendor_id') . "
@@ -5471,7 +5488,7 @@ class ReportController extends SalesController
         $head = "A.id, " . ($vBr ? "C.{$vBr}" : "''") . " AS branch_code, F.branch_code AS branch_code2,
                  DATE_FORMAT(A.transaction_date, '%d-%b-%y') AS po_date, A.invoice_no, A.declared_month, " . ($vTin ? "C.{$vTin}" : "''") . " AS tin,
                  C.{$v} AS vendor_name, COALESCE(A.document_no, '') AS document_no, A.account_code, D.{$acName} AS account_name";
-        $bind = [(int) $d['client_id'], $d['from'], $d['to']];
+        $bind = $byApproval ? [(int) $d['client_id'], $d['approval_no']] : [(int) $d['client_id'], $d['from'], $d['to']];
         if ($d['type'] === 'sales') {
             $sql = "SELECT {$head}, A.amount AS total, A.currency, A.ex_rate, A.created_at AS date_added, A.amount * A.ex_rate AS total2,
                            A.net_of_vat * A.ex_rate AS net_of_vat, A.input_vat * A.ex_rate AS input_vat, A.vat_exempt * A.ex_rate AS vat_exempt,
@@ -6582,7 +6599,7 @@ class ReportController extends SalesController
             ->orderByDesc($hasAt ? DB::raw('COALESCE(approved_at, updated_at)') : 'updated_at')->orderBy('id')
             ->get();
         if ($list->isEmpty()) return response()->json(['groups' => []]);
- 
+
         $rows = $this->vsUndeclaredRows($list);
         $groups = [];
         foreach ($list->values() as $i => $u) {
@@ -6597,6 +6614,19 @@ class ReportController extends SalesController
             $groups[$key]['rows'][] = $r;
         }
         foreach ($groups as &$g) { $g['net'] = round($g['net'], 2); $g['vat'] = round($g['vat'], 2); }
+        unset($g);
+
+        // before / after E-BIR table saved at approval time
+        $nos = array_values(array_filter(array_column($groups, 'approval_no')));
+        $snaps = $nos && Schema::hasTable('t_undeclared_approval')
+            ? DB::table('t_undeclared_approval')->whereIn('approval_no', $nos)->get()->keyBy('approval_no') : collect();
+        foreach ($groups as $k => $g) {
+            $s = $g['approval_no'] ? $snaps->get($g['approval_no']) : null;
+            $groups[$k]['snapshot'] = $s ? [
+                'from' => $s->period_from, 'to' => $s->period_to,
+                'old'  => json_decode($s->old_data, true), 'new' => json_decode($s->new_data, true),
+            ] : null;
+        }
         return response()->json(['groups' => array_values($groups)]);
     }
     private function reportDaOnly(Request $request): int
@@ -6701,5 +6731,30 @@ class ReportController extends SalesController
             return substr((string) $ts, 0, 16);
         }
     }
-
+    private function vsApprovalSnapshot(Request $request, array $d, $list): ?array
+    {
+        if (empty($d['user_ids']) || !Schema::hasTable('t_undeclared_approval')) return null;
+        // reach the month the documents move to (e.g. Oct → Nov), so After shows where they landed
+        $to = $d['to'];
+        foreach ($list as $u) {
+            $m = substr((string) $u->new_declared_month, 0, 7);
+            if (preg_match('/^\d{4}-\d{2}$/', $m) && $m > $to) $to = $m;
+        }
+        try {
+            $take = function (string $mode) use ($request, $d, $to) {
+                $sub = Request::create('/', 'GET', array_filter([
+                    'user_ids' => $d['user_ids'], 'client_id' => $d['client_id'], 'caid' => $d['caid'] ?? null,
+                    'from' => $d['from'], 'to' => $to, 'mode' => $mode,
+                ], fn ($v) => $v !== null && $v !== ''));
+                $sub->setUserResolver($request->getUserResolver());
+                $data = $this->vatClientsEbir($sub)->getData(true);
+                unset($data['locked_months']);
+                return $data;
+            };
+            return ['old' => $take('initial'), 'new' => $take('adjusted'), 'to' => $to];
+        } catch (\Throwable $e) {
+            report($e);          // never block the approval because of the snapshot
+            return null;
+        }
+    }
 }
