@@ -753,9 +753,71 @@ class IMSDashboardController extends MonitoringController
         return compact('byCa', 'daily');
     }
 
-    /** compliance deadlines of these accounts (m_client_account.compliance_ids → m_compliance) */
-    private function roleDeadlines($accounts): array
+    /* ---------------- BIR deadlines (RETURN DEADLINE schedule) ----------------
+       code             rule                                                     due
+       1601-C / 0619-E  every 10th day after the end of each month             10th of the next month
+       1601-EQ (+ DAT)  last day of the month after the end of each quarter   Apr 30 · Jul 31 · Oct 31 · Jan 31
+       2550-M           voluntary                                              –
+       2550-Q / SLSP / 2551-Q  every 25th day after the end of each month     25th of the next month
+       1701-Q           Q1 May 15 · Q2 Aug 15 · Q3 Nov 15
+       1702-Q           Q1 May 29 · Q2 Aug 29 · Q3 Nov 29
+       1701 / 1702      Apr 15 (annual)
+       1604-C           Jan 31 (annual)          1604-E   Mar 01 (annual)                                       */
+    private const BIR_RULES = [
+        // [pattern on the compliance name, rule text, kind]
+        ['/0619\s*-?\s*E/i', 'Every 10th day after the end of each month', 'm10'],
+        ['/1601\s*-?\s*C/i', 'Every 10th day after the end of each month', 'm10'],
+        ['/1601\s*-?\s*EQ|EXPANDED.*DAT|DAT.*EXPANDED/i', 'Every last day of the month after the end of each quarter', 'qlast'],
+        ['/2550\s*-?\s*M/i', 'Voluntary', 'none'],
+        ['/2550\s*-?\s*Q/i', 'Every 25th day after the end of each month', 'm25'],
+        ['/\bSLSP\b|SUMMARY LIST OF SALES/i', 'Every 25th day after the end of each month', 'm25'],
+        ['/2551\s*-?\s*Q/i', 'Every 25th day after the end of each month', 'm25'],
+        ['/1701\s*-?\s*Q/i', 'Q1 May 15 · Q2 Aug 15 · Q3 Nov 15', 'q1701'],
+        ['/1702\s*-?\s*Q/i', 'Q1 May 29 · Q2 Aug 29 · Q3 Nov 29', 'q1702'],
+        ['/1701(?!\s*-?\s*Q)/i', 'April 15 (annual)', 'a0415'],
+        ['/1702(?!\s*-?\s*Q)/i', 'April 15 (annual)', 'a0415'],
+        ['/1604\s*-?\s*C/i', 'January 31 (annual)', 'a0131'],
+        ['/1604\s*-?\s*E/i', 'March 01 (annual)', 'a0301'],
+    ];
+
+    /**
+     * the next due date of a return on or after the 1st of $month: ['due' => Y-m-d, 'covers' => text, 'rule' => text] | null
+     */
+    private function birDue(string $name, string $month): ?array
     {
+        foreach (self::BIR_RULES as [$re, $rule, $kind]) {
+            if (!preg_match($re, $name)) continue;
+            if ($kind === 'none') return ['due' => null, 'covers' => '', 'rule' => $rule];
+            $from = new DateTime("{$month}-01");
+            $y = (int) $from->format('Y');
+            $cands = [];                                   // [due date, what it covers]
+            $mon = fn ($yy, $mm) => (new DateTime(sprintf('%04d-%02d-01', $yy, $mm)))->format('F Y');
+            for ($yy = $y - 1; $yy <= $y + 1; $yy++) {
+                for ($mm = 1; $mm <= 12; $mm++) {
+                    $next = (new DateTime(sprintf('%04d-%02d-01', $yy, $mm)))->modify('+1 month');
+                    if ($kind === 'm10') $cands[] = [$next->format('Y-m-10'), $mon($yy, $mm)];
+                    if ($kind === 'm25') $cands[] = [$next->format('Y-m-25'), $mon($yy, $mm)];
+                    if ($kind === 'qlast' && $mm % 3 === 0) $cands[] = [$next->format('Y-m-t'), 'Q' . ($mm / 3) . " {$yy}"];
+                }
+                if ($kind === 'q1701') foreach ([[5, 15, 1], [8, 15, 2], [11, 15, 3]] as [$m, $d, $q]) $cands[] = [sprintf('%04d-%02d-%02d', $yy, $m, $d), "Q{$q} {$yy}"];
+                if ($kind === 'q1702') foreach ([[5, 29, 1], [8, 29, 2], [11, 29, 3]] as [$m, $d, $q]) $cands[] = [sprintf('%04d-%02d-%02d', $yy, $m, $d), "Q{$q} {$yy}"];
+                if ($kind === 'a0415') $cands[] = [sprintf('%04d-04-15', $yy), 'Year ' . ($yy - 1)];
+                if ($kind === 'a0131') $cands[] = [sprintf('%04d-01-31', $yy), 'Year ' . ($yy - 1)];
+                if ($kind === 'a0301') $cands[] = [sprintf('%04d-03-01', $yy), 'Year ' . ($yy - 1)];
+            }
+            usort($cands, fn ($a, $b) => strcmp($a[0], $b[0]));
+            foreach ($cands as [$due, $covers]) {
+                if ($due >= $from->format('Y-m-d')) return ['due' => $due, 'covers' => $covers, 'rule' => $rule];
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /** compliance deadlines of these accounts (m_client_account.compliance_ids → m_compliance) + the BIR due date in that month */
+    private function roleDeadlines($accounts, ?string $month = null): array
+    {
+        $month = $month ?: date('Y-m');
         $table = collect(['m_compliance', 'm_compliances'])->first(fn ($t) => (bool) $this->cols($t));
         if (!$table) return [];
         $name = $this->pick($table, ['name', 'compliance', 'description']);
@@ -767,15 +829,26 @@ class IMSDashboardController extends MonitoringController
         }
         if (!$who || !$name) return [];
         $plain = fn ($v) => trim(preg_replace('/\s+/', ' ', html_entity_decode(strip_tags(str_replace(['</p>', '<br>', '</li>'], ' ', (string) $v)))));
-        return DB::table($table)->whereIn('id', array_keys($who))->orderBy($name)->get()
-            ->map(fn ($c) => [
-                'id' => (int) $c->id,
-                'compliance' => (string) $c->{$name},
-                'deadline' => $deadline ? $plain($c->{$deadline}) : '',
-                'terms' => $terms ? (string) $c->{$terms} : '',
-                'clients' => count($who[$c->id]),
-                'client_list' => implode(', ', array_slice($who[$c->id], 0, 50)),
-            ])->values()->all();
+        $today = date('Y-m-d');
+        return DB::table($table)->whereIn('id', array_keys($who))->get()
+            ->map(function ($c) use ($name, $deadline, $terms, $who, $plain, $month, $today) {
+                $bir = $this->birDue((string) $c->{$name}, $month);
+                $days = $bir && $bir['due'] ? (int) round((strtotime($bir['due']) - strtotime($today)) / 86400) : null;
+                return [
+                    'id' => (int) $c->id,
+                    'compliance' => (string) $c->{$name},
+                    // the RETURN DEADLINE rule when the return is known, else what the compliance record says
+                    'deadline' => $bir['rule'] ?? ($deadline ? $plain($c->{$deadline}) : ''),
+                    'due' => $bir['due'] ?? null,               // Y-m-d of the next filing on/after the 1st of the month
+                    'covers' => $bir['covers'] ?? '',           // the month / quarter / year that filing is for
+                    'days_left' => $days,                       // from today (negative = overdue)
+                    'terms' => $terms ? (string) $c->{$terms} : '',
+                    'clients' => count($who[$c->id]),
+                    'client_list' => implode(', ', array_slice($who[$c->id], 0, 50)),
+                ];
+            })
+            // soonest first; no-date ones (voluntary / unknown) last
+            ->sortBy(fn ($r) => ($r['due'] ?? '9999-12-31') . ' ' . $r['compliance'])->values()->all();
     }
 
     /* GET /ims_dashboard/da?month=YYYY-MM   DATA ANALYST: my assigned clients · scans · sales / purchases / expenses · reverted · deadlines */
@@ -808,7 +881,7 @@ class IMSDashboardController extends MonitoringController
             'month' => $d['month'], 'employee_id' => $this->myEmployeeId($request),
             'scan_labels' => self::SCAN_LABELS,
             'clients' => $rows, 'daily' => $this->dailyList($days),
-            'deadlines' => $this->roleDeadlines($accounts),
+            'deadlines' => $this->roleDeadlines($accounts, $d['month']),
         ]);
     }
 
@@ -866,7 +939,7 @@ class IMSDashboardController extends MonitoringController
             'month' => $d['month'], 'employee_id' => $this->myEmployeeId($request),
             'scan_labels' => self::SCAN_LABELS,
             'clients' => $rows, 'daily' => $this->dailyList($days),
-            'deadlines' => $this->roleDeadlines($accounts),
+            'deadlines' => $this->roleDeadlines($accounts, $d['month']),
         ]);
     }
 }
