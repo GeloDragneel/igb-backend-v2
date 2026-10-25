@@ -129,8 +129,6 @@ trait EsubValidation
 
             if ($p = $this->esNameProblem($nameRaw)) $add($errors, $line, $r, 'Registered name', $p);
             else {
-                $dat = $this->esDatText($nameRaw);
-                if (strlen($dat) > 50) $add($warnings, $line, $r, 'Registered name', 'Registered name is longer than 50 characters (' . strlen($dat) . ').');
                 if (preg_match('/[,ñÑ]|[^\x20-\x7E]/u', $nameRaw)) $fixed['name'] = 'Names: commas removed, Ñ changed to N, accents removed.';
             }
 

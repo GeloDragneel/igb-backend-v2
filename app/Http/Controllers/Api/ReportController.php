@@ -2809,7 +2809,8 @@ class ReportController extends SalesController
                     ->whereRaw('LOWER(m.trans_type) IN (?, ?)', ['purchases', 'expenses'])
                     ->selectRaw('m.declared_month AS mon, m.invoice_no AS ref, m.vendor_id AS pid, COALESCE(x.amount,0) AS php, COALESCE(x.net_of_vat,0) AS net, COALESCE(x.input_vat,0) AS vat, COALESCE(x.vat_exempt,0) AS exempt, COALESCE(x.zero_rated,0) AS zero')
                     ->get();
-                $lines = $grn->concat($ap);
+                // E-Sub: leave out negative lines (returns / debit memos) – not shown, not in the totals or the DAT
+                $lines = $grn->concat($ap)->filter(fn ($x) => min((float) $x->php, (float) $x->net, (float) $x->vat, (float) $x->exempt, (float) $x->zero) >= 0)->values();
                 $party = $this->esParties($lines->pluck('pid'));
                 $blank = ['tin' => '', 'name' => '', 'address' => '', 'city' => '', 'tin_raw' => '', 'name_raw' => ''];
  
@@ -2883,6 +2884,8 @@ class ReportController extends SalesController
                         'php' => round($r->php, 2), 'net' => round($r->net, 2), 'vat' => round($r->vat, 2), 'exempt' => round($r->exempt, 2), 'zero' => round($r->zero, 2),
                         '_tin_raw' => $v['tin_raw'], '_name_raw' => $v['name_raw']];
                 }
+                                // E-Sub: leave out customers whose amounts come out negative (returns / credit memos) – not shown, not in the totals or the DAT
+                $rows = array_values(array_filter($rows, fn ($r) => min($r['php'], $r['net'], $r['vat'], $r['exempt'], $r['zero']) >= 0));
                 $t = fn ($k) => round(array_sum(array_column($rows, $k)), 2);
                 $totals = ['php' => $t('php'), 'net' => $t('net'), 'vat' => $t('vat'), 'exempt' => $t('exempt'), 'zero' => $t('zero')];
  
