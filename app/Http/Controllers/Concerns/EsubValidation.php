@@ -115,10 +115,16 @@ trait EsubValidation
             $tinRaw = (string) ($r['_tin_raw'] ?? $r['tin'] ?? '');
             $nameRaw = (string) ($r['_name_raw'] ?? $r['name'] ?? '');
 
-            // Sales: no TIN checks (customers often have no TIN) – the TIN goes in as digits only
             if ($type !== 'S') {
                 if ($p = $this->esTinProblem($tinRaw, $own)) $add($errors, $line, $r, 'TIN', $p);
                 elseif (preg_match('/[\-\s]/', $tinRaw)) $fixed['tin'] = 'Dashes and spaces were removed from TINs.';
+            } else {
+                // Sales: an empty TIN is allowed (walk-in / customers without TIN),
+                // but a TIN of only zeros (000-000-000, 00000000 …) is not – leave it empty instead
+                $digits = preg_replace('/\D/', '', $tinRaw);
+                if ($digits !== '' && preg_match('/^0+$/', $digits)) {
+                    $add($errors, $line, $r, 'TIN', "TIN is all zeros ({$tinRaw}) – leave the TIN empty if the customer has none.");
+                }
             }
 
             if ($p = $this->esNameProblem($nameRaw)) $add($errors, $line, $r, 'Registered name', $p);
