@@ -69,7 +69,7 @@ class TeamController extends SalesController
     {
         return [
             'employee_id'   => ['nullable', 'integer', 'exists:m_employee,id'],
-            'fullname'      => ['nullable', 'string', 'max:50'],
+            'fullname'      => ['required', 'string', 'max:50'],
             'username'      => ['required', 'string', 'max:50', 'regex:/^[A-Za-z0-9._@-]+$/'],
             'password'      => [$creating ? 'required' : 'nullable', 'string', 'min:4', 'max:50'],
             'is_active'     => ['boolean'],

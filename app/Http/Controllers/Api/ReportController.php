@@ -2836,8 +2836,8 @@ class ReportController extends SalesController
                     ->whereRaw('LOWER(m.trans_type) IN (?, ?)', ['purchases', 'expenses'])
                     ->selectRaw('m.declared_month AS mon, m.invoice_no AS ref, m.vendor_id AS pid, COALESCE(x.amount,0) AS php, COALESCE(x.net_of_vat,0) AS net, COALESCE(x.input_vat,0) AS vat, COALESCE(x.vat_exempt,0) AS exempt, COALESCE(x.zero_rated,0) AS zero')
                     ->get();
-                // E-Sub: leave out negative lines (returns / debit memos) – not shown, not in the totals or the DAT
-                $lines = $grn->concat($ap)->filter(fn ($x) => min((float) $x->php, (float) $x->net, (float) $x->vat, (float) $x->exempt, (float) $x->zero) >= 0)->values();
+                    
+                $lines = $grn->concat($ap);
                 $party = $this->esParties($lines->pluck('pid'));
                 $blank = ['tin' => '', 'name' => '', 'address' => '', 'city' => '', 'tin_raw' => '', 'name_raw' => ''];
  
@@ -2911,8 +2911,6 @@ class ReportController extends SalesController
                         'php' => round($r->php, 2), 'net' => round($r->net, 2), 'vat' => round($r->vat, 2), 'exempt' => round($r->exempt, 2), 'zero' => round($r->zero, 2),
                         '_tin_raw' => $v['tin_raw'], '_name_raw' => $v['name_raw']];
                 }
-                                // E-Sub: leave out customers whose amounts come out negative (returns / credit memos) – not shown, not in the totals or the DAT
-                $rows = array_values(array_filter($rows, fn ($r) => min($r['php'], $r['net'], $r['vat'], $r['exempt'], $r['zero']) >= 0));
                 $t = fn ($k) => round(array_sum(array_column($rows, $k)), 2);
                 $totals = ['php' => $t('php'), 'net' => $t('net'), 'vat' => $t('vat'), 'exempt' => $t('exempt'), 'zero' => $t('zero')];
  
@@ -4658,24 +4656,42 @@ class ReportController extends SalesController
     }
 
     /* ---------------- main list ---------------- */
-
+    private function vsPeriodCond(string $alias, string $monthCol, string $basis): string
+    {
+        return $basis === 'DE'
+            ? "{$alias}.created_at >= ? AND {$alias}.created_at < ?"
+            : "{$alias}.{$monthCol} BETWEEN ? AND ?";
+    }
+ 
+    /** DM: months (a date is cut to its month) · DE: whole days — From 00:00 up to the day after To (a month = its first / last day) */
+    private function vsPeriodBind(string $from, string $to, string $basis): array
+    {
+        if ($basis !== 'DE') return [substr($from, 0, 7), substr($to, 0, 7)];
+        $start = strlen($from) === 7 ? Carbon::createFromFormat('Y-m-d', "{$from}-01") : Carbon::createFromFormat('Y-m-d', $from);
+        $end = strlen($to) === 7 ? Carbon::createFromFormat('Y-m-d', "{$to}-01")->endOfMonth() : Carbon::createFromFormat('Y-m-d', $to);
+        return [$start->startOfDay()->format('Y-m-d H:i:s'), $end->copy()->addDay()->startOfDay()->format('Y-m-d H:i:s')];
+    }
     public function vatClientsSummary(Request $request)
     {
         $d = $request->validate([
-            'from'      => ['required', 'date_format:Y-m'],
-            'to'        => ['required', 'date_format:Y-m'],
+            'from'      => ['required', 'regex:/^\d{4}-\d{2}(-\d{2})?$/'],   // YYYY-MM, or YYYY-MM-DD with basis=DE
+            'to'        => ['required', 'regex:/^\d{4}-\d{2}(-\d{2})?$/'],   // YYYY-MM, or YYYY-MM-DD with basis=DE
             'status_id' => ['nullable', 'integer'],
             'da_id'     => ['nullable', 'integer'],
+            'basis'     => ['nullable', 'in:DM,DE'],   // DM = declared month (default) · DE = date entry (created)
         ]);
         $from = $d['from'];
         $to = $d['to'];
         $statusId = (int) ($d['status_id'] ?? 0);
         $daId = (int) ($d['da_id'] ?? 0);
-        if ($mine = $this->reportDaOnly($request)) $daId = $mine;
+        $basis = $d['basis'] ?? 'DM';
+        $pc = fn (string $col) => $this->vsPeriodCond('A', $col, $basis);
+        $pb = $this->vsPeriodBind($from, $to, $basis);
+        if ($mine = $this->reportDaOnly($request)) $daId = $mine;   // data analyst → his clients only
         $ca = $this->vsUserCa();
         $sl = $this->vsStatusLabel();
         $active = $this->vsPick('m_client', ['active', 'is_active']);
-
+ 
         // 1. VAT clients + their logins (old: GROUP BY ClientNum, B.TaxRegistration = 'VAT')
         $where = ["B.tax_registration = 'VAT'"];
         $bind = [];
@@ -4696,11 +4712,11 @@ class ReportController extends SalesController
             GROUP BY A.client_num
             ORDER BY sort_name, A.client_num', $bind);
         if (!$clients) return response()->json(['rows' => []]);
-
+ 
         $users = [];
         foreach ($clients as $c) foreach ($this->vsIds($c->user_ids) as $u) $users[$u] = true;
         $users = array_keys($users);
-
+ 
         // 2. every amount in ONE query, per login (rounded per login like the old code)
         $in = $this->vsIn($users);
         $daSql = $daId > 0 ? ' AND A.assigned_daid = ?' : '';
@@ -4715,7 +4731,7 @@ class ReportController extends SalesController
                    ROUND(COALESCE(SUM(A.zero_rated), 0), 2) AS zr, ROUND(COALESCE(SUM(A.input_vat), 0), 2) AS vat,
                    GROUP_CONCAT(DISTINCT A.assigned_daid) AS da, " . ($sAud ? "GROUP_CONCAT(DISTINCT A.{$sAud})" : 'NULL') . " AS au
             FROM t_sales_invoice_detail A
-            WHERE A.added_by IN ({$in}) AND A.declared_month BETWEEN ? AND ?
+            WHERE A.added_by IN ({$in}) AND {$pc('declared_month')}
               AND A.invoice_status_id <> {$void} AND A.amount != 0 {$this->vsSalesPosted('A')} {$daSql}
             GROUP BY A.added_by
             UNION ALL
@@ -4724,17 +4740,17 @@ class ReportController extends SalesController
                    ROUND(COALESCE(SUM(A.zero_rated), 0), 2), ROUND(COALESCE(SUM(A.input_vat), 0), 2),
                    GROUP_CONCAT(DISTINCT A.assigned_daid), " . ($pAud ? "GROUP_CONCAT(DISTINCT A.{$pAud})" : 'NULL') . "
             FROM t_purchase_expense_detail A {$peJoin}
-            WHERE A.added_by IN ({$in}) AND A.declared_month BETWEEN ? AND ?
+            WHERE A.added_by IN ({$in}) AND {$pc('declared_month')}
               AND A.invoice_status_id <> {$void} AND {$this->vsPeTotal()} != 0 {$daSql}
             GROUP BY A.added_by, {$peType}
             UNION ALL
             SELECT A.added_by, 'W', ROUND(COALESCE(SUM(A.`2307_vt`), 0), 2), 0, 0, 0, NULL, NULL
             FROM t_sales_invoice_master A
             WHERE A.added_by IN ({$in}) AND A.invoice_status_id <> {$void} AND A.`2307_vt` != 0
-              AND A.`2307_vt_declared_month` BETWEEN ? AND ? {$this->vsSalesPosted('A', 't_sales_invoice_master')} {$daSql}
+              AND {$pc('`2307_vt_declared_month`')} {$this->vsSalesPosted('A', 't_sales_invoice_master')} {$daSql}
             GROUP BY A.added_by",
-            [...$users, $from, $to, ...$daBind, ...$users, $from, $to, ...$daBind, ...$users, $from, $to, ...$daBind]);
-
+            [...$users, ...$pb, ...$daBind, ...$users, ...$pb, ...$daBind, ...$users, ...$pb, ...$daBind]);
+ 
         $by = [];
         $empIds = [];
         foreach ($rows as $r) {
@@ -4745,7 +4761,7 @@ class ReportController extends SalesController
         }
         $names = $empIds ? DB::table('m_employee')->whereIn('id', array_keys($empIds))
             ->pluck(DB::raw("TRIM(CONCAT_WS(' ', last_name, first_name, middle_name))"), 'id')->all() : [];
-
+ 
         // 3. add the logins up per client (old step 5)
         $out = [];
         foreach ($clients as $c) {
@@ -4800,10 +4816,13 @@ class ReportController extends SalesController
     public function vatClientsBranches(Request $request)
     {
         $d = $request->validate([
-            'from'       => ['required', 'date_format:Y-m'],
-            'to'         => ['required', 'date_format:Y-m'],
+            'from'       => ['required', 'regex:/^\d{4}-\d{2}(-\d{2})?$/'],   // YYYY-MM, or YYYY-MM-DD with basis=DE
+            'to'         => ['required', 'regex:/^\d{4}-\d{2}(-\d{2})?$/'],   // YYYY-MM, or YYYY-MM-DD with basis=DE
             'client_num' => ['required', 'string', 'max:50'],
+            'basis'      => ['nullable', 'in:DM,DE'],
         ]);
+        $basis = $d['basis'] ?? 'DM';
+        $pc = fn (string $col) => $this->vsPeriodCond('A', $col, $basis);
         $ca = $this->vsUserCa();
         $sl = $this->vsStatusLabel();
         $active = $this->vsPick('m_client', ['active', 'is_active']);
@@ -4818,10 +4837,10 @@ class ReportController extends SalesController
             WHERE A.client_num = ? ' . ($active ? "AND A.{$active} = 1" : '') . '
             ORDER BY B.branch_code, B.trade_name', [$d['client_num']]);
         if (!$accounts) return response()->json(['rows' => []]);
-
+ 
         $users = array_map(fn ($a) => (int) $a->uid, $accounts);
         $in = $this->vsIn($users);
-        $b = [$d['from'], $d['to']];
+        $b = $this->vsPeriodBind($d['from'], $d['to'], $basis);
         [$peJoin, $peType] = $this->vsPeType();
         $void = self::VS_VOID;
         // old: each invoice rounded first, then added up
@@ -4829,25 +4848,25 @@ class ReportController extends SalesController
             SELECT A.added_by AS uid, 'S' AS k, SUM(ROUND(COALESCE(A.net_of_vat, 0), 2)) AS nv, SUM(ROUND(COALESCE(A.vat_exempt, 0), 2)) AS ve,
                    SUM(ROUND(COALESCE(A.zero_rated, 0), 2)) AS zr, SUM(ROUND(COALESCE(A.input_vat, 0), 2)) AS vat
             FROM t_sales_invoice_detail A
-            WHERE A.added_by IN ({$in}) AND A.declared_month BETWEEN ? AND ? AND A.invoice_status_id <> {$void} AND A.amount != 0{$this->vsSalesPosted('A')}
+            WHERE A.added_by IN ({$in}) AND {$pc('declared_month')} AND A.invoice_status_id <> {$void} AND A.amount != 0{$this->vsSalesPosted('A')}
             GROUP BY A.added_by
             UNION ALL
             SELECT A.added_by, {$peType}, SUM(ROUND(COALESCE(A.net_of_vat, 0), 2)), SUM(ROUND(COALESCE(A.vat_exempt, 0), 2)),
                    SUM(ROUND(COALESCE(A.zero_rated, 0), 2)), SUM(ROUND(COALESCE(A.input_vat, 0), 2))
             FROM t_purchase_expense_detail A {$peJoin}
-            WHERE A.added_by IN ({$in}) AND A.declared_month BETWEEN ? AND ? AND A.invoice_status_id <> {$void} AND {$this->vsPeTotal()} != 0
+            WHERE A.added_by IN ({$in}) AND {$pc('declared_month')} AND A.invoice_status_id <> {$void} AND {$this->vsPeTotal()} != 0
             GROUP BY A.added_by, {$peType}
             UNION ALL
             SELECT A.added_by, 'W', SUM(ROUND(COALESCE(A.`2307_vt`, 0), 2)), 0, 0, 0
             FROM t_sales_invoice_master A
-            WHERE A.added_by IN ({$in}) AND A.invoice_status_id <> {$void} AND A.`2307_vt` != 0 AND A.`2307_vt_declared_month` BETWEEN ? AND ?{$this->vsSalesPosted('A', 't_sales_invoice_master')}
+            WHERE A.added_by IN ({$in}) AND A.invoice_status_id <> {$void} AND A.`2307_vt` != 0 AND {$pc('`2307_vt_declared_month`')}{$this->vsSalesPosted('A', 't_sales_invoice_master')}
             GROUP BY A.added_by", [...$users, ...$b, ...$users, ...$b, ...$users, ...$b]);
         $by = [];
         foreach ($rows as $r) {
             $k = $r->k === 'S' || $r->k === 'W' ? $r->k : (strcasecmp((string) $r->k, 'Purchases') === 0 ? 'P' : (strcasecmp((string) $r->k, 'Expenses') === 0 ? 'E' : null));
             if ($k) $by[(int) $r->uid][$k] = $r;
         }
-
+ 
         $out = [];
         foreach ($accounts as $a) {
             $x = $by[(int) $a->uid] ?? [];
@@ -4888,27 +4907,30 @@ class ReportController extends SalesController
         $d = $request->validate([
             'type'     => ['required', 'in:' . implode(',', $types)],
             'user_ids' => ['required', 'string'],
-            'from'     => ['required', 'date_format:Y-m'],
-            'to'       => ['required', 'date_format:Y-m'],
+            'from'     => ['required', 'regex:/^\d{4}-\d{2}(-\d{2})?$/'],   // YYYY-MM, or YYYY-MM-DD with basis=DE
+            'to'       => ['required', 'regex:/^\d{4}-\d{2}(-\d{2})?$/'],   // YYYY-MM, or YYYY-MM-DD with basis=DE
+            'basis'    => ['nullable', 'in:DM,DE'],
         ]);
+        $basis = $d['basis'] ?? 'DM';
+        $pc = fn (string $col) => $this->vsPeriodCond('A', $col, $basis);
         $users = $this->vsClientUsers($this->vsIds($d['user_ids']));
         if (!$users) return response()->json([]);
         $in = $this->vsIn($users);
         $v = $this->vsVendor();
         $void = self::VS_VOID;
         [$peJoin, $peType] = $this->vsPeType();
-
+ 
         $sales = fn (string $amount, string $cond) => "
             SELECT A.id, B.{$v} AS vendor_name, A.transaction_date, A.declared_month, A.document_no, {$amount} AS amount
             FROM t_sales_invoice_detail A INNER JOIN m_vendor_customer B ON B.id = A.customer_id
-            WHERE A.added_by IN ({$in}) AND A.declared_month BETWEEN ? AND ? AND A.invoice_status_id <> {$void} AND {$cond}{$this->vsSalesPosted('A')}
+            WHERE A.added_by IN ({$in}) AND {$pc('declared_month')} AND A.invoice_status_id <> {$void} AND {$cond}{$this->vsSalesPosted('A')}
             ORDER BY A.id DESC";
         $ap = fn (string $amount, string $cond) => "
             SELECT A.id, B.{$v} AS vendor_name, A.transaction_date, A.declared_month, A.document_no, {$amount} AS amount
             FROM t_purchase_expense_detail A INNER JOIN m_vendor_customer B ON B.id = A.vendor_id {$peJoin}
-            WHERE A.added_by IN ({$in}) AND A.declared_month BETWEEN ? AND ? AND A.invoice_status_id <> {$void} AND {$cond}
+            WHERE A.added_by IN ({$in}) AND {$pc('declared_month')} AND A.invoice_status_id <> {$void} AND {$cond}
             ORDER BY A.id DESC";
-
+ 
         $sql = match ($d['type']) {
             'vatable_sales'       => $sales('A.net_of_vat', 'A.net_of_vat != 0'),
             'exempt_sales'        => $sales('A.vat_exempt', 'A.vat_exempt != 0'),
@@ -4923,10 +4945,10 @@ class ReportController extends SalesController
             'creditable_wt'       => "
                 SELECT A.id, B.{$v} AS vendor_name, A.transaction_date, A.`2307_vt_declared_month` AS declared_month, A.document_no, A.`2307_vt` AS amount
                 FROM t_sales_invoice_master A INNER JOIN m_vendor_customer B ON B.id = A.customer_id
-                WHERE A.added_by IN ({$in}) AND A.`2307_vt_declared_month` BETWEEN ? AND ? AND A.invoice_status_id <> {$void} AND A.`2307_vt` != 0{$this->vsSalesPosted('A', 't_sales_invoice_master')}
+                WHERE A.added_by IN ({$in}) AND {$pc('`2307_vt_declared_month`')} AND A.invoice_status_id <> {$void} AND A.`2307_vt` != 0{$this->vsSalesPosted('A', 't_sales_invoice_master')}
                 ORDER BY A.id DESC",
         };
-        $rows = DB::select($sql, [...$users, $d['from'], $d['to']]);
+        $rows = DB::select($sql, [...$users, ...$this->vsPeriodBind($d['from'], $d['to'], $basis)]);
         return response()->json(array_map(fn ($r) => [
             'id'               => (int) $r->id,
             'vendor_name'      => $r->vendor_name,
@@ -4936,7 +4958,6 @@ class ReportController extends SalesController
             'amount'           => (float) $r->amount,
         ], $rows));
     }
-
     /* ---------------- remarks ---------------- */
 
     public function vatClientsRemarks(Request $request)

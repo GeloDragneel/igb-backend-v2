@@ -127,7 +127,7 @@ class AuthController extends Controller
     /**
      * GET /api/staff-access   sidebar FEMS / STAFF switch + which Staff pages this login can open (m_user_staff_access)
      *   Client       → FEMS only, no switch
-     *   ClientStaff  → switch
+     *   ClientStaff  → FEMS only, no switch (their FEMS pages = Team → Module List, see userPayload rights)
      *   Staff        → switch when clients are assigned to them, or when IT OFFICER / CEO / SUPERVISOR / AUDIT SUPERVISOR;
      *                  otherwise STAFF only, no switch
      * { switch: bool, only: 'fems'|'staff'|null, all: bool, paths: [...] }   no access set → all = every Staff page
@@ -137,7 +137,8 @@ class AuthController extends Controller
         $user = $request->user();
         $type = $this->typeOf($user);
 
-        if (!in_array($type, ['Staff', 'ClientStaff'], true)) {
+        // Client and team members (ClientStaff) → FEMS only, no switch
+        if ($type !== 'Staff') {
             return response()->json(['switch' => false, 'only' => 'fems', 'all' => false, 'paths' => []]);
         }
         $switch = true;
@@ -320,7 +321,41 @@ class AuthController extends Controller
             'name'           => $displayName,
             'username'       => $user->username,
             'role'           => $this->designationName($designationId, $type),
+            // Team → Module List (m_user_client_staff.access_rights "1-4-15" → [1, 4, 15]); empty = every FEMS page
+            'rights'         => $rights = ($type === 'ClientStaff' ? $this->clientStaffRights($user) : []),
+            // the pages of those modules (m_menu_data.url) – the sidebar matches by page, so it works without "m:" codes
+            'right_paths'    => $this->rightPaths($rights),
+            // and their names ("Sales", "Charts of Account" … – the same names the sidebar shows)
+            'right_names'    => $this->rightNames($rights),
         ];
+    }
+
+    /** m_menu_data ids → module names (lower case) */
+    private function rightNames(array $ids): array
+    {
+        if (!$ids || !Schema::hasTable('m_menu_data')) return [];
+        $name = collect(['module_name', 'name', 'menu_name'])->first(fn ($c) => Schema::hasColumn('m_menu_data', $c));
+        if (!$name) return [];
+        return DB::table('m_menu_data')->whereIn('id', $ids)->pluck($name)
+            ->map(fn ($n) => mb_strtolower(trim((string) $n)))->filter(fn ($n) => $n !== '')->unique()->values()->all();
+    }
+
+    /** m_menu_data ids → their page urls ("/task/sales", "/settings" …) */
+    private function rightPaths(array $ids): array
+    {
+        if (!$ids || !Schema::hasTable('m_menu_data')) return [];
+        $url = collect(['url', 'link', 'path'])->first(fn ($c) => Schema::hasColumn('m_menu_data', $c));
+        if (!$url) return [];
+        return DB::table('m_menu_data')->whereIn('id', $ids)->pluck($url)
+            ->map(fn ($u) => trim((string) $u))->filter(fn ($u) => $u !== '')->unique()->values()->all();
+    }
+
+    /** the m_menu_data ids ticked for this team member (sidebar: only these FEMS pages; none ticked → all) */
+    private function clientStaffRights($user): array
+    {
+        if (!Schema::hasColumn('m_user_client_staff', 'access_rights')) return [];
+        $raw = (string) ($user->getRawOriginal('access_rights') ?? $user->access_rights ?? '');
+        return array_values(array_unique(array_filter(array_map('intval', explode('-', $raw)))));
     }
 
     /** Name from m_user_type for the designation; falls back to the user type */

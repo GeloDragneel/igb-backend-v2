@@ -133,9 +133,7 @@ trait EsubValidation
             }
 
             if ($isList) {
-                foreach (['php' => 'Amount', 'net' => 'Net of VAT', 'vat' => 'VAT', 'exempt' => 'VAT exempt', 'zero' => 'Zero rated'] as $k => $label) {
-                    if ((float) ($r[$k] ?? 0) < 0) $add($errors, $line, $r, $label, "{$label} is negative.");
-                }
+                // negative amounts (returns / credit memos) are allowed – no error, they go into the DAT as they are
                 $net = (float) ($r['net'] ?? 0); $vat = (float) ($r['vat'] ?? 0);
                 if ($net == 0 && $vat == 0 && (float) ($r['exempt'] ?? 0) == 0 && (float) ($r['zero'] ?? 0) == 0) {
                     $add($warnings, $line, $r, 'Amounts', 'All amounts are zero.');
