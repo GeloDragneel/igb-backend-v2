@@ -2836,7 +2836,7 @@ class ReportController extends SalesController
                     ->whereRaw('LOWER(m.trans_type) IN (?, ?)', ['purchases', 'expenses'])
                     ->selectRaw('m.declared_month AS mon, m.invoice_no AS ref, m.vendor_id AS pid, COALESCE(x.amount,0) AS php, COALESCE(x.net_of_vat,0) AS net, COALESCE(x.input_vat,0) AS vat, COALESCE(x.vat_exempt,0) AS exempt, COALESCE(x.zero_rated,0) AS zero')
                     ->get();
-                    
+
                 $lines = $grn->concat($ap);
                 $party = $this->esParties($lines->pluck('pid'));
                 $blank = ['tin' => '', 'name' => '', 'address' => '', 'city' => '', 'tin_raw' => '', 'name_raw' => ''];
@@ -2983,7 +2983,23 @@ class ReportController extends SalesController
         // RELIEF-style checks; with errors there is no DAT (the screen lists what to fix)
         $check = $this->esValidate($d['type'], $rows, $c, $from, $to);
         $rows = array_map(fn ($r) => array_diff_key($r, ['_tin_raw' => 1, '_name_raw' => 1]), $rows);
- 
+         // DAT per month: Jul 2026 – Sep 2026 → one DAT for Jul, one for Aug, one for Sep (months with no lines are skipped)
+        $files = null;
+        if ($d['type'] !== '1604E' && $from && $to && $from !== $to && $check['ok'] && !$request->boolean('_one_month')) {
+            $files = [];
+            for ($m = Carbon::parse("{$from}-01"); $m->format('Y-m') <= $to; $m->addMonth()) {
+                $ym = $m->format('Y-m');
+                $one = $this->esubReport($request->duplicate(array_merge($request->query(), ['from' => $ym, 'to' => $ym, '_one_month' => 1])))->getData(true);
+                if (empty($one['rows'])) continue;
+                $files[] = [
+                    'month'    => $ym,
+                    'label'    => $m->format('M Y'),
+                    'filename' => $one['dat']['filename'],
+                    'content'  => $one['dat']['content'],                                  // null = that month has errors
+                    'errors'   => count($one['validation']['errors'] ?? []),
+                ];
+            }
+        }
         return response()->json([
             'validation' => $check,
             'company' => [
@@ -2995,7 +3011,7 @@ class ReportController extends SalesController
             'columns' => $columns,
             'rows'    => $rows,
             'totals'  => $totals,
-            'dat'     => ['filename' => $filename, 'content' => $check['ok'] ? $content : null],
+            'dat'     => ['filename' => $filename, 'content' => $check['ok'] ? $content : null, 'files' => $files],
         ]);
     }
     /* ======================= Income Tax Summary (old Income_Statement.php) ======================= */
@@ -3328,13 +3344,36 @@ class ReportController extends SalesController
     ];
 
     /* GET /api/report-generator/clients  → clients with their branches */
-    public function reportGeneratorClients(){
-        $accounts = ClientAccount::orderBy('trade_name')->get(['id', 'client_num', 'trade_name', 'branch_code', 'branch_type']);
+    private function rgOwnClient(Request $request): ?string
+    {
+        $u = $request->user();
+        $isClient = $u instanceof UserClient || $u instanceof \App\Models\UserClientStaff;
+        if (!$isClient) return null;
+
+        $caid = (int) ($u->caid ?? 0);
+        $num = $caid ? ClientAccount::whereKey($caid)->value('client_num') : null;
+        abort_if($num === null || $num === '', 403, 'Your login is not linked to a client account.');
+        return (string) $num;
+    }
+
+    private function rgGuard(Request $request, string $clientNum): void
+    {
+        $own = $this->rgOwnClient($request);
+        abort_if($own !== null && $own !== $clientNum, 403, 'You can only generate reports for your own client accounts.');
+    }
+
+    public function reportGeneratorClients(Request $request)
+    {
+        $own = $this->rgOwnClient($request);
+        $current = (int) ($this->caidFor($request) ?? 0);   // staff → branch selected on his token; client → his own caid
+        $accounts = ClientAccount::when($own !== null, fn ($q) => $q->where('client_num', $own))
+            ->orderBy('trade_name')->get(['id', 'client_num', 'trade_name', 'branch_code', 'branch_type']);
         $people = Schema::hasTable('m_client')
-            ? DB::table('m_client')->get(['client_num', 'last_name', 'first_name', 'middle_name'])->keyBy('client_num')
+            ? DB::table('m_client')->when($own !== null, fn ($q) => $q->where('client_num', $own))
+                ->get(['client_num', 'last_name', 'first_name', 'middle_name'])->keyBy('client_num')
             : collect();
 
-        $out = $accounts->groupBy('client_num')->map(function ($accs, $num) use ($people) {
+        $out = $accounts->groupBy('client_num')->map(function ($accs, $num) use ($people, $current) {
             $main = $accs->first(fn ($a) => strtoupper((string) $a->branch_type) === 'MAIN') ?? $accs->first();
             $p = $people[$num] ?? null;
             $person = $p ? trim("{$p->last_name}, {$p->first_name} " . ($p->middle_name ?? ''), ' ,') : '';
@@ -3343,9 +3382,10 @@ class ReportController extends SalesController
                 'name'       => $main->trade_name ?: ($person ?: (string) $num),
                 'person'     => $person,
                 'branches'   => $accs->map(fn ($a) => [
-                    'id'    => $a->id,
-                    'label' => trim("{$a->trade_name} | {$a->branch_code}"),
-                    'main'  => strtoupper((string) $a->branch_type) === 'MAIN',
+                    'id'      => $a->id,
+                    'label'   => trim("{$a->trade_name} | {$a->branch_code}"),
+                    'main'    => strtoupper((string) $a->branch_type) === 'MAIN',
+                    'current' => $current > 0 && (int) $a->id === $current,
                 ])->values(),
             ];
         })->sortBy('name', SORT_NATURAL | SORT_FLAG_CASE)->values();
@@ -3397,6 +3437,7 @@ class ReportController extends SalesController
             'report'      => ['required', 'string', 'in:' . implode(',', array_keys(self::RG_REPORTS))],
             'token'       => ['nullable', 'regex:/^[A-Za-z0-9]{20}$/'],
         ]);
+        $this->rgGuard($request, $d['client_num']);
         [$type, $from, $to, $ids, $head] = $this->rgPrepare($d);
  
         // job folder (old ones – more than a day – are cleared)
@@ -3453,6 +3494,7 @@ class ReportController extends SalesController
             'reports'     => ['nullable', 'array'],
             'reports.*'   => ['string', 'in:' . implode(',', array_keys(self::RG_REPORTS))],
         ]);
+        $this->rgGuard($request, $d['client_num']);
         $type = $d['filter_type'];
         [$from, $to] = $d['from'] <= $d['to'] ? [$d['from'], $d['to']] : [$d['to'], $d['from']];
         abort_unless($type === 'DM' ? preg_match('/^\d{4}-\d{2}$/', $from) && preg_match('/^\d{4}-\d{2}$/', $to)
