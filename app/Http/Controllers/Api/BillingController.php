@@ -1282,35 +1282,31 @@ class BillingController extends Controller
 
     /**
      * user id of the logged-in staff's company books (old obj_AddedByCAID + doGetAddedBy):
-     *   SELECT c.id FROM m_employee a
-     *   INNER JOIN m_client_account b ON b.id = a.company_caid
-     *   INNER JOIN m_user_client c ON c.caid = b.id
-     *   WHERE a.id = <employee>
+     *   m_employee (this login) → company_caid → m_client_account → m_user_client
+     * The employee is found the same way as everywhere else (me()): employee_id, else m_user_staff.comid = m_employee.com_id.
      */
     private function companyBooks(Request $request)
     {
         $u = $request->user();
         if (!$u) return 'Not logged in.';
 
-        // possible m_employee ids for this login, in order (first one that has company books wins)
-        $ids = [];
-        foreach (['employee_id', 'emp_id', 'employeeid', 'comid'] as $k) {
-            $v = $u->getAttribute($k);
-            if (is_numeric($v) && (int) $v > 0) $ids[] = (int) $v;
+        $empId = $this->me($request);
+        if (!$empId) {
+            return "Your login (#{$u->id}) is not linked to an employee. Check User Access → Login for this staff.";
         }
-        if (method_exists($u, 'employee') && ($e = $u->employee)) $ids[] = (int) $e->id;
-        $ids[] = (int) $u->id;
-        $ids = array_values(array_unique(array_filter($ids)));
 
-        foreach ($ids as $employeeId) {
-            $userId = (int) DB::table('m_employee as a')
-                ->join('m_client_account as b', 'b.id', '=', 'a.company_caid')
-                ->join('m_user_client as c', 'c.caid', '=', 'b.id')
-                ->where('a.id', $employeeId)
-                ->value('c.id');
-            if ($userId > 0) return $userId;
+        $caid = (int) DB::table('m_employee')->where('id', $empId)->value('company_caid');
+        if ($caid <= 0) {
+            $e = DB::table('m_employee')->where('id', $empId)->first(['last_name', 'first_name']);
+            $name = trim(($e->last_name ?? '') . ' ' . ($e->first_name ?? ''));
+            return "No company account is set for {$name} (employee #{$empId}). Set the employee's Company account in HR Management, then try again.";
         }
-        return 'No UserID found for the supplied CAID (login #' . $u->id . ', employee id tried: ' . implode(', ', $ids) . ').';
+
+        $userId = (int) DB::table('m_user_client')->where('caid', $caid)->orderBy('id')->value('id');
+        if ($userId <= 0) {
+            return "The company account (#{$caid}) of employee #{$empId} has no login (m_user_client). Create one for that account, then try again.";
+        }
+        return $userId;
     }
 
     /* =====================================================================
