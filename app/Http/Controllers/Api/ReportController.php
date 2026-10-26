@@ -2405,6 +2405,12 @@ class ReportController extends SalesController
                     ->whereIn('x.receive_by', $ids)->where('x.grn_status_id', '<>', 5);
                 [$dm, $dt, $rate] = ['x.declared_month', 'x.grn_date', '1'];
                 break;
+            case 'importation':
+                // Importation (Task → Importation): taxable imports + VAT on importation, in PHP (× the line's rate)
+                $q = DB::table('t_importation_detail as x')
+                    ->whereIn('x.added_by', $ids)->where('x.invoice_status_id', '<>', 5);
+                [$dm, $dt, $rate] = ['x.declared_month', 'x.release_date', 'COALESCE(NULLIF(x.ex_rate,0),1)'];
+                break;
             default: // purchases | expenses | ap (both)
                 $q = DB::table('t_purchase_expense_detail as x')
                     ->join('t_purchase_expense_master as m', 'm.invoice_no', '=', 'x.invoice_no')
@@ -2412,12 +2418,12 @@ class ReportController extends SalesController
                 if ($src !== 'ap') $q->whereRaw('LOWER(m.trans_type) = ?', [$src]);
                 [$dm, $dt, $rate] = ['m.declared_month', 'm.transaction_date', '1'];
         }
-
+ 
         if ($p['dm']) $q->whereBetween($dm, [$p['from'], $p['to']]);
         else $q->whereRaw("DATE({$dt}) BETWEEN ? AND ?", [$p['from'], $p['to']]);
-
+ 
         if ($acct !== '') $q->where('x.account_code', $acct);
-
+ 
         return [$q, $p['dm'] ? $dm : "DATE_FORMAT({$dt}, '%Y-%m')", $rate];
     }
 
@@ -2426,11 +2432,12 @@ class ReportController extends SalesController
     {
         $out = array_fill_keys($fields, []);
         if (!$ids) return $out;
-
+        if ($src === 'importation' && !Schema::hasTable('t_importation_detail')) return $out;
+ 
         [$q, $month, $rate] = $this->vatSource($src, $ids, $p, $acct);
         $sel = ["{$month} AS mon"];
         foreach ($fields as $f) $sel[] = "SUM(COALESCE(x.`{$f}`,0) * {$rate}) AS `{$f}`";
-
+ 
         foreach ($q->selectRaw(implode(', ', $sel))->groupBy('mon')->get() as $r) {
             foreach ($fields as $f) $out[$f][$r->mon] = (float) $r->{$f};
         }
@@ -2449,10 +2456,10 @@ class ReportController extends SalesController
         $months = $p['months'];
         [$ids, $account, $branches] = $this->journalScope($request, $d['branch'] ?? 'all');
         $acct = in_array($d['account_code'] ?? '', ['', '0'], true) ? '' : $d['account_code'];
-
+ 
         $F = ['net_of_vat' => 'Net of VAT', 'vat_exempt' => 'VAT Exempt', 'zero_rated' => 'Zero Rated'];
         $fields = array_keys($F);
-
+ 
         // one row
         $row = function (string $key, string $label, array $byMonth) use ($months) {
             $values = [];
@@ -2475,13 +2482,13 @@ class ReportController extends SalesController
             foreach ($sets as $s) foreach ($s as $m => $v) $out[$m] = ($out[$m] ?? 0) + $v;
             return $out;
         };
-
+ 
         // ---- Sales / Purchases / Expenses
         $s = $this->vatByMonth('sales', $ids, $p, $fields, $acct);
         $g = $this->vatByMonth('grn', $ids, $p, $fields, $acct);
         $pu = $this->vatByMonth('purchases', $ids, $p, $fields, $acct);
         $ex = $this->vatByMonth('expenses', $ids, $p, $fields, $acct);
-
+ 
         $section = function (array $data) use ($F, $row, $sum) {
             $rows = [];
             foreach ($F as $f => $label) $rows[] = $row($f, $label, $data[$f]);
@@ -2490,18 +2497,24 @@ class ReportController extends SalesController
         $sales = $section($s);
         $purchases = $section(array_map(fn ($f) => $merge($g[$f], $pu[$f]), array_combine($fields, $fields)));
         $expenses = $section($ex);
-
-        $purchExp = $sum([$purchases['total'], $expenses['total']], 'purch_exp', 'Total Purchases/Expenses');
+ 
+        // ---- Importation (same as E-BIR: Net of VAT = taxable imports)
+        $im = $this->vatByMonth('importation', $ids, $p, ['taxable_imports', 'amount_of_vat'], $acct);
+        $impRows = [$row('net_of_vat', 'Net of VAT', $im['taxable_imports'])];
+        $importation = ['rows' => $impRows, 'total' => $sum($impRows)];
+ 
+        $purchExp = $sum([$purchases['total'], $importation['total'], $expenses['total']], 'purch_exp', 'Total Purchases/Expenses');
         $net = $minus($sales['total'], $purchExp, 'net', 'Net Total');
-
+ 
         // ---- VAT (no account filter, same as the old page)
         $out = $row('output', 'Output VAT', $this->vatByMonth('sales', $ids, $p, ['input_vat'])['input_vat']);
         $in = $row('input', 'Input VAT', $merge(
             $this->vatByMonth('grn', $ids, $p, ['input_vat'])['input_vat'],
             $this->vatByMonth('ap', $ids, $p, ['input_vat'])['input_vat'],
+            $this->vatByMonth('importation', $ids, $p, ['amount_of_vat'])['amount_of_vat'],   // VAT paid on importation
         ));
         $due = $minus($out, $in, 'due', 'VAT Due');
-
+ 
         // ---- Less: tax paid (AP lines on "VAT Paid" accounts) – 1st & 2nd month
         $paidCodes = DB::table('m_charts_of_account')
             ->whereRaw('LOWER(account_name) LIKE ?', ['%vat paid%'])
@@ -2515,7 +2528,7 @@ class ReportController extends SalesController
         }
         $first = round($paid[$months[0] ?? ''] ?? 0, 2);
         $second = round($paid[$months[1] ?? ''] ?? 0, 2);
-
+ 
         // ---- 2307 VT on sales
         $vt2307 = $ids && $months
             ? round((float) SalesInvoiceMaster::whereIn('added_by', $ids)->where('invoice_status_id', '<>', 5)->where('trans_type', 'posted')
@@ -2523,7 +2536,7 @@ class ReportController extends SalesController
                 ->whereBetween('2307_vt_declared_month', [$months[0], end($months)])
                 ->sum('2307_vt'), 2)
             : 0;
-
+ 
         // ---- header + account list
         $h = $this->companyHeader($account) ?? [];
         $accounts = [];
@@ -2534,7 +2547,7 @@ class ReportController extends SalesController
                 ->unique('account_code')
                 ->map(fn ($a) => ['code' => $a->account_code, 'name' => $a->account_name])->values();
         } catch (\Throwable $e) { /* list stays empty */ }
-
+ 
         return response()->json([
             'company'   => ['name' => $h['trade_name'] ?? '', 'tin' => $h['tin'] ?? '', 'address' => $h['address'] ?? ''],
             'branches'  => $branches->map(fn ($b) => ['id' => $b->id, 'label' => "{$b->branch_code} - {$b->trade_name}"])->values(),
@@ -2542,6 +2555,7 @@ class ReportController extends SalesController
             'months'    => $months,
             'sales'     => $sales,
             'purchases' => $purchases,
+            'importation' => $importation,
             'expenses'  => $expenses,
             'purch_exp' => $purchExp,
             'net'       => $net,
@@ -2554,7 +2568,7 @@ class ReportController extends SalesController
     public function vatSummaryDocs(Request $request)
     {
         $d = $request->validate([
-            'section'      => ['required', 'in:sales,purchases,expenses,output,input'],
+            'section'      => ['required', 'in:sales,purchases,importation,expenses,output,input'],
             'field'        => ['nullable', 'in:net_of_vat,vat_exempt,zero_rated'],
             'month'        => ['required', 'date_format:Y-m'],
             'filter_type'  => ['required', 'in:DM,DR'],
@@ -2563,32 +2577,39 @@ class ReportController extends SalesController
         ]);
         [$ids] = $this->journalScope($request, $d['branch'] ?? 'all');
         if (!$ids) return response()->json(['rows' => [], 'total' => 0]);
-
+ 
         $m = Carbon::createFromFormat('Y-m-d', "{$d['month']}-01");
         $p = $d['filter_type'] === 'DM'
             ? ['dm' => true, 'from' => $d['month'], 'to' => $d['month']]
             : ['dm' => false, 'from' => $m->format('Y-m-d'), 'to' => $m->copy()->endOfMonth()->format('Y-m-d')];
-
+ 
         $isVat = in_array($d['section'], ['output', 'input'], true);
         $field = $isVat ? 'input_vat' : ($d['field'] ?? 'net_of_vat');
         $acct = $isVat || in_array($d['account_code'] ?? '', ['', '0'], true) ? '' : $d['account_code'];
-
+ 
         $sources = match ($d['section']) {
             'sales', 'output' => ['sales'],
             'purchases'       => ['grn', 'purchases'],
+            'importation'     => ['importation'],
             'expenses'        => ['expenses'],
-            'input'           => ['grn', 'ap'],
+            'input'           => ['grn', 'ap', 'importation'],
         };
-
+ 
         $rows = collect();
         foreach ($sources as $src) {
+            if ($src === 'importation' && !Schema::hasTable('t_importation_detail')) continue;
             [$q, , $rate] = $this->vatSource($src, $ids, $p, $acct);
-            $amt = "COALESCE(x.`{$field}`,0) * {$rate}";
-            $q->whereRaw("COALESCE(x.`{$field}`,0) <> 0");
-
+            // importation columns: Net of VAT = taxable_imports, VAT = amount_of_vat
+            $col = $src === 'importation' ? ($field === 'input_vat' ? 'amount_of_vat' : ($field === 'net_of_vat' ? 'taxable_imports' : null)) : $field;
+            if ($col === null) continue;
+            $amt = "COALESCE(x.`{$col}`,0) * {$rate}";
+            $q->whereRaw("COALESCE(x.`{$col}`,0) <> 0");
+ 
             if ($src === 'sales') {
                 $q->leftJoin('t_sales_invoice_master as sm', 'sm.invoice_no', '=', 'x.invoice_no')
                   ->selectRaw("x.transaction_date AS date, x.declared_month AS dm, x.document_no AS doc, x.invoice_no AS ref, x.customer_id AS pid, 'Sales / Invoices' AS module, sm.id AS sales_id, {$amt} AS amount");
+            } elseif ($src === 'importation') {
+                $q->selectRaw("x.release_date AS date, x.declared_month AS dm, x.invoice_no AS doc, x.importation_no AS ref, x.seller_id AS pid, 'Importation' AS module, NULL AS sales_id, {$amt} AS amount, 1 AS is_imp");
             } elseif ($src === 'grn') {
                 $q->leftJoin('t_grn_master as g', 'g.grn_no', '=', 'x.grn_no')
                   ->selectRaw("x.grn_date AS date, x.declared_month AS dm, COALESCE(g.ref_data, x.grn_no) AS doc, COALESCE(g.ref_data, x.grn_no) AS ref, x.vendor_id AS pid, 'Receive Inventory' AS module, NULL AS sales_id, {$amt} AS amount");
@@ -2598,7 +2619,7 @@ class ReportController extends SalesController
             }
             $rows = $rows->concat($q->get());
         }
-
+ 
         // party names
         $names = [];
         foreach (VendorCustomer::whereIn('id', $rows->pluck('pid')->filter()->unique())->get() as $v) {
@@ -2607,21 +2628,27 @@ class ReportController extends SalesController
                 if (!empty($a[$k])) { $names[$v->id] = $a[$k]; break; }
             }
         }
-
+ 
+        // importation sellers are in m_sellers, not m_vendor_customer
+        $sellers = [];
+        $impPids = $rows->filter(fn ($r) => !empty($r->is_imp))->pluck('pid')->filter()->unique()->values();
+        if ($impPids->isNotEmpty() && Schema::hasTable('m_sellers')) {
+            $sellers = DB::table('m_sellers')->whereIn('id', $impPids)->pluck('name', 'id')->all();
+        }
+ 
         $rows = $rows->sortBy('date')->values()->map(fn ($r) => [
             'date'     => $r->date ? substr((string) $r->date, 0, 10) : $r->dm,
             'doc'      => $r->doc,
             'ref'      => $r->ref,
-            'party'    => $names[$r->pid] ?? '',
+            'party'    => !empty($r->is_imp) ? ($sellers[$r->pid] ?? '') : ($names[$r->pid] ?? ''),
             'module'   => $r->module,
             'sales_id' => $r->sales_id,
             'amount'   => round((float) $r->amount, 2),
         ]);
-
+ 
         return response()->json(['rows' => $rows, 'total' => round($rows->sum('amount'), 2)]);
     }
-        /* ======================= E-Sub Report + DAT (old E_Sub_Report.php + ajax/dat.php) ======================= */
-
+    /* ======================= E-Sub Report + DAT (old E_Sub_Report.php + ajax/dat.php) ======================= */
     private function esClean($s): string
     {
         return trim(preg_replace('/\s+/', ' ', str_replace([',', "\r", "\n", "\t"], ' ', (string) $s)));
