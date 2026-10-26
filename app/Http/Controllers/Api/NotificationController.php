@@ -415,8 +415,9 @@ class NotificationController extends Controller
                 $items[] = $this->item("allrev{$type}", 'red', "{$n} reverted " . $this->plural($type, $n), 'All clients · Reverted', null, '/monitoring/efficiency', $t);
             }
             if ($eo = $this->unpaidEo()) {
+                // opens Billing → Dashboard already filled: the account with the biggest unpaid EO balance, Type = EO, Status = Unpaid + partial
                 $items[] = $this->item('billeo', 'blue', "{$eo['n']} unpaid EO bill" . ($eo['n'] > 1 ? 's' : '') . ' · ₱' . number_format($eo['amount'], 2),
-                    'Billing · EO', null, '/billing/dashboard', $eo['t']);
+                    'Billing · EO', null, $this->billingEoLink($eo['top']), $eo['t']);
             }
         }
 
@@ -566,6 +567,7 @@ class NotificationController extends Controller
     }
 
     /** EO (non-recurring) bills still unpaid / partly paid: count + balance */
+    /** EO (non-recurring) bills still unpaid / partly paid: count + balance */
     private function unpaidEo(): ?array
     {
         if (!$this->cols('t_service') || !$this->cols('m_service_list')) return null;
@@ -579,7 +581,30 @@ class NotificationController extends Controller
             ->where('S.total_service_fee', '>', 0)
             ->selectRaw("COUNT(*) AS n, COALESCE(SUM(GREATEST({$fee} - COALESCE(P.paid, 0), 0)), 0) AS amount, " . $this->newest('t_service', 'S') . ' AS t')
             ->first();
-        return $r && (int) $r->n > 0 ? ['n' => (int) $r->n, 'amount' => round((float) $r->amount, 2), 't' => $r->t] : null;
+        if (!$r || (int) $r->n <= 0) return null;
+
+        // the account that owes the most EO – the bell opens Billing on it
+        $top = DB::table('t_service as S')
+            ->join('m_service_list as L', 'L.id', '=', 'S.ser_list_id')
+            ->leftJoinSub($paid, 'P', 'P.service_id', '=', 'S.id')
+            ->where('L.ser_type_id', self::EO_SER_TYPE)
+            ->whereIn('S.invoice_status_id', [self::SVC_UNPAID, self::SVC_PARTIAL])
+            ->where('S.total_service_fee', '>', 0)
+            ->groupBy('S.ca_id')
+            ->orderByRaw("SUM(GREATEST({$fee} - COALESCE(P.paid, 0), 0)) DESC")
+            ->value('S.ca_id');
+
+        return ['n' => (int) $r->n, 'amount' => round((float) $r->amount, 2), 't' => $r->t, 'top' => $top ? (int) $top : null];
+    }
+
+    /** Billing → Dashboard filled in: account, Type = EO, Status = Unpaid + partial */
+    private function billingEoLink(?int $caId): string
+    {
+        return '/billing/dashboard?' . http_build_query(array_filter([
+            'ca_id'  => $caId,
+            'groups' => 'eo',
+            'status' => 'open',
+        ]));
     }
 
     /* ---------------- GET /notifications/detail?key=   the list behind a "work to do" card ---------------- */
@@ -668,7 +693,7 @@ class NotificationController extends Controller
                     'meta'  => '₱' . number_format((float) $r->bal, 2),
                     'time'  => null,
                     'ca_id' => null,
-                    'to'    => '/billing/dashboard',
+                    'to'    => $this->billingEoLink((int) $r->ca),
                 ])->all();
             return response()->json(['rows' => $rows, 'note' => 'Per client account, biggest balance first.']);
         }
