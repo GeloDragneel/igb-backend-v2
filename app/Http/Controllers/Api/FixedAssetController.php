@@ -63,9 +63,11 @@ class FixedAssetController extends SalesController
         $posted = DB::table(self::DEP)->where('added_by', $by)->groupBy('asset_id')
             ->selectRaw('asset_id, SUM(amount) AS total, MAX(period) AS last_period')->get()->keyBy('asset_id');
         $names = ChartsOfAccount::where('added_by', $by)->pluck('account_name', 'account_code');
+        $vendorIds = $assets->pluck('vendor_id')->filter()->unique()->values()->all();
+        $vendors = $vendorIds ? DB::table('m_vendor_customer')->whereIn('id', $vendorIds)->pluck('name', 'id') : collect();
         $thisMonth = date('Y-m');
 
-        return response()->json($assets->map(function ($a) use ($posted, $names, $thisMonth) {
+        return response()->json($assets->map(function ($a) use ($posted, $names, $thisMonth, $vendors) {
             $acc = (float) ($posted[$a->id]->total ?? 0);
             $life = max(1, (int) $a->useful_life_months);
             return (array) $a + [
@@ -77,6 +79,7 @@ class FixedAssetController extends SalesController
                 'end_period' => Carbon::createFromFormat('Y-m-d', $a->depreciation_start . '-01')->addMonths($life - 1)->format('Y-m'),
                 'due_this_month' => $this->amountFor($a, $thisMonth),
                 'asset_account_name' => $names[$a->asset_account] ?? '',
+                'vendor_name' => !empty($a->vendor_id) ? (string) ($vendors[$a->vendor_id] ?? '') : '',
             ];
         }));
     }
@@ -88,9 +91,19 @@ class FixedAssetController extends SalesController
             ->where('root_name', '!=', '0')->orderBy('account_code')->get(['account_code', 'account_name']));
     }
 
+    /* GET /api/fixed-assets/vendors   this client's vendors (same list as Expenses / Purchases) */
+    public function faVendors(Request $request)
+    {
+        $by = $this->addedByFor($request);
+        if (!$by) return response()->json([]);
+        return response()->json(DB::table('m_vendor_customer')->where('user_type', 'Vendor')->where('entry_by', $by)
+            ->orderBy('name')->get(['id', 'name', 'tin', 'branch_code']));
+    }
+
     private function rules(): array
     {
         return [
+            'vendor_id' => ['nullable', 'integer'],
             'name' => ['required', 'string', 'max:150'],
             'category' => ['nullable', 'string', 'max:100'],
             'description' => ['nullable', 'string', 'max:255'],

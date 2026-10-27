@@ -908,8 +908,7 @@ class ReportController extends SalesController
 
             $invLines = SalesInvoiceDetail::whereIn('added_by', $ids)
                 ->where('invoice_status_id', '<>', 5)->where('trans_type', 'posted')
-                ->when($customerId, fn ($q) => $q->where('customer_id', $customerId))
-                ->where(fn ($q) => $byDate($q, 'transaction_date'))
+                ->whereIn('invoice_no', $invMasters->pluck('invoice_no')->filter()->unique()->values()->all() ?: [''])
                 ->get(['id', 'added_by', 'account_code', 'transaction_date', 'customer_id', 'invoice_no', 'document_no',
                        'input_vat', 'item_id', 'net_of_vat', 'vat_exempt', 'non_vat', 'zero_rated', 'ex_rate',
                        'total_cost', 'declared_month', 'created_at']);
@@ -1014,8 +1013,7 @@ class ReportController extends SalesController
             }
 
             $apLines = PurchaseExpenseDetail::whereIn('added_by', $ids)->active()->where('record_status', 'posted')
-                ->when($vendorId, fn ($q) => $q->where('vendor_id', $vendorId))
-                ->where(fn ($q) => $byDate($q, 'transaction_date'))
+                ->whereIn('invoice_no', $apMasters->pluck('invoice_no')->filter()->unique()->values()->all() ?: [''])
                 ->get(['id', 'added_by', 'account_code', 'transaction_date', 'vendor_id', 'invoice_no', 'document_no',
                        'input_vat', 'item_id', 'net_of_vat', 'vat_exempt', 'non_vat', 'zero_rated', 'trans_type',
                        'declared_month', 'created_at']);
@@ -1312,6 +1310,7 @@ class ReportController extends SalesController
         ]);
     }
         /* ---------- Trial balance totals per account (old doGetTrialBalanceList) ---------- */
+    private array $tbUnbalanced = [];
     private function trialBalanceRows(array $ids, string $type, string $from, string $to, array $opt = []): array
     {
         // old trial balance: no collections, no cost of sales (normal + adjusting journal entries unless $opt['gj'] says otherwise)
@@ -1319,7 +1318,7 @@ class ReportController extends SalesController
 
         $modules = ['INV' => 'Sales / Invoices', 'PO' => 'Purchase Order', 'GRN' => 'Receive Inventory', 'GJ' => 'General Journal'];
         $acc = [];
-
+        $docBal = [];
         foreach ($entries as $e) {
             if (($e['jrnl'] ?? '') === 'COG') continue;
 
@@ -1347,7 +1346,15 @@ class ReportController extends SalesController
                 'amount'      => 0.0,
             ];
             $acc[$code]['docs'][$key]['amount'] += (float) $e['debit'] - (float) $e['credit'];
+            $docBal[$key] ??= ['module' => $acc[$code]['docs'][$key]['module'], 'trans_type' => $e['trans_type'], 'date' => $e['sort_date'],
+                'document_no' => $e['reference'], 'reference' => $e['ref_data'], 'name' => $e['party'] ?? '', 'debit' => 0.0, 'credit' => 0.0];
+            $docBal[$key]['debit'] += (float) $e['debit'];
+            $docBal[$key]['credit'] += (float) $e['credit'];
         }
+        $this->tbUnbalanced = collect($docBal)
+            ->map(fn ($d) => ['debit' => round($d['debit'], 4), 'credit' => round($d['credit'], 4), 'difference' => round($d['debit'] - $d['credit'], 4)] + $d)
+            ->filter(fn ($d) => abs($d['difference']) >= 0.005)
+            ->sortByDesc(fn ($d) => abs($d['difference']))->values()->take(500)->all();
 
         ksort($acc, SORT_STRING);
 
@@ -1386,6 +1393,7 @@ class ReportController extends SalesController
             'company'  => $this->companyHeader($client),
             'branches' => $branches->map(fn ($b) => ['id' => $b->id, 'label' => "{$b->branch_code} - {$b->trade_name}"])->values(),
             'rows'     => $rows,
+            'unbalanced' => $this->tbUnbalanced,
         ]);
     }
 

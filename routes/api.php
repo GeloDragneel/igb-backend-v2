@@ -38,6 +38,7 @@ use App\Http\Controllers\Api\PrintController;
 use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\AiAssistantController; 
 use App\Http\Controllers\Api\ArchiveController;
+use App\Http\Controllers\Api\BirReturnSummaryController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -150,7 +151,6 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/bir/filing/{name}/payments', [BirReturnController::class, 'payStore']);
     Route::delete('/bir/payments/{id}', [BirReturnController::class, 'payDelete']);
     Route::get('/bir/payments/{id}/attachment', [BirReturnController::class, 'payAttachment']);
-
 
     Route::get('/reports/bir2307', [ReportController::class, 'bir2307Summary']);
     Route::get('/reports/vat-summary', [ReportController::class, 'vatSummary']);
@@ -315,7 +315,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/fixed-assets/{id}/schedule', [FixedAssetController::class, 'faSchedule'])->whereNumber('id');
     Route::post('/fixed-assets/{id}/dispose', [FixedAssetController::class, 'faDispose'])->whereNumber('id');
     Route::post('/fixed-assets/{id}/restore', [FixedAssetController::class, 'faRestore'])->whereNumber('id');
-
+    Route::get('/fixed-assets/vendors', [FixedAssetController::class, 'faVendors']);
+    
     Route::get('/engagements/{type}', [EngagementController::class, 'engIndex'])->whereIn('type', ['import', 'export']);
     Route::post('/engagements/{type}', [EngagementController::class, 'engStore'])->whereIn('type', ['import', 'export']);
     Route::put('/engagements/{type}/{id}', [EngagementController::class, 'engUpdate'])->whereIn('type', ['import', 'export'])->whereNumber('id');
@@ -597,7 +598,6 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::put('/hr/payroll-cutoffs/{id}', [HR::class, 'savePayrollCutoff']);
     Route::post('/hr/payroll/{id}/exclusions', [HR::class, 'savePayrollExclusion']);
     
-    
     // ---------- Lending ----------
     Route::get('/lending/summary', [HR::class, 'lendingSummary']);
     Route::post('/lending/settings', [HR::class, 'saveLendingSetting']);
@@ -750,9 +750,13 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/archive', [ArchiveController::class, 'index']);
     Route::get('/archive/summary', [ArchiveController::class, 'summary']);
     Route::get('/archive/file', [ArchiveController::class, 'file']);
-    Route::post('/archive/folder', [ArchiveController::class, 'createFolder']);    // IT Officer
-    Route::put('/archive/folder', [ArchiveController::class, 'renameFolder']);     // IT Officer
-    Route::post('/archive/upload', [ArchiveController::class, 'upload']);          // IT Officer
+    Route::post('/archive/folder', [ArchiveController::class, 'createFolder']); // IT Officer
+    Route::put('/archive/folder', [ArchiveController::class, 'renameFolder']); // IT Officer
+    Route::post('/archive/upload', [ArchiveController::class, 'upload']); // IT Officer
+
+    Route::get('/reports/bir-return-summary/clients', [BirReturnSummaryController::class, 'clients']);
+    Route::get('/reports/bir-return-summary', [BirReturnSummaryController::class, 'show']);
+    Route::put('/reports/bir-return-summary', [BirReturnSummaryController::class, 'save']);
 
     require __DIR__ . '/api_messenger.php';
 });
