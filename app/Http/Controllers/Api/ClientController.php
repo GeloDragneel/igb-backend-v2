@@ -260,15 +260,15 @@ class ClientController extends Controller
             'phone_num'                         => ['required', 'string', 'max:50'],
             'tell_num'                          => ['nullable', 'string', 'max:50'],
             'email_address'                     => ['nullable', 'email', 'max:150'],
-            'street'                            => ['nullable', 'string', 'max:255'],
-            'province_id'                       => ['nullable', 'integer'],
-            'city_id'                           => ['nullable', 'integer'],
-            'brgy_id'                           => ['nullable', 'integer'],
+            'street'                            => ['required', 'string', 'max:255'],
+            'province_id'                       => ['required', 'integer', 'min:1'],
+            'city_id'                           => ['required', 'integer', 'min:1'],
+            'brgy_id'                           => ['required', 'integer', 'min:1'],
             'business_ownership_type_id'        => ['required', 'integer', 'min:1'],
             'business_ownership_type_detail_id' => ['nullable', 'integer'],
-            'classification_id'                 => ['nullable', 'integer'],
+            'classification_id'                 => ['required', 'integer'],
             'industries_id'                     => ['nullable', 'integer'],
-            'compliance_ids'                    => ['nullable', 'array'],
+            'compliance_ids'                    => ['required', 'array', 'min:1'],
             'compliance_ids.*'                  => ['integer'],
             'date_of_engagement'                => ['nullable', 'date'],
             'date_of_disengagement'             => ['nullable', 'date'],
@@ -286,6 +286,12 @@ class ClientController extends Controller
             'business_ownership_type_id.required' => 'Business ownership type is required.',
             'business_ownership_type_id.min' => 'Business ownership type is required.',
             'accounts.required' => 'Add at least one business account.', 'accounts.min' => 'Add at least one business account.',
+            'province_id.required' => 'Province is required.', 'province_id.min' => 'Province is required.',
+            'city_id.required' => 'City / municipality is required.', 'city_id.min' => 'City / municipality is required.',
+            'brgy_id.required' => 'Barangay is required.', 'brgy_id.min' => 'Barangay is required.',
+            'street.required' => 'Street name / district is required.',
+            'classification_id.required' => 'Classification is required.',
+            'compliance_ids.required' => 'Select at least one compliance.', 'compliance_ids.min' => 'Select at least one compliance.',
         ];
     }
 
@@ -311,9 +317,13 @@ class ClientController extends Controller
     /* POST /api/clients   { …same fields as Settings, accounts: [ {business account}, … ] }  – client_num is generated (IGB-####) */
     public function storeClient(Request $request)
     {
-        $rules = $this->clientRules() + ['accounts' => ['required', 'array', 'min:1']];
+        $rules = $this->clientRules() + ['accounts' => ['required', 'array', 'min:1'], 'valid_ids' => ['required', 'array', 'min:1']];
         foreach ($this->accountRules() as $k => $r) $rules["accounts.*.{$k}"] = $r;
+        foreach ($this->idRules() as $k => $r) $rules["valid_ids.*.{$k}"] = $r;
         $d = $request->validate($rules, $this->clientMessages() + [
+            'valid_ids.required' => 'Add at least one valid ID.',
+            'valid_ids.min' => 'Add at least one valid ID.',
+            'valid_ids.*.id_num.required' => 'Every valid ID needs an ID number.',
             'accounts.*.trade_name.required' => 'Every business account needs a trade name.',
             'accounts.*.branch_type.required' => 'Every business account needs a branch type.',
             'accounts.*.branch_code.required' => 'Every business account needs a branch code.',
@@ -324,12 +334,14 @@ class ClientController extends Controller
         $names = array_values(array_filter(array_map(fn ($a) => strtolower(trim((string) ($a['login']['username'] ?? ''))), $d['accounts'])));
         abort_if(count($names) !== count(array_unique($names)), 422, 'Two business accounts have the same login username.');
 
+        $ids = $d['valid_ids'];
+        foreach ($ids as $v) $this->checkTin($v);
         $accounts = $d['accounts'];
-        unset($d['accounts']);
+        unset($d['accounts'], $d['valid_ids']);
         $row = $this->cleanClient($d);
 
         $by = $request->user()?->id;
-        $num = DB::transaction(function () use ($row, $accounts, $by) {
+        $num = DB::transaction(function () use ($row, $accounts, $by, $ids) {
             $num = $this->nextClientNum();
             DB::table('m_client')->insert($this->onlyColumns('m_client', $row + ['client_num' => $num, 'created_at' => now(), 'updated_at' => now()]));
             foreach ($accounts as $a) {
@@ -339,9 +351,16 @@ class ClientController extends Controller
                 $uid = $this->saveLogin((int) $caid, $a['login'] ?? null, $by);
                 if ($uid) $this->applyCoa($uid, $a['nob_id'] ?? null, array_key_exists('coa', $a) ? $a['coa'] : null);
             }
+            // valid IDs typed before the first save (at least one is required)
+            foreach ($ids as $v) {
+                ClientValidId::create([
+                    'client_num' => $num, 'client_num_type' => 'CLIENT',
+                    'institution' => strtoupper(trim($v['institution'])), 'id_num' => trim($v['id_num']),
+                ]);
+            }
             return $num;
         });
-        return response()->json(['client' => $this->client($num), 'accounts' => $this->accountsOf($num), 'valid_ids' => [], 'message' => "Client {$num} added."], 201);
+        return response()->json(['client' => $this->client($num), 'accounts' => $this->accountsOf($num), 'valid_ids' => $this->validIds($num), 'message' => "Client {$num} added."], 201);
     }
 
     /* PUT /api/clients/{num} */
