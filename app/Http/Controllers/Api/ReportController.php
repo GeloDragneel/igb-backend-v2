@@ -3194,7 +3194,7 @@ class ReportController extends SalesController
 
         $brackets = Schema::hasTable('m_tax_brackets')
             ? DB::table('m_tax_brackets')->orderBy('bracket_min')->get()->map(fn ($b) => [
-                'min' => (float) $b->bracket_min, 'max' => $b->bracket_max === null ? null : (float) $b->bracket_max,
+                'min' => (float) $b->bracket_min, 'max' => ($b->bracket_max === null || (float) $b->bracket_max <= (float) $b->bracket_min) ? null : (float) $b->bracket_max,   // empty / 0 = and above
                 'base' => (float) $b->base_tax, 'rate' => (float) $b->rate,
             ])->values()->all()
             : self::ITS_BRACKETS;
