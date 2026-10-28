@@ -479,6 +479,11 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::delete('/client-master-files/{key}/{id}', [ClientController::class, 'destroyMasterFile'])->whereNumber('id');
     Route::get('/client-master-files/{key}', [ClientController::class, 'masterFileRows'])->where('key', '[a-z_]+');
 
+    // Settings
+    Route::get('/settings/account-extras', [ClientController::class, 'myAccountExtras']);
+    Route::post('/settings/accounts/{id}/extras', [ClientController::class, 'mySaveAccountExtras'])->whereNumber('id');
+    Route::put('/settings/twa', [ClientController::class, 'mySaveTwa']);
+
     // ---------- Monitoring → Reconciliation Monitoring (year grid) ----------
     Route::get('/monitoring/reconciliation', [MonitoringController::class, 'monitoring']);
     Route::get('/monitoring/reconciliation/compliance', [MonitoringController::class, 'complianceList']);
@@ -759,7 +764,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/reports/bir-return-summary/clients', [BirReturnSummaryController::class, 'clients']);
     Route::get('/reports/bir-return-summary', [BirReturnSummaryController::class, 'show']);
     Route::put('/reports/bir-return-summary', [BirReturnSummaryController::class, 'save']);
-    
+
     Route::put('/me/password', [AccountPasswordController::class, 'update']);
 
     require __DIR__ . '/api_messenger.php';

@@ -266,6 +266,7 @@ class ClientController extends Controller
             'brgy_id'                           => ['required', 'integer', 'min:1'],
             'business_ownership_type_id'        => ['required', 'integer', 'min:1'],
             'business_ownership_type_detail_id' => ['nullable', 'integer'],
+            'is_top_withholding_agent'          => ['nullable', 'boolean'],
             'classification_id'                 => ['required', 'integer'],
             'industries_id'                     => ['nullable', 'integer'],
             'compliance_ids'                    => ['required', 'array', 'min:1'],
@@ -298,6 +299,7 @@ class ClientController extends Controller
     private function cleanClient(array $d): array
     {
         $d['compliance_ids'] = implode(',', array_unique($d['compliance_ids'] ?? []));
+        if (array_key_exists('is_top_withholding_agent', $d)) $d['is_top_withholding_agent'] = !empty($d['is_top_withholding_agent']) ? 1 : 0;
         foreach (['civ_stat_id', 'status_id', 'province_id', 'city_id', 'brgy_id', 'business_ownership_type_id',
                   'business_ownership_type_detail_id', 'classification_id', 'industries_id'] as $k) {
             if (empty($d[$k])) $d[$k] = null;
@@ -449,11 +451,16 @@ class ClientController extends Controller
         abort_if($this->dupCode($a->client_num, $d['branch_code'], $id), 422, 'That branch code is already used by this client.');
 
         $by = $request->user()?->id;
-        DB::transaction(function () use ($id, $d, $by) {
+        $done = DB::transaction(function () use ($id, $d, $by) {
             DB::table('m_client_account')->where('id', $id)->update($this->cleanAccount($d) + ['updated_at' => now()]);
-            $this->saveLogin($id, $d['login'] ?? null, $by);
+            $uid = $this->saveLogin($id, $d['login'] ?? null, $by) ?: $this->loginOf($id);
+            abort_if(!$uid && !empty($d['coa']), 422, 'This account has no login, so its Charts of account can\'t be saved. Add a username on the Login tab first.');
+            // Charts of account tab: ticked accounts of the nature's chart → inserted / updated in m_charts_of_account
+            return ($uid && array_key_exists('coa', $d) && $d['coa'] !== null) ? $this->applyCoa($uid, $d['nob_id'] ?? null, $d['coa']) : null;
         });
-        return response()->json(['accounts' => $this->accountsOf($a->client_num), 'message' => 'Business account updated.']);
+        $msg = 'Business account updated.';
+        if ($done) $msg .= " Charts of account: {$done[0]} added, {$done[1]} updated.";
+        return response()->json(['accounts' => $this->accountsOf($a->client_num), 'message' => $msg]);
     }
 
     /* DELETE /api/client-accounts/{id}  { confirm: branch code } */
@@ -609,6 +616,72 @@ class ClientController extends Controller
     }
 
     /* =====================================================================
+       Client Settings (/settings) – the signed-in client's OWN accounts only
+         GET  /settings/account-extras?ca_id=&nob_id=   login of the account + the nature's chart (+ codes it has)
+         POST /settings/accounts/{id}/extras            { login, coa }  → login saved · chart inserted / updated
+         PUT  /settings/twa                             { is_top_withholding_agent }
+       ===================================================================== */
+
+    /** client # of the signed-in client / client staff (from its business account) */
+    private function myClientNum(Request $request): string
+    {
+        $u = $request->user();
+        $caid = (int) ($u->caid ?? 0);
+        $num = $caid ? DB::table('m_client_account')->where('id', $caid)->value('client_num') : null;
+        abort_if(!$num, 403, 'Your login is not linked to a client.');
+        return (string) $num;
+    }
+
+    /** one business account of the signed-in client (404 for anyone else's) */
+    private function myAccount(Request $request, int $id): object
+    {
+        $a = DB::table('m_client_account')->where('id', $id)->first();
+        abort_if(!$a || (string) $a->client_num !== $this->myClientNum($request), 404, 'Business account not found.');
+        return $a;
+    }
+
+    public function myAccountExtras(Request $request)
+    {
+        $this->myClientNum($request);
+        $caid = (int) $request->query('ca_id');
+        if ($caid) $this->myAccount($request, $caid);
+        $tpl = $this->coaTemplate($request)->getData(true);           // rows · source · have (when ca_id)
+        $login = $caid ? ($this->loginsFor([$caid])[$caid] ?? null) : null;
+        return response()->json($tpl + ['login' => $login]);
+    }
+
+    public function mySaveAccountExtras(Request $request, int $id)
+    {
+        $a = $this->myAccount($request, $id);
+        $d = $request->validate($this->loginRules() + [
+            'coa'   => ['nullable', 'array'],
+            'coa.*' => ['string', 'max:20'],
+        ], $this->loginMessages());
+        $by = $request->user()?->id;
+        $done = DB::transaction(function () use ($id, $a, $d, $by) {
+            $uid = $this->saveLogin($id, $d['login'] ?? null, $by) ?: $this->loginOf($id);
+            if (!array_key_exists('coa', $d) || $d['coa'] === null) return null;
+            abort_if(!$uid && !empty($d['coa']), 422, 'This account has no login, so its Charts of account can\'t be saved. Add a username on the Login tab first.');
+            return $uid ? $this->applyCoa($uid, $a->nob_id ?? null, $d['coa']) : null;
+        });
+        return response()->json([
+            'login'   => $this->loginsFor([$id])[$id] ?? null,
+            'coa'     => $done ? ['added' => $done[0], 'updated' => $done[1]] : null,
+            'message' => $done ? "Charts of account: {$done[0]} added, {$done[1]} updated." : 'Saved.',
+        ]);
+    }
+
+    public function mySaveTwa(Request $request)
+    {
+        $num = $this->myClientNum($request);
+        $d = $request->validate(['is_top_withholding_agent' => ['required', 'boolean']]);
+        abort_unless(Schema::hasColumn('m_client', 'is_top_withholding_agent'), 422, 'Run php artisan migrate first (m_client.is_top_withholding_agent).');
+        $v = !empty($d['is_top_withholding_agent']) ? 1 : 0;
+        DB::table('m_client')->where('client_num', $num)->update(['is_top_withholding_agent' => $v, 'updated_at' => now()]);
+        return response()->json(['is_top_withholding_agent' => (bool) $v, 'message' => 'Saved.']);
+    }
+
+    /* =====================================================================
        Default Charts of Account per Nature of business (m_nature_coa_template → m_charts_of_account)
        ===================================================================== */
 
@@ -626,10 +699,19 @@ class ClientController extends Controller
     {
         $nob = (int) $request->query('nob_id') ?: null;
         $rows = $this->coaTemplateRows($nob);
+        // editing an account: the codes its login already has (ticked, updated on save)
+        $have = [];
+        if ($caid = (int) $request->query('ca_id')) {
+            $uid = $this->loginOf($caid);
+            if ($uid && Schema::hasTable('m_charts_of_account')) {
+                $have = DB::table('m_charts_of_account')->where('added_by', $uid)->pluck('account_code')->map(fn ($c) => (string) $c)->values()->all();
+            }
+        }
         $own = $nob && $rows->isNotEmpty() && (int) ($rows->first()->nature_of_business_id ?? 0) === $nob;
         return response()->json([
             'source'   => $rows->isEmpty() ? 'none' : ($own ? 'nature' : 'general'),
             'template' => $rows->first()->template ?? null,
+            'have'     => $have,
             'rows'     => $rows->map(fn ($r) => [
                 'code' => (string) $r->account_code, 'name' => $r->account_name, 'type' => $r->account_type,
                 'parent' => (string) $r->root_name === '0' ? null : (string) $r->root_name,
@@ -640,16 +722,18 @@ class ClientController extends Controller
     }
 
     /**
-     * Copy the default chart into m_charts_of_account for a new login (added_by = m_user_client id).
+     * Default chart of the nature of business → m_charts_of_account of a login (added_by = m_user_client id).
      * $codes null = the whole default chart · [] = none · otherwise those codes (+ their parent headers).
-     * Codes that login already has are skipped.
+     * A code the login doesn't have yet is INSERTED; one it already has is UPDATED from the chart
+     * (name, type, parent, description, Sales / Purchases / Expenses / Payments flags). Nothing is deleted.
+     * → [inserted, updated]
      */
-    private function applyCoa(int $userId, $nobId, ?array $codes): int
+    private function applyCoa(int $userId, $nobId, ?array $codes): array
     {
-        if ($codes !== null && !$codes) return 0;
-        if (!Schema::hasTable('m_charts_of_account')) return 0;
+        if ($codes !== null && !$codes) return [0, 0];
+        if (!Schema::hasTable('m_charts_of_account')) return [0, 0];
         $rows = $this->coaTemplateRows((int) $nobId ?: null)->keyBy(fn ($r) => (string) $r->account_code);
-        if ($rows->isEmpty()) return 0;
+        if ($rows->isEmpty()) return [0, 0];
 
         $keys = array_map('strval', $rows->keys()->all());           // numeric codes become int array keys → compare as strings
         $want = $codes === null ? $keys : array_values(array_intersect(array_map('strval', $codes), $keys));
@@ -661,24 +745,41 @@ class ClientController extends Controller
             }
         }
 
-        $have = DB::table('m_charts_of_account')->where('added_by', $userId)->pluck('account_code')->map(fn ($c) => (string) $c)->all();
+        $have = DB::table('m_charts_of_account')->where('added_by', $userId)->pluck('account_code')->map(fn ($c) => (string) $c)->flip();
         $now = now();
         $cols = array_flip(Schema::getColumnListing('m_charts_of_account'));
+        // text never longer than the column (a long name stopped the whole save: "Data too long for column 'account_name'")
+        $max = collect(Schema::getColumns('m_charts_of_account'))->mapWithKeys(fn ($c) => [$c['name'] => (int) (preg_match('/char\((\d+)\)/i', (string) $c['type'], $m) ? $m[1] : 0)]);
+        $fit = fn ($col, $v) => ($v !== null && ($n = (int) ($max[$col] ?? 0)) > 0) ? mb_substr((string) $v, 0, $n) : $v;
         $insert = [];
+        $updated = 0;
         foreach ($rows as $code => $r) {
             $code = (string) $code;
-            if (!in_array($code, $want, true) || in_array($code, $have, true)) continue;
-            $insert[] = array_intersect_key([
-                'root_name' => (string) $r->root_name, 'account_code' => $code, 'account_name' => $r->account_name,
-                'account_type' => $r->account_type, 'description' => $r->description,
+            if (!in_array($code, $want, true)) continue;
+            $vals = array_intersect_key([
+                'root_name' => (string) $r->root_name, 'account_name' => $fit('account_name', $r->account_name),
+                'account_type' => $fit('account_type', $r->account_type), 'description' => $fit('description', $r->description),
                 'is_for_paid' => (int) $r->is_for_paid, 'is_sales' => (int) $r->is_sales,
                 'is_purchases' => (int) $r->is_purchases, 'is_expenses' => (int) $r->is_expenses,
-                'added_by' => $userId, 'created_at' => $now, 'updated_at' => $now,
+                'updated_at' => $now,
             ], $cols);
+            if (isset($have[$code])) {
+                $updated += DB::table('m_charts_of_account')->where('added_by', $userId)->where('account_code', $code)->update($vals) ? 1 : 0;
+            } else {
+                $insert[] = $vals + array_intersect_key(['account_code' => $code, 'added_by' => $userId, 'created_at' => $now], $cols);
+            }
         }
         foreach (array_chunk($insert, 200) as $chunk) DB::table('m_charts_of_account')->insert($chunk);
-        return count($insert);
+        return [count($insert), $updated];
     }
+
+    /** the login (m_user_client id) of a business account, or null */
+    private function loginOf(int $caid): ?int
+    {
+        $id = DB::table('m_user_client')->where($this->loginCaCol(), $caid)->orderBy('id')->value('id');
+        return $id ? (int) $id : null;
+    }
+
     /* =====================================================================
        Master File → Nature of Business → "Charts of account" popup: edit the default chart of a nature
        nob 0 = the general chart (used by natures without their own)
