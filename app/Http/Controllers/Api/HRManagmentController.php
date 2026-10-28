@@ -846,7 +846,7 @@ class HRManagmentController extends Controller
     }
 
     /* GET /hr/employee-lookups   everything the employee form needs (cities / barangays come by parent) */
-    public function employeeLookups()
+    public function employeeLookups(Request $request)
     {
         $out = [];
         foreach (['designations', 'employment_statuses', 'civil_statuses', 'religions', 'citizenships', 'provinces'] as $key) {
@@ -856,6 +856,9 @@ class HRManagmentController extends Controller
             ->map(fn ($a) => ['value' => $a->id, 'label' => trim((string) $a->trade_name) ?: trim((string) $a->branch_code)])
             ->sortBy('label')->values();
         $out['shifts'] = Shift::query()->where('is_active', true)->orderBy('name')->get(['id', 'name'])->map(fn ($x) => ['value' => $x->id, 'label' => $x->name]);
+        // Work → Company on the form: my client's accounts (MAIN + branches) · default = my own company
+        $out['my_companies'] = collect($this->myCompanies($request))->map(fn ($l, $id) => ['value' => $id, 'label' => $l])->values();
+        $out['my_company'] = $this->myCompany($request);
         return response()->json($out);
     }
 
@@ -893,46 +896,72 @@ class HRManagmentController extends Controller
         });
     }
 
-    /**
-     * m_employee.com_id is a foreign key to m_client_account.id: every employee has its own account row.
-     * New employee → copy the account row of the latest employee (same client_num, company, types, flags),
-     * put the new employee's name on it, branch_code = next number under that client → its id is the com_id.
-     */
-    private function newEmployeeAccount(array $profile): int
+    /** com_id of a new employee = the logged-in user's com_id – nothing is added to m_client_account */
+    private function userComId(Request $request): int
     {
-        $tpl = DB::table('m_client_account as A')
-            ->join('m_employee as E', 'E.com_id', '=', 'A.id')
-            ->orderByDesc('A.id')->lockForUpdate()->select('A.*')->first();
-        abort_unless($tpl, 422, 'No existing employee account (m_client_account) to copy from.');
+        $com = (int) $this->userComIdOrNull($request);
+        abort_if($com <= 0, 422, 'Your login has no com_id, so the employee can\'t be added. Ask IT to set m_user_staff.comid for your account.');
+        return $com;
+    }
 
-        $cols = collect(\Illuminate\Support\Facades\Schema::getColumns('m_client_account'))->keyBy('name');
-        $row = (array) $tpl;
-        unset($row['id']);
-        $name = trim(strtoupper(($profile['last_name'] ?? '') . ', ' . ($profile['first_name'] ?? '')), ' ,');
-        foreach (['trade_name', 'tradename', 'account_name', 'name'] as $c) if ($cols->has($c)) $row[$c] = $name;
-        if ($cols->has('branch_code') && $cols->has('client_num')) {
-            $max = DB::table('m_client_account')->where('client_num', $tpl->client_num)
-                ->selectRaw('MAX(CAST(branch_code AS UNSIGNED)) AS n')->value('n');
-            $len = max(strlen((string) $tpl->branch_code), 5);
-            $row['branch_code'] = str_pad((string) (((int) $max) + 1), $len, '0', STR_PAD_LEFT);
+    /** the logged-in user's com_id: m_user_staff.comid, else the com_id of his own employee record */
+    private function userComIdOrNull(Request $request): ?int
+    {
+        $u = $request->user();
+        if (!$u) return null;
+        $com = (int) ($u->comid ?? 0);
+        if ($com <= 0 && Schema::hasTable('m_user_staff') && Schema::hasColumn('m_user_staff', 'comid')) {
+            $com = (int) DB::table('m_user_staff')->where('id', $u->id ?? 0)->value('comid');
         }
-        foreach (['created_at', 'updated_at'] as $c) if ($cols->has($c)) $row[$c] = now();
-        if ($cols->has('is_active')) $row['is_active'] = 1;
-
-        $row = $this->fkValid('m_client_account', $row);
-
-        try {
-            return (int) DB::table('m_client_account')->insertGetId($row);
-        } catch (\Illuminate\Database\QueryException $x) {
-            report($x);
-            abort(422, 'Could not create the employee account (m_client_account): ' . ($x->errorInfo[2] ?? $x->getMessage()));
+        if ($com <= 0 && !empty($u->employee_id)) {
+            $com = (int) DB::table('m_employee')->where('id', $u->employee_id)->value('com_id');
         }
+        return $com > 0 ? $com : null;
+    }
+
+    /** the logged-in user's own company: company_caid of his employee record (m_employee.com_id = his comid) */
+    private function myCompany(Request $request): ?int
+    {
+        $com = $this->userComIdOrNull($request);
+        if (!$com) return null;
+        $caid = (int) DB::table('m_employee')->where('com_id', $com)->whereNotNull('company_caid')->orderByDesc('is_active')->value('company_caid');
+        return $caid > 0 ? $caid : null;
+    }
+
+    /**
+     * Company dropdown: every ACTIVE client account of the same client as my company (same client_num)
+     *   e.g. Angelo → MAIN 00000 IGB ACCOUNTING … and all its branches (00001 ICB CONSTRUCTION SUPPLIES …)
+     * → [id => "MAIN 00000 – IGB ACCOUNTING AND BUSINESS CONSULTANCY"]   (empty = no company of my own → all)
+     */
+    private function myCompanies(Request $request): array
+    {
+        $mine = $this->myCompany($request);
+        if (!$mine) return [];
+        $num = DB::table('m_client_account')->where('id', $mine)->value('client_num');
+        $q = ClientAccount::query();
+        ($num !== null && $num !== '') ? $q->where('client_num', $num) : $q->whereKey($mine);
+        // active accounts only
+        $active = collect(['is_active', 'active'])->first(fn ($c) => Schema::hasColumn('m_client_account', $c));
+        if ($active) $q->where($active, 1);
+        return $q->get(['id', 'branch_code', 'branch_type', 'trade_name'])
+            ->sortBy(fn ($a) => [strtoupper((string) $a->branch_type) === 'MAIN' ? 0 : 1, (string) $a->branch_code, (string) $a->trade_name])
+            ->mapWithKeys(fn ($a) => [(int) $a->id => trim(implode(' ', array_filter([strtoupper((string) $a->branch_type), (string) $a->branch_code])) . ' – ' . trim((string) $a->trade_name), ' –')])
+            ->all();
+    }
+
+    /** a company picked on the form must be one of myCompanies() */
+    private function checkCompany(Request $request, $caid): void
+    {
+        if ($caid === null || $caid === '') return;
+        $list = $this->myCompanies($request);
+        abort_if($list && !array_key_exists((int) $caid, $list), 422, 'That company is not one of your client accounts.');
     }
 
     /**
      * POST /hr/employees   add an employee, all in one save:
      *   profile fields + optional shift {…} · salary {…} · banks [{…}] · leave_credits [{…}] · photo (data URL → S3)
      *   everything but the photo is one transaction (nothing is saved when one part fails)
+     *   com_id = the logged-in user's com_id (no new m_client_account row)
      */
     public function createEmployee(Request $request)
     {
@@ -951,11 +980,17 @@ class HRManagmentController extends Controller
         $profile = array_intersect_key($d, $rules);
         $me = $this->me($request);
 
-        $e = DB::transaction(function () use ($d, $profile, $me) {
-            // com_id = the new employee's own m_client_account row (foreign key m_employee.com_id → m_client_account.id)
-            $comId = $this->newEmployeeAccount($profile);
+        // com_id = the logged-in user's com_id · company = the one picked, default my own company (e.g. MAIN 00000 IGB ACCOUNTING …)
+        $comId = $this->userComId($request);
+        if (empty($profile['company_caid'])) $profile['company_caid'] = $this->myCompany($request);
+        $this->checkCompany($request, $profile['company_caid'] ?? null);
+
+        $e = DB::transaction(function () use ($d, $profile, $me, $comId) {
             $e = new Employee();
-            $e->forceFill($this->fkValid('m_employee', $this->notNullSafe('m_employee', $profile + ['is_active' => $profile['is_active'] ?? true, 'com_id' => $comId])))->save();
+            $e->forceFill($this->fkValid('m_employee', $this->notNullSafe('m_employee', array_merge($profile, [
+                'is_active' => $profile['is_active'] ?? true,
+                'com_id'    => $comId,
+            ]))))->save();
             if (!empty($d['shift']['shift_id'])) $this->applyShift($e, $d['shift'], $me);
             if (!empty($d['salary'])) $this->insertSalary($e, $d['salary'] + ['is_default' => true], $me);
             foreach ($d['banks'] ?? [] as $b) $this->putBank($b + ['is_active' => true], $e->id, null, $me);
@@ -1043,6 +1078,7 @@ class HRManagmentController extends Controller
     {
         $e = Employee::findOrFail($id);
         $d = $request->validate($this->employeeRules());
+        if (array_key_exists('company_caid', $d) && (int) $d['company_caid'] !== (int) $e->company_caid) $this->checkCompany($request, $d['company_caid']);
         $e->update($this->notNullSafe('m_employee', $d, true));
         return response()->json(['message' => "{$e->full_name} updated."]);
     }
