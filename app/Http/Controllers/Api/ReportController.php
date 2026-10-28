@@ -3061,6 +3061,27 @@ class ReportController extends SalesController
         return $out;
     }
 
+    /**
+     * Income Tax Summary scope.
+     * Staff opening a client from Reports → Income Summary sends user_ids (that client's logins):
+     * the statement is that client's, like /bir/income-tax is for the logged-in branch.
+     * Otherwise: the normal branch scope (journalScope).
+     */
+    private function itsScope(Request $request, string $branch): array
+    {
+        $raw = $request->input('user_ids');
+        if ($raw !== null && $raw !== '' && $request->user() instanceof \App\Models\UserStaff) {
+            $ids = $this->vsClientUsers($this->vsIds($raw));
+            abort_unless($ids, 422, 'This client has no login.');
+            $caids = DB::table('m_user_client')->whereIn('id', $ids)->pluck($this->vsUserCa())->filter()->unique()->values();
+            $accounts = ClientAccount::whereIn('id', $caids)->get();
+            // the MAIN account names the statement (several branches = the whole client)
+            $account = $accounts->first(fn ($a) => strtoupper((string) $a->branch_type) === 'MAIN') ?? $accounts->first();
+            return [$ids, $account, collect()];
+        }
+        return $this->journalScope($request, $branch);
+    }
+
     // is the client a corporation? (old: BusinessOwnershipTypeID = 3 → 20%)
     private function itsCorporate($account): bool
     {
@@ -3091,7 +3112,7 @@ class ReportController extends SalesController
             $months[] = $c->format('Y-m');
         }
 
-        [$ids, $account, $branches] = $this->journalScope($request, $d['branch'] ?? 'all');
+        [$ids, $account, $branches] = $this->itsScope($request, $d['branch'] ?? 'all');
         DB::statement('SET SESSION group_concat_max_len = 1000000');
 
         // account names
@@ -3201,7 +3222,7 @@ class ReportController extends SalesController
             'refs'   => ['required', 'string'],
             'branch' => ['nullable', 'string', 'max:20'],
         ]);
-        [$ids] = $this->journalScope($request, $d['branch'] ?? 'all');
+        [$ids] = $this->itsScope($request, $d['branch'] ?? 'all');
         $refs = array_values(array_filter(array_map('trim', explode(',', $d['refs']))));
         if (!$ids || !$refs) return response()->json([]);
 
@@ -3251,7 +3272,7 @@ class ReportController extends SalesController
             'to'           => ['required', 'date_format:Y-m'],
             'branch'       => ['nullable', 'string', 'max:20'],
         ]);
-        [$ids] = $this->journalScope($request, $d['branch'] ?? 'all');
+        [$ids] = $this->itsScope($request, $d['branch'] ?? 'all');
         if (!$ids) return response()->json([]);
 
         $rows = DB::table('t_purchase_expense_detail as x')
@@ -3277,7 +3298,7 @@ class ReportController extends SalesController
     public function incomeTaxAdjustments(Request $request)
     {
         $d = $request->validate(['from' => ['required', 'date_format:Y-m'], 'to' => ['required', 'date_format:Y-m']]);
-        [, $account] = $this->journalScope($request, 'all');
+        [, $account] = $this->itsScope($request, 'all');
         $me = (int) $request->user()->id;
 
         $fmt = fn ($t) => $t ? Carbon::parse($t)->format('M d Y - h:iA') : '—';
@@ -3306,7 +3327,7 @@ class ReportController extends SalesController
             'mode' => ['required', 'in:new_version,continue'],
             'data' => ['required', 'array'],
         ]);
-        [, $account] = $this->journalScope($request, 'all');
+        [, $account] = $this->itsScope($request, 'all');
         $caid = optional($account)->id;
         abort_unless($caid, 422, 'No client account is selected.');
 

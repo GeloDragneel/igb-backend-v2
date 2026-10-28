@@ -258,14 +258,44 @@ class HRManagmentController extends Controller
        ===================================================================== */
 
     /* GET /hr/employees?status=active|inactive|all   employees for the list and pickers (shift, default rate, company) */
+    /* ---------- Branch employees (FEMS → Admin → Employees): one branch only ----------
+       Client / client staff logins: ALWAYS their own branch (m_user_client.caid / m_user_client_staff.caid).
+       Staff: the branch picked at the top (token caid) when the page asks for it (?branch=current / branch: "current").
+       null = no limit (Staff in HR Management). */
+    private function branchScope(Request $request, bool $asked = false): ?int
+    {
+        $u = $request->user();
+        $isStaff = $u instanceof \App\Models\UserStaff;
+        if ($isStaff && !$asked) return null;
+        if (!$isStaff) {
+            $c = (int) ($u->caid ?? 0);
+            abort_if($c <= 0, 403, 'Your login is not linked to a branch.');
+            return $c;
+        }
+        $tok = method_exists($u, 'currentAccessToken') ? $u->currentAccessToken() : null;
+        $c = (int) collect($tok->abilities ?? [])->map(fn ($a) => str_starts_with((string) $a, 'caid:') ? (int) substr((string) $a, 5) : 0)->filter()->first();
+        abort_if($c <= 0, 422, 'Pick a branch at the top first.');
+        return $c;
+    }
+
+    /** a client / client staff login may only touch employees of its own branch */
+    private function guardEmployee(Request $request, int $empId): void
+    {
+        $scope = $this->branchScope($request);
+        if ($scope === null) return;
+        abort_unless((int) Employee::query()->whereKey($empId)->value('company_caid') === $scope, 404, 'Employee not found.');
+    }
+
     public function employees(Request $request)
     {
         $status = $request->query('status', 'active');
+        $scope = $this->branchScope($request, $request->query('branch') === 'current');
         $shifts = Shift::query()->pluck('name', 'id');
         $default = Shift::default();
         $rows = Employee::query()
             ->when($status === 'active', fn ($q) => $q->where('is_active', 1))
             ->when($status === 'inactive', fn ($q) => $q->where(fn ($w) => $w->where('is_active', 0)->orWhereNull('is_active')))
+            ->when($scope, fn ($q) => $q->where('company_caid', $scope))
             ->orderBy('last_name')->orderBy('first_name')
             ->get(['id', 'last_name', 'first_name', 'middle_name', 'suffix', 'designation_id', 'shift_id', 'salary_month', 'salary_day', 'company_caid', 'is_active', 'birthdate']);
 
@@ -291,6 +321,7 @@ class HRManagmentController extends Controller
     /* GET /hr/employees/{id}   everything HR about one employee */
     public function employee(Request $request, int $id)
     {
+        $this->guardEmployee($request, $id);
         $e = Employee::findOrFail($id);
         $year = (int) ($request->query('year') ?: $this->now()->year);
         $shift = $this->attendanceCalc->shiftOf($e);
@@ -310,6 +341,7 @@ class HRManagmentController extends Controller
     /* PUT /hr/employees/{id}/shift   { shift_id (null = default shift), effective_from, reason } */
     public function setEmployeeShift(Request $request, int $id)
     {
+        $this->guardEmployee($request, $id);
         $d = $request->validate($this->shiftRules());
         $e = Employee::findOrFail($id);
         DB::transaction(fn () => $this->applyShift($e, $d, $this->me($request)));
@@ -339,6 +371,7 @@ class HRManagmentController extends Controller
      */
     public function addSalary(Request $request, int $id)
     {
+        $this->guardEmployee($request, $id);
         $d = $request->validate($this->salaryRules());
         $e = Employee::findOrFail($id);
         $row = DB::transaction(fn () => $this->insertSalary($e, $d, $this->me($request)));
@@ -375,6 +408,7 @@ class HRManagmentController extends Controller
     /* PUT /hr/salaries/{id}/default */
     public function setDefaultSalary(int $id)
     {
+        $this->guardEmployee(request(), (int) EmployeeSalary::query()->whereKey($id)->value('employee_id'));
         DB::transaction(fn () => $this->makeDefaultSalary(EmployeeSalary::findOrFail($id)));
         return response()->json(['message' => 'Default salary updated.']);
     }
@@ -405,6 +439,7 @@ class HRManagmentController extends Controller
     /* POST /hr/employees/{id}/banks   PUT /hr/banks/{bankId}   DELETE /hr/banks/{bankId} */
     public function saveBank(Request $request, ?int $id = null, ?int $bankId = null)
     {
+        $this->guardEmployee($request, (int) ($id ?: EmployeeBank::query()->whereKey($bankId)->value('employee_id')));
         $d = $request->validate($this->bankRules());
         $bank = DB::transaction(fn () => $this->putBank($d, $id, $bankId, $this->me($request)));
         return response()->json(['message' => 'Bank account saved.', 'bank' => $bank]);
@@ -438,6 +473,7 @@ class HRManagmentController extends Controller
 
     public function deleteBank(int $bankId)
     {
+        $this->guardEmployee(request(), (int) EmployeeBank::query()->whereKey($bankId)->value('employee_id'));
         EmployeeBank::findOrFail($bankId)->update(['is_active' => false, 'is_default' => false]);
         return response()->json(['message' => 'Bank account removed.']);
     }
@@ -445,6 +481,7 @@ class HRManagmentController extends Controller
     /* PUT /hr/employees/{id}/leave-credits   { year, leave_type_id, allowed_days, carried_over } */
     public function saveLeaveCredit(Request $request, int $id)
     {
+        $this->guardEmployee($request, $id);
         $d = $request->validate($this->creditRules());
         $row = $this->putCredit($id, $d, $this->me($request));
         return response()->json(['message' => 'Leave credit saved.', 'credit' => $row]);
@@ -859,6 +896,13 @@ class HRManagmentController extends Controller
         // Work → Company on the form: my client's accounts (MAIN + branches) · default = my own company
         $out['my_companies'] = collect($this->myCompanies($request))->map(fn ($l, $id) => ['value' => $id, 'label' => $l])->values();
         $out['my_company'] = $this->myCompany($request);
+        // client / client staff login: only its own branch (no other client's names)
+        $scope = $this->branchScope($request);
+        if ($scope !== null) {
+            $out['companies'] = collect($out['companies'])->filter(fn ($c) => (int) $c['value'] === $scope)->values();
+            $out['my_companies'] = $out['companies'];
+            $out['my_company'] = $scope;
+        }
         return response()->json($out);
     }
 
@@ -980,10 +1024,19 @@ class HRManagmentController extends Controller
         $profile = array_intersect_key($d, $rules);
         $me = $this->me($request);
 
-        // com_id = the logged-in user's com_id · company = the one picked, default my own company (e.g. MAIN 00000 IGB ACCOUNTING …)
-        $comId = $this->userComId($request);
-        if (empty($profile['company_caid'])) $profile['company_caid'] = $this->myCompany($request);
-        $this->checkCompany($request, $profile['company_caid'] ?? null);
+        // branch page (FEMS → Employees) / client login: company = the branch at the top, com_id = that branch for a client login
+        $scope = $this->branchScope($request, $request->input('branch') === 'current');
+        if ($scope !== null) {
+            $profile['company_caid'] = $scope;
+            // Staff → his own com_id (same as HR Management) · client / client staff login → the branch itself
+            $comId = $request->user() instanceof \App\Models\UserStaff ? ($this->userComIdOrNull($request) ?: $scope) : $scope;
+            unset($d['leave_credits']);                          // no leave credits on the branch page
+        } else {
+            // com_id = the logged-in user's com_id · company = the one picked, default my own company (e.g. MAIN 00000 IGB ACCOUNTING …)
+            $comId = $this->userComId($request);
+            if (empty($profile['company_caid'])) $profile['company_caid'] = $this->myCompany($request);
+            $this->checkCompany($request, $profile['company_caid'] ?? null);
+        }
 
         $e = DB::transaction(function () use ($d, $profile, $me, $comId) {
             $e = new Employee();
@@ -1015,6 +1068,7 @@ class HRManagmentController extends Controller
     /* POST /hr/employees/{id}/photo   { photo: "data:image/jpeg;base64,…" } · { photo: null } removes it  →  S3 Employee_Profile/ */
     public function saveEmployeePhoto(Request $request, int $id)
     {
+        $this->guardEmployee($request, $id);
         $e = Employee::findOrFail($id);
         $data = $request->input('photo');
         if (!$data) {
@@ -1076,8 +1130,11 @@ class HRManagmentController extends Controller
     /* PUT /hr/employees/{id}   update the profile */
     public function updateEmployee(Request $request, int $id)
     {
+        $this->guardEmployee($request, $id);
         $e = Employee::findOrFail($id);
         $d = $request->validate($this->employeeRules());
+        // branch page / client login: the employee stays in this branch
+        if (($scope = $this->branchScope($request, $request->input('branch') === 'current')) !== null) $d['company_caid'] = $scope;
         if (array_key_exists('company_caid', $d) && (int) $d['company_caid'] !== (int) $e->company_caid) $this->checkCompany($request, $d['company_caid']);
         $e->update($this->notNullSafe('m_employee', $d, true));
         return response()->json(['message' => "{$e->full_name} updated."]);

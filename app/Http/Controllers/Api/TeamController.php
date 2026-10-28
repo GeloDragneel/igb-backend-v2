@@ -51,9 +51,23 @@ class TeamController extends SalesController
         $members = UserClientStaff::where('user_client_id', $this->addedByFor($request))
             ->orderBy('username')->get()->map(fn ($m) => $this->member($m));
 
-        $employees = DB::table('m_employee')->orderBy('last_name')->orderBy('first_name')
-            ->get(['id', 'last_name', 'first_name', 'middle_name'])
-            ->map(fn ($e) => ['id' => $e->id, 'name' => trim("{$e->last_name} {$e->first_name} " . ($e->middle_name ?? ''))]);
+        // employees of the branch at the top only (m_employee.company_caid = current branch)
+        // that have NO login yet (any m_user_client_staff row) · this team's own linked ones come along for Edit
+        $caid = (int) $this->caidFor($request);
+        $linked = $members->filter(fn ($m) => $m['employee_id'])->mapWithKeys(fn ($m) => [(int) $m['employee_id'] => $m['id']]);
+        $employees = DB::table('m_employee')
+            ->where(function ($q) use ($caid, $linked) {
+                $q->where(fn ($w) => $w->where('company_caid', $caid)->where('is_active', 1)
+                    ->whereNotExists(fn ($x) => $x->from('m_user_client_staff as S')->whereColumn('S.employee_id', 'm_employee.id')));
+                if ($linked->isNotEmpty()) $q->orWhereIn('id', $linked->keys()->all());
+            })
+            ->orderBy('last_name')->orderBy('first_name')
+            ->get(['id', 'last_name', 'first_name', 'middle_name', 'designation_id'])
+            ->map(fn ($e) => [
+                'id'        => $e->id,
+                'name'      => $this->empName($e),
+                'member_id' => $linked[(int) $e->id] ?? null,   // already has a login here
+            ]);
 
         $menu = Schema::hasTable('m_menu_data') ? DB::table('m_menu_data')->orderBy('id')->get(['id', 'root_name', 'module_name']) : collect();
         $modules = $menu->where('root_name', 0)->values()->map(fn ($p) => [
@@ -65,11 +79,30 @@ class TeamController extends SalesController
         return response()->json(['members' => $members, 'employees' => $employees, 'modules' => $modules]);
     }
 
+    private function empName($e): string
+    {
+        $mid = trim((string) ($e->middle_name ?? ''));
+        return trim(preg_replace('/\s+/', ' ', trim("{$e->last_name}, {$e->first_name}", ', ') . ($mid !== '' ? ' ' . mb_substr($mid, 0, 1) . '.' : '')));
+    }
+
+    /** the employee must be of the branch at the top, and not linked to another member */
+    private function checkEmployee(Request $request, ?int $empId, ?int $memberId = null): void
+    {
+        if (!$empId) return;
+        $caid = (int) $this->caidFor($request);
+        $own  = $memberId ? (int) UserClientStaff::whereKey($memberId)->value('employee_id') : 0;
+        abort_unless($own === $empId || DB::table('m_employee')->where('id', $empId)->where('company_caid', $caid)->exists(),
+            422, 'Pick an employee of this branch.');
+        $taken = UserClientStaff::where('employee_id', $empId)
+            ->when($memberId, fn ($q) => $q->where('id', '<>', $memberId))->value('username');
+        abort_if($taken, 422, "This employee already has a login ({$taken}).");
+    }
+
     private function rules(bool $creating): array
     {
         return [
             'employee_id'   => ['nullable', 'integer', 'exists:m_employee,id'],
-            'fullname'      => ['required', 'string', 'max:50'],
+            'fullname'      => ['nullable', 'string', 'max:50'],
             'username'      => ['required', 'string', 'max:50', 'regex:/^[A-Za-z0-9._@-]+$/'],
             'password'      => [$creating ? 'required' : 'nullable', 'string', 'min:4', 'max:50'],
             'is_active'     => ['boolean'],
@@ -85,7 +118,7 @@ class TeamController extends SalesController
         $name = $d['fullname'] ?? '';
         if (!empty($d['employee_id'])) {
             $e = DB::table('m_employee')->where('id', $d['employee_id'])->first(['last_name', 'first_name', 'middle_name']);
-            if ($e) $name = trim("{$e->last_name} {$e->first_name} " . ($e->middle_name ?? ''));
+            if ($e) $name = $this->empName($e);
         }
 
         $m->employee_id   = $d['employee_id'] ?? null;
@@ -104,6 +137,7 @@ class TeamController extends SalesController
     {
         $d = $request->validate($this->rules(true));
         abort_if($this->usernameTaken($d['username']), 422, 'Username already exists.');
+        $this->checkEmployee($request, $d['employee_id'] ?? null);
 
         $m = new UserClientStaff();
         $m->caid = $this->caidFor($request);
@@ -121,6 +155,7 @@ class TeamController extends SalesController
         $m = $this->mine($request, $id);
         $d = $request->validate($this->rules(false));
         abort_if($this->usernameTaken($d['username'], $m->id), 422, 'Username already exists.');
+        $this->checkEmployee($request, $d['employee_id'] ?? null, $m->id);
 
         $this->fill($m, $d, $request);
         $m->save();

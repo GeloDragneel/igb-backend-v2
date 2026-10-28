@@ -58,22 +58,40 @@ class MonitoringController extends Controller
         return null;
     }
 
-    /** logged-in employee id (must exist in m_employee) */
+    /**
+     * logged-in employee id (m_employee.id) – never the login id itself
+     *   Staff (m_user_staff): his employee record via comid (m_employee.com_id), like the login does
+     *   Client staff (m_user_client_staff): its employee_id
+     * Used for the list scope: Data Analyst → assigned_daid, Auditor → assigned_auid,
+     * Audit Supervisor / CEO / Supervisor / IT Officer → every client.
+     */
     protected function me(Request $request): ?int
     {
+        static $cache = [];
         $u = $request->user();
         if (!$u) return null;
-        $ids = [];
+        $key = get_class($u) . ':' . $u->id;
+        if (array_key_exists($key, $cache)) return $cache[$key];
+
+        $ok = fn ($id) => is_numeric($id) && (int) $id > 0 && DB::table('m_employee')->where('id', (int) $id)->exists() ? (int) $id : null;
+
+        // 1) an explicit employee id on the login
         foreach (['employee_id', 'emp_id', 'employeeid'] as $k) {
-            $v = $u->getAttribute($k);
-            if (is_numeric($v) && (int) $v > 0) $ids[] = (int) $v;
+            if ($id = $ok($u->getAttribute($k))) return $cache[$key] = $id;
         }
-        if (method_exists($u, 'employee') && ($e = $u->employee)) $ids[] = (int) $e->id;
-        $ids[] = (int) $u->id;
-        foreach (array_unique(array_filter($ids)) as $id) {
-            if (DB::table('m_employee')->where('id', $id)->exists()) return $id;
+        if (method_exists($u, 'employee')) {
+            try { if (($e = $u->employee) && ($id = $ok($e->id))) return $cache[$key] = $id; } catch (\Throwable $x) { /* no relation */ }
         }
-        return null;
+
+        // 2) staff login: m_user_staff.comid → m_employee.com_id (active first)
+        $com = (int) ($u->getAttribute('comid') ?? 0);
+        if ($com > 0) {
+            $q = DB::table('m_employee')->where('com_id', $com);
+            if ($active = $this->pick('m_employee', ['is_active', 'active'])) $q->orderByDesc($active);
+            if ($id = $ok($q->orderBy('id')->value('id'))) return $cache[$key] = $id;
+        }
+
+        return $cache[$key] = null;   // unknown → no assigned filter (sees all), never someone else's list
     }
 
     /** active client filter on m_client alias (old: D.Active = 1 AND D.StatusID IN (2,9,11)) */
@@ -518,10 +536,12 @@ class MonitoringController extends Controller
     const SUPERVISOR_USER_TYPES = [10];                             // old qry_user UserTypeID IN (10)
     const NO_DATA_COLOR = '#e8eaed';
 
+    /** role of the login: the employee's designation (3 = Data Analyst, 5 = Auditor, 10 = Audit Supervisor …), else user_type_id */
     private function designation(Request $request): int
     {
         $emp = $this->me($request);
-        return $emp ? (int) DB::table('m_employee')->where('id', $emp)->value('designation_id') : 0;
+        $des = $emp ? (int) DB::table('m_employee')->where('id', $emp)->value('designation_id') : 0;
+        return $des > 0 ? $des : (int) ($request->user()?->getAttribute('user_type_id') ?? 0);
     }
 
     /** old tbl2_declared_month_settings: a row for CAID + month = that month is locked */
