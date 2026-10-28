@@ -216,6 +216,10 @@ class BirReturnController extends ReportController
     }
     private function periodLabel(string $raw): string
     {
+        // annual returns (1701 / 1702RT / 1702EX / 1604C / 1604E): FY + year-ended MM + YYYY
+        if (preg_match('/^FY(\d{2})(\d{4})$/', $raw, $m)) {
+            return $m[1] === '12' ? "Year {$m[2]}" : "Year ended {$m[1]}/{$m[2]}";
+        }
         // 0605: MMDDYYYYHHMMSS
         if (preg_match('/^(\d{2})(\d{2})(\d{4})(\d{2})(\d{2})(\d{2})$/', $raw, $m)) {
             return "{$m[1]}/{$m[2]}/{$m[3]} {$m[4]}:{$m[5]}:{$m[6]}";
@@ -307,12 +311,39 @@ class BirReturnController extends ReportController
         }
 
         return response()->json([
-            'profile' => $p,
-            'source'  => $source,
+            'profile'    => $p,
+            'compliance' => $this->clientCompliance($account),   // returns ticked in Client → Classification & Compliance (null = not set up)
+            'source'     => $source,
             'tin'     => $tin9 . $branch,
             'name'    => $h['trade_name'] ?? '',
             'address' => $h['address'] ?? '',
         ]);
+    }
+
+    /**
+     * compliance codes of the client of this account: m_client.compliance_ids → m_compliance names → ['0605', '1601EQ', '2550M', …]
+     * null when the tables / columns don't exist (the page then shows every return)
+     */
+    private function clientCompliance($account): ?array
+    {
+        if (!$account || !Schema::hasTable('m_client')) return null;
+        $col = $this->col('m_client', ['compliance_ids', 'compliance_id']);
+        $table = collect(['m_compliance', 'm_compliances'])->first(fn ($t) => Schema::hasTable($t));
+        $name = $table ? $this->col($table, ['compliance', 'name', 'description']) : null;
+        if (!$col || !$name) return null;
+
+        $clientNum = DB::table('m_client_account')->where('id', $account->id)->value('client_num');
+        if (!$clientNum) return [];
+        $raw = (string) DB::table('m_client')->where('client_num', $clientNum)->value($col);
+        $ids = array_values(array_unique(array_filter(array_map('intval', preg_split('/[^0-9]+/', $raw)))));
+        if (!$ids) return [];
+
+        return DB::table($table)->whereIn('id', $ids)->pluck($name)
+            ->map(function ($n) {
+                $n = strtoupper(preg_replace('/[^0-9A-Za-z]/', '', (string) $n));            // "1601-EQ" → 1601EQ
+                return preg_match('/\d{4}(?:RT|EX|EQ|[A-Z])?/', $n, $m) ? $m[0] : $n;   // "BIR FORM 2550Q" → 2550Q
+            })
+            ->filter()->unique()->values()->all();
     }
 
     /* GET /api/bir/atc-2551q */
@@ -327,15 +358,21 @@ class BirReturnController extends ReportController
     public function autofill(Request $request)
     {
         $d = $request->validate([
-            'type'   => ['required', 'in:vat_payable,bir2307,sum_atc,2550m,2550q,2551q,1601c,remit0619e'],
+            'type'   => ['required', 'in:vat_payable,bir2307,sum_atc,2550m,2550q,2551q,1601c,remit0619e,income,ewt_months,saved_months'],
             'from'   => ['nullable', 'date_format:Y-m'],
             'to'     => ['nullable', 'date_format:Y-m'],
             'atc_id' => ['nullable', 'integer'],
             'months' => ['nullable', 'string', 'max:100'],
+            'form'   => ['nullable', 'regex:/^[0-9A-Za-z]{3,15}$/'],
+            'year'   => ['nullable', 'digits:4'],
+            'keys'   => ['nullable', 'string', 'max:500'],
         ]);
 
         if ($d['type'] === 'remit0619e') {
             return response()->json($this->remit0619e($request, (string) ($d['months'] ?? '')));
+        }
+        if ($d['type'] === 'saved_months') {
+            return response()->json($this->savedMonths($request, (string) ($d['form'] ?? ''), (int) ($d['year'] ?? 0), (string) ($d['keys'] ?? '')));
         }
 
         [$ids] = $this->journalScope($request, 'all');   // old: MAIN = every branch
@@ -351,6 +388,8 @@ class BirReturnController extends ReportController
             '2550q'       => $this->vatData($ids, $from, $to, true),
             '2551q'       => $this->percentageData($ids, $from, $to, $d['atc_id'] ?? null),
             '1601c'       => ['total_comp' => round((float) $this->ap($ids, $from, $to)->where('account_code', '69400')->sum(DB::raw($this->net())), 2)],
+            'income'      => $this->incomeData($ids, $from, $to),
+            'ewt_months'  => ['values' => collect($this->monthsOf($from, $to))->mapWithKeys(fn ($m) => [$m => round($this->ewt2307($ids, $m, $m), 2)])->all()],
         });
     }
 
@@ -504,6 +543,51 @@ class BirReturnController extends ReportController
         return ['values' => $out];
     }
 
+    /**
+     * income tax returns (1701Q / 1701 / 1702Q / 1702RT / 1702EX): amounts from the books
+     *   sales = posted sales (net of VAT) · cost = accounts 5… (Receive Inventory + Purchases) · expenses = accounts 6… and 8…
+     *   cwt = creditable tax withheld by customers (2307 income tax on sales), by its 2307 declared month
+     */
+    private function incomeData(array $ids, string $from, string $to): array
+    {
+        $t = 't_sales_invoice_detail';
+        $rate = $this->col($t, ['ex_rate']) ? " * COALESCE(NULLIF({$t}.ex_rate,0),1)" : '';
+        $sales = (float) $this->sales($ids, $from, $to)->sum(DB::raw('(' . $this->net("{$t}.") . "){$rate}"));
+
+        $pe = 't_purchase_expense_detail';
+        $cost = (float) $this->grn($ids, $from, $to)->where('d.account_code', 'like', '5%')->sum(DB::raw($this->net('d.')))
+              + (float) $this->ap($ids, $from, $to)->where("{$pe}.account_code", 'like', '5%')->sum(DB::raw($this->net("{$pe}.")));
+        $expenses = (float) $this->ap($ids, $from, $to)
+            ->where(fn ($q) => $q->where("{$pe}.account_code", 'like', '6%')->orWhere("{$pe}.account_code", 'like', '8%'))
+            ->sum(DB::raw($this->net("{$pe}.")));
+
+        $cwtMonth = $this->col('t_sales_invoice_master', ['2307_it_declared_month', 'declared_month']);
+        $cwt = (float) SalesInvoiceMaster::whereIn('added_by', $ids)->where('invoice_status_id', '<>', 5)->where('trans_type', 'posted')
+            ->where('2307_it', '>', 0)->whereBetween($cwtMonth, [$from, $to])->sum('2307_it');
+
+        return ['sales' => round($sales, 2), 'cost' => round($cost, 2), 'expenses' => round($expenses, 2), 'cwt' => round($cwt, 2)];
+    }
+
+    /**
+     * values of some keys from this client's saved monthly returns of one year (e.g. 1601Cv2018 → 1604-C)
+     * → ['values' => ['01' => [key => value], …]]  (a month without a saved file is left out)
+     */
+    private function savedMonths(Request $request, string $form, int $year, string $keys): array
+    {
+        if (!$form || $year < 2000) return ['values' => []];
+        [$tin9, $branch] = $this->tinParts($request);
+        $want = array_values(array_filter(array_map('trim', explode(',', $keys))));
+        $out = [];
+        for ($m = 1; $m <= 12; $m++) {
+            $mm = str_pad((string) $m, 2, '0', STR_PAD_LEFT);
+            $path = $this->ebirPath('savefile') . "/{$tin9}{$branch}-{$form}-{$mm}{$year}.xml";
+            if (!is_file($path)) continue;
+            $data = $this->parseSaveFile($path);
+            $out[$mm] = array_intersect_key($data, array_flip($want));
+        }
+        return ['values' => $out];
+    }
+
     /* =====================================================================
        FILE & SUBMITTED → Expenses bill · PAID → Pay Bill (t_pvoucher)   (ENTRY FOR BIR RETURN)
          t_bir_return_filing   one row per filed save file
@@ -599,6 +683,10 @@ class BirReturnController extends ReportController
     private function periodRange(string $raw): array
     {
         $ym = fn (int $y, int $m) => sprintf('%04d-%02d', $y, $m);
+        if (preg_match('/^FY(\d{2})(\d{4})$/', $raw, $m)) {                                                                                      // annual: 12 months up to year end
+            $end = Carbon::create((int) $m[2], (int) $m[1], 1);
+            return [$end->copy()->subMonths(11)->format('Y-m'), $end->format('Y-m')];
+        }
         if (preg_match('/^(\d{2})(\d{2})(\d{4})(\d{6})$/', $raw, $m)) return [$ym((int) $m[3], (int) $m[1]), $ym((int) $m[3], (int) $m[1])];   // 0605
         if (preg_match('/^(\d{2})(\d{4})$/', $raw, $m)) return [$ym((int) $m[2], (int) $m[1]), $ym((int) $m[2], (int) $m[1])];                  // monthly
         if (preg_match('/^(\d{4})Q(\d)$/', $raw, $m)) {                                                                                          // 1601EQ (calendar)
@@ -766,6 +854,38 @@ class BirReturnController extends ReportController
                 $line('cr', $acc(['/compensation.*payable/i', '/withholding.*payable/i']), 'Withholding Tax Payable - Compensation', $due + $pen, true),
             ];
         }
+        // income tax returns: DR income tax expense · CR creditable withholding tax / prepaid income tax · CR income tax payable (to pay)
+        $itx = [
+            '1701Q'  => ['frm1701q:', ['s3PrevCwt', 's3Cwt']],
+            '1701'   => ['frm1701:', ['cCwtQ13', 'cCwtQ4', 'cComp']],
+            '1702Q'  => ['frm1702q:', ['cPrevCwt', 'cCwt']],
+            '1702RT' => ['frm1702rt:', ['cCwtQ13', 'cCwtQ4']],
+        ];
+        if (isset($itx[$form])) {
+            [$X, $cwtKeys] = $itx[$form];
+            $due = $num("{$X}taxDue");
+            $credits = $num("{$X}credits");
+            $cwt = array_sum(array_map(fn ($k) => $num($X . $k), $cwtKeys));
+            $pen = $num("{$X}penalties");
+            $pay = $num("{$X}payable");
+            return [
+                $line('dr', $acc(['/^income tax expense/i', '/provision for income tax/i', '/income tax.*current/i', '/^income tax$/i'], ['/payable/i', '/deferred/i']), 'Income Tax Expense', $due),
+                ...$penalty($pen),
+                $line('cr', $acc(['/creditable withholding tax/i', '/^cwt/i', '/withholding tax.*receivable/i', '/prepaid.*withholding/i'], ['/payable/i', '/vat/i']), 'Creditable Withholding Tax', $cwt),
+                $line('cr', $acc(['/prepaid income tax/i', '/advance.*income tax/i', '/income tax.*prepaid/i']), 'Prepaid Income Tax', $credits - $cwt),
+                $line('cr', $acc(['/income tax payable/i', '/income tax.*payable/i']), 'Income Tax Payable', $pay + $pen, true),
+            ];
+        }
+        if ($form === '2200M') {
+            $X = 'frm2200m:';
+            $pen = $num("{$X}penalties");
+            return [
+                $line('dr', $acc(['/^excise tax/i', '/excise tax expense/i'], ['/payable/i']), 'Excise Tax', $num("{$X}taxDue")), ...$penalty($pen),
+                $line('cr', $acc(['/advance.*excise/i', '/excise.*paid/i']), 'Excise tax paid previously', $num("{$X}credits")),
+                $line('cr', $acc(['/excise tax payable/i', '/excise.*payable/i']), 'Excise Tax Payable', $num("{$X}payable") + $pen, true),
+            ];
+        }
+
         return [$line('dr', '', 'Tax', 0), $line('cr', '', 'Tax Payable', 0, true)];
     }
 
@@ -811,7 +931,7 @@ class BirReturnController extends ReportController
             $l['kind'] = match (true) {
                 str_contains($n, 'payable'), str_contains($n, 'output vat'), $n === 'withholding tax',
                 str_contains($n, 'compensation') && !str_contains($n, 'previously') => 2,
-                str_contains($n, 'penalt'), $n === 'percentage tax' => 6,
+                str_contains($n, 'penalt'), $n === 'percentage tax', $n === 'income tax expense', $n === 'excise tax' => 6,
                 default => 1,
             };
         }
@@ -919,7 +1039,7 @@ class BirReturnController extends ReportController
     /** S3 folder / short code of a form: 2550Qv2024 → 2550Q, 2551Qv2018 → 2551Q */
     private function birFolder(string $form): string
     {
-        foreach (['0605', '0619E', '1601EQ', '1601C', '2550M', '2550Q', '2551Q'] as $f) {
+        foreach (['0605', '0619E', '1601EQ', '1601C', '1604C', '1604E', '1701Q', '1701', '1702Q', '1702RT', '1702EX', '2200M', '2550M', '2550Q', '2551Q'] as $f) {
             if (str_starts_with(strtoupper($form), $f)) return $f;
         }
         return preg_replace('/[^0-9A-Za-z]/', '', $form) ?: 'Other';
