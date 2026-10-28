@@ -39,6 +39,8 @@ use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\AiAssistantController; 
 use App\Http\Controllers\Api\ArchiveController;
 use App\Http\Controllers\Api\BirReturnSummaryController;
+use App\Http\Controllers\Api\AccountPasswordController;
+
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -757,6 +759,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/reports/bir-return-summary/clients', [BirReturnSummaryController::class, 'clients']);
     Route::get('/reports/bir-return-summary', [BirReturnSummaryController::class, 'show']);
     Route::put('/reports/bir-return-summary', [BirReturnSummaryController::class, 'save']);
+    
+    Route::put('/me/password', [AccountPasswordController::class, 'update']);
 
     require __DIR__ . '/api_messenger.php';
 });
