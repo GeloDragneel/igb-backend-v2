@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Http\Controllers\Api\BranchController;
+use App\Http\Controllers\Api\SocialAuthController;
 use App\Models\Client;
 use App\Models\ClientAccount;
 use App\Models\Employee;
@@ -23,6 +24,17 @@ class AuthController extends Controller
     /** POST /api/login  { "username": "...", "password": "..." } */
     public function login(Request $request)
     {
+        // Google / Facebook: the Login page sends the one-time code from /auth/{provider}/callback as the password
+        if ($request->input('username') === SocialAuthController::USERNAME) {
+            $found = SocialAuthController::takeCode((string) $request->input('password'));
+            if (!$found) return response()->json(['message' => 'That Google / Facebook sign-in expired or was already used. Try again.'], 422);
+            [$user, $type] = $found;
+            return response()->json([
+                'token' => $user->createToken('web-' . $type)->plainTextToken,
+                'user'  => $this->userPayload($user, $type),
+            ]);
+        }
+
         $data = $request->validate([
             'username' => ['required', 'string', 'max:50'],
             'password' => ['required', 'string', 'max:255'],

@@ -40,12 +40,29 @@ use App\Http\Controllers\Api\AiAssistantController;
 use App\Http\Controllers\Api\ArchiveController;
 use App\Http\Controllers\Api\BirReturnSummaryController;
 use App\Http\Controllers\Api\AccountPasswordController;
-
+use App\Http\Controllers\Api\SocialAuthController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
 
+// Google / Facebook – public (no login needed)
+Route::get('/auth/{provider}/url', [SocialAuthController::class, 'loginUrl'])
+    ->where('provider', 'google|facebook')->middleware('throttle:20,1');
+Route::get('/auth/{provider}/callback', [SocialAuthController::class, 'callback'])
+    ->where('provider', 'google|facebook');
+Route::get('/auth/signup/{token}', [SocialAuthController::class, 'signupInfo'])
+    ->middleware('throttle:20,1');
+Route::post('/auth/signup', [SocialAuthController::class, 'signup'])
+->middleware('throttle:5,1');
+
 Route::middleware('auth:sanctum')->group(function () {
+
+    Route::get('/auth/social', [SocialAuthController::class, 'linked']);
+    Route::get('/auth/{provider}/link-url', [SocialAuthController::class, 'linkUrl'])->where('provider', 'google|facebook');
+    Route::delete('/auth/social/{provider}', [SocialAuthController::class, 'unlink'])->where('provider', 'google|facebook');
+    Route::get('/trial', [SocialAuthController::class, 'trial']);
+    Route::put('/clients/{num}/trial', [SocialAuthController::class, 'setTrial']);
+
     Route::get('/me', [AuthController::class, 'me']);
     Route::post('/logout', [AuthController::class, 'logout']);
     Route::get('/branches', [BranchController::class, 'index']);
