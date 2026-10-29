@@ -41,6 +41,8 @@ use App\Http\Controllers\Api\ArchiveController;
 use App\Http\Controllers\Api\BirReturnSummaryController;
 use App\Http\Controllers\Api\AccountPasswordController;
 use App\Http\Controllers\Api\SocialAuthController;
+use App\Http\Controllers\Api\CalendarController;
+
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -784,6 +786,16 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::put('/reports/bir-return-summary', [BirReturnSummaryController::class, 'save']);
 
     Route::put('/me/password', [AccountPasswordController::class, 'update']);
+
+    Route::get('calendar', [CalendarController::class, 'index']);
+    Route::get('calendar/today', [CalendarController::class, 'today']);
+    Route::get('calendar/employees', [CalendarController::class, 'employees']);
+    Route::post('calendar/events', [CalendarController::class, 'store']);
+    Route::put('calendar/events/{id}', [CalendarController::class, 'update'])->whereNumber('id');
+    Route::patch('calendar/events/{id}/done', [CalendarController::class, 'done'])->whereNumber('id');
+    Route::delete('calendar/events/{id}', [CalendarController::class, 'destroy'])->whereNumber('id');
+    Route::get('calendar/access', [CalendarController::class, 'access']);
+    Route::put('calendar/access/{employeeId}', [CalendarController::class, 'saveAccess'])->whereNumber('employeeId');
 
     require __DIR__ . '/api_messenger.php';
 });
