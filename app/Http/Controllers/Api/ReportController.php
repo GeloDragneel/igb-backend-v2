@@ -3295,30 +3295,121 @@ class ReportController extends SalesController
         ]));
     }
 
+    /* ======================= Income Tax Summary → saved adjustments ======================= */
+ 
     public function incomeTaxAdjustments(Request $request)
     {
         $d = $request->validate(['from' => ['required', 'date_format:Y-m'], 'to' => ['required', 'date_format:Y-m']]);
         [, $account] = $this->itsScope($request, 'all');
         $me = (int) $request->user()->id;
-
+        $myType = class_basename($request->user());
+ 
         $fmt = fn ($t) => $t ? Carbon::parse($t)->format('M d Y - h:iA') : '—';
-
+ 
         $rows = DB::table('t_income_statement_adjustment')
             ->where('caid', optional($account)->id)
             ->where('declared_month_from', $d['from'])->where('declared_month_to', $d['to'])
             ->orderByDesc('version')->orderByDesc('id')->get();
-
+ 
+        // name per login (looked up once per type + id)
+        $names = [];
+        foreach ($rows as $r) {
+            $k = "{$r->user_type}:{$r->user_id}";
+            if (!isset($names[$k])) $names[$k] = $this->itsSaverName($r->user_type, $r->user_id);
+        }
+ 
         return response()->json($rows->map(fn ($r) => [
             'id'           => $r->id,
             'version'      => (int) $r->version,
-            'employee'     => $r->user_name ?: '—',
-            'mine'         => (int) $r->user_id === $me,
+            'employee'     => $names["{$r->user_type}:{$r->user_id}"] ?: (trim((string) $r->user_name) ?: '—'),
+            'mine'         => (int) $r->user_id === $me && $r->user_type === $myType,
             'date_added'   => $fmt($r->created_at),
             'date_updated' => $r->updated_at && $r->updated_at !== $r->created_at ? $fmt($r->updated_at) : '—',
-            'data'         => json_decode($r->data, true),
+            'from'         => $d['from'],
+            'to'           => $d['to'],
+            'data'         => $this->itsDecode($r->data),
         ]));
     }
+        /**
+     * name of whoever saved an adjustment (old-system rows have no user_name)
+     * staff login → m_employee (via comid) "LAST, FIRST M." · else the login's own name / username
+     */
+    private function itsUserName($id): string
+    {
+        $id = (int) $id;
+        if (!$id) return '—';
 
+        $emp = function ($e) {
+            if (!$e) return '';
+            $mi = trim((string) ($e->middle_name ?? ''));
+            $first = trim((string) ($e->first_name ?? ''));
+            $last = trim((string) ($e->last_name ?? ''));
+            return trim(($last !== '' ? "{$last}, " : '') . $first . ($mi !== '' ? ' ' . mb_substr($mi, 0, 1) . '.' : ''), ', ');
+        };
+        $own = function ($row) {
+            if (!$row) return '';
+            foreach (['fullname', 'full_name', 'name', 'username', 'email'] as $k) {
+                if (!empty($row->{$k})) return trim((string) $row->{$k});
+            }
+            return '';
+        };
+
+        // staff (the ones who prepare the income tax summary)
+        if (Schema::hasTable('m_user_staff') && ($s = DB::table('m_user_staff')->where('id', $id)->first())) {
+            $com = (int) ($s->comid ?? 0);
+            if ($com && Schema::hasTable('m_employee')) {
+                $e = DB::table('m_employee')->where('com_id', $com)->orderByDesc('id')->first(['last_name', 'first_name', 'middle_name']);
+                if ($name = $emp($e)) return $name;
+            }
+            if ($name = $own($s)) return $name;
+        }
+        // client login / client staff
+        foreach (['m_user_client', 'm_user_client_staff'] as $t) {
+            if (Schema::hasTable($t) && ($name = $own(DB::table($t)->where('id', $id)->first()))) return $name;
+        }
+        return "User #{$id}";
+    }
+    // saved adjustment JSON → array (handles BOM, double-encoded strings, old-system saves)
+    private function itsDecode($raw)
+    {
+        $v = $raw;
+        for ($i = 0; $i < 3 && is_string($v); $i++) {
+            $t = trim(preg_replace('/^\xEF\xBB\xBF/', '', $v));
+            if ($t === '') return null;
+            $j = json_decode($t, true);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                $j = json_decode(mb_convert_encoding($t, 'UTF-8', 'UTF-8, ISO-8859-1'), true, 512, JSON_INVALID_UTF8_SUBSTITUTE);
+            }
+            if ($j === null) return null;
+            $v = $j;
+        }
+        return $v;
+    }
+    /**
+     * who saved an adjustment
+     * UserClient → the Client · UserClientStaff → its Employee · UserStaff → the Employee (via comid)
+    */
+    private function itsSaverName(?string $type, $id): string
+    {
+        $full = fn ($p) => $p ? trim(preg_replace('/\s+/', ' ', "{$p->last_name} {$p->first_name} {$p->middle_name}")) : '';
+        $id = (int) $id;
+        if (!$id || !$type) return '';
+ 
+        if ($type === 'UserClient') {
+            $u = UserClient::find($id);
+            $account = $u?->clientAccount;
+            return $full($account ? \App\Models\Client::where('client_num', $account->client_num)->first() : null) ?: (string) ($u->username ?? '');
+        }
+        if ($type === 'UserClientStaff') {
+            $u = \App\Models\UserClientStaff::find($id);
+            return $full($u?->employee) ?: (string) ($u->fullname ?? $u->username ?? '');
+        }
+        if ($type === 'UserStaff') {
+            $u = \App\Models\UserStaff::find($id);
+            return $full($u ? \App\Models\Employee::where('com_id', $u->comid)->first() : null) ?: (string) ($u->username ?? '');
+        }
+        return '';
+    }
     public function saveIncomeTaxAdjustment(Request $request)
     {
         $d = $request->validate([
@@ -3330,31 +3421,31 @@ class ReportController extends SalesController
         [, $account] = $this->itsScope($request, 'all');
         $caid = optional($account)->id;
         abort_unless($caid, 422, 'No client account is selected.');
-
+ 
         $user = $request->user();
-        $u = $user->getAttributes();
-        $userName = trim((string) ($u['name'] ?? $u['full_name'] ?? $u['username'] ?? $u['email'] ?? "User #{$user->id}"));
-
+        $userType = class_basename($user);   // UserStaff | UserClient | UserClientStaff
+        $userName = mb_substr($this->itsSaverName($userType, $user->id) ?: (string) $user->username, 0, 100);
+ 
         $base = DB::table('t_income_statement_adjustment')
             ->where('caid', $caid)->where('declared_month_from', $d['from'])->where('declared_month_to', $d['to']);
-        $mine = (clone $base)->where('user_id', $user->id)->orderByDesc('version')->first();
+        $mine = (clone $base)->where('user_id', $user->id)->where('user_type', $userType)->orderByDesc('version')->first();
         $json = json_encode($d['data']);
-
+ 
         if ($mine && $d['mode'] === 'continue') {
-            DB::table('t_income_statement_adjustment')->where('id', $mine->id)->update(['data' => $json, 'updated_at' => now()]);
+            DB::table('t_income_statement_adjustment')->where('id', $mine->id)->update(['data' => $json, 'user_name' => $userName, 'updated_at' => now()]);
             $version = (int) $mine->version;
         } else {
             $version = (int) (clone $base)->max('version') + 1;
             DB::table('t_income_statement_adjustment')->insert([
                 'caid' => $caid, 'declared_month_from' => $d['from'], 'declared_month_to' => $d['to'],
-                'user_id' => $user->id, 'user_name' => $userName, 'version' => $version,
+                'user_id' => $user->id, 'user_type' => $userType, 'user_name' => $userName, 'version' => $version,
                 'data' => $json, 'created_at' => now(), 'updated_at' => now(),
             ]);
         }
-
+ 
         return response()->json(['version' => $version]);
     }
-        /* ======================= Report Generator (old Report_Generator.php) ======================= */
+    /* ======================= Report Generator (old Report_Generator.php) ======================= */
 
     private const RG_REPORTS = [
         'P'               => 'Purchase Summary',
