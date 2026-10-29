@@ -349,6 +349,16 @@ class PrintController extends ReportController
         ]);
         $format = $d['format'] ?? 'xlsx';
 
+        // Sales / Purchase Summary as PDF → the BIR RELIEF printout (Summary List of Sales / Purchases), per taxable month
+        if ($format === 'pdf' && in_array($d['type'], ['P', 'S'], true)) {
+            $ss = $this->reliefSheet($request, $d['type']);
+            $pdf = $this->toPdf($ss);
+            $who = $this->addedByFor($request) ?? 'report';
+            $base = $d['type'] === 'S' ? 'SummaryListOfSales' : 'SummaryListOfPurchases';
+            return response()->download($pdf, "{$base}-{$who}.pdf", ['Content-Type' => 'application/pdf'], 'inline')
+                ->deleteFileAfterSend(true);
+        }
+
         // same lines and totals as the screen (ReportController::esubReport validates from/to/year)
         $v = $this->esubReport($request)->getData(true);
         $type = $d['type'];
@@ -422,7 +432,180 @@ class PrintController extends ReportController
             'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         ])->deleteFileAfterSend(true);
     }
+    private function reliefSheet(Request $request, string $type): Spreadsheet
+    {
+        $isSales = $type === 'S';
+        $from = (string) $request->input('from');
+        $to = (string) ($request->input('to') ?: $from);
+        if ($to < $from) [$from, $to] = [$to, $from];
 
+        // month by month (same numbers as the screen for that month)
+        $months = [];
+        $company = null;
+        for ($m = \Carbon\Carbon::createFromFormat('Y-m-d', "{$from}-01"); $m->format('Y-m') <= $to; $m->addMonth()) {
+            $ym = $m->format('Y-m');
+            $one = $this->esubReport($request->duplicate(array_merge($request->query(), ['from' => $ym, 'to' => $ym, '_one_month' => 1])))->getData(true);
+            $company ??= $one['company'] ?? [];
+            // one line per TIN + name (RELIEF lists each TIN once a month)
+            $lines = [];
+            foreach ($one['rows'] ?? [] as $r) {
+                $k = ($r['tin'] ?? '') . '|' . mb_strtoupper(trim((string) ($r['name'] ?? '')));
+                $lines[$k] ??= ['tin' => (string) ($r['tin'] ?? ''), 'name' => (string) ($r['name'] ?? ''),
+                    'addr' => trim(($r['address'] ?? '') . ' ' . ($r['city'] ?? '')), 'net' => 0.0, 'vat' => 0.0, 'exempt' => 0.0, 'zero' => 0.0];
+                foreach (['net', 'vat', 'exempt', 'zero'] as $f) $lines[$k][$f] += (float) ($r[$f] ?? 0);
+            }
+            if ($lines) $months[$ym] = array_values($lines);
+        }
+        $company ??= [];
+
+        $ss = new Spreadsheet();
+        $ss->getProperties()->setCustomProperty('pdfKeepWidths', true);   // pdfLayout: don't make these columns narrower
+        $sh = $ss->getActiveSheet();
+        $sh->setTitle($isSales ? 'Summary List of Sales' : 'Summary List of Purchases');
+        $ss->getDefaultStyle()->getFont()->setName('Arial')->setSize(9);
+
+        $mono = ['font' => ['name' => 'Courier New', 'size' => 8]];
+        $line = fn (string $rng, string $where = 'bottom', string $style = Border::BORDER_THIN) =>
+            $sh->getStyle($rng)->getBorders()->{'get' . ucfirst($where)}()->setBorderStyle($style);
+        $text = fn (string $cell, $v) => $sh->setCellValueExplicit($cell, (string) $v, DataType::TYPE_STRING);
+        $tinText = function (string $t): string {
+            $d = preg_replace('/\D/', '', $t);
+            if (strlen($d) < 9) return '-     -';
+            return substr($d, 0, 3) . '-' . substr($d, 3, 3) . '-' . substr($d, 6, 3);
+        };
+
+        // ---------- header ----------
+        $r = 1;
+        foreach (['Bureau of Internal Revenue', 'Reconciliation of Listings for Enforcement System',
+                     $isSales ? 'Summary List of Sales' : 'Summary List of Purchases'] as $t) {
+            $text("A{$r}", $t);
+            $r++;
+        }
+        $text("A{$r}", 'Report Date : ' . now('Asia/Manila')->format('d F Y'));
+        $sh->getStyle("A1:A{$r}")->getFont()->setSize(10);
+        $line("A{$r}:H{$r}");
+        $r += 2;
+
+        $ownerTin = preg_replace('/\D/', '', (string) ($company['tin'] ?? ''));
+        $addr = (string) ($company['address'] ?? '');
+        [$addr1, $addr2] = array_pad(array_map('trim', explode(',', $addr, 2)), 2, '');
+
+        // label in A, value in B:D (merged) – columns keep their widths in the PDF, so nothing runs over
+        $owner = function (int $row, string $label, string $value, bool $strong = false) use ($sh, $text) {
+            $text("A{$row}", $label);
+            $text("B{$row}", $value);
+            $sh->mergeCells("B{$row}:D{$row}");
+            if ($strong) $sh->getStyle("B{$row}")->getFont()->setBold(true)->setItalic(true);
+        };
+        $owner($r, 'T.I.N. of Owner :', $tinText($ownerTin), true);
+        $r++;
+        $owner($r, 'Registered Name :', mb_strtoupper((string) ($company['name'] ?? '')));
+        $text("E{$r}", "Owner's Address:");
+        $sh->getStyle("E{$r}")->getAlignment()->setHorizontal('right');
+        $text("F{$r}", mb_strtoupper($addr1));
+        $sh->mergeCells("F{$r}:H{$r}");
+        $sh->getStyle("F{$r}")->getAlignment()->setHorizontal('left');
+        $r++;
+        $owner($r, 'Trade Name :', mb_strtoupper((string) ($company['trade_name'] ?? '')));
+        $text("F{$r}", mb_strtoupper($addr2));
+        $sh->mergeCells("F{$r}:H{$r}");
+        $sh->getStyle("F{$r}")->getAlignment()->setHorizontal('left');
+        $sh->getStyle('A' . ($r - 2) . ":H{$r}")->getFont()->setSize(10);
+        $line("A{$r}:H{$r}");
+        $r += 2;
+
+        // ---------- columns ----------
+        $caps = ['T.I.N.', 'Registered Name', $isSales ? 'Total Sales' : 'Total Purchases', 'Zero Rated', 'Exempt',
+            'Gross Taxable', 'Taxable Net', $isSales ? 'Output Tax' : 'Input Tax'];
+        $nums = fn (array $l) => [$l['net'] + $l['zero'] + $l['exempt'], $l['zero'], $l['exempt'], $l['net'] + $l['vat'], $l['net'], $l['vat']];
+        $putNums = function (int $row, array $vals) use ($sh) {
+            foreach (array_values($vals) as $i => $v) $sh->setCellValue(Coordinate::stringFromColumnIndex($i + 3) . $row, round($v, 2));
+        };
+        $numCells = [];                                    // only these get the number format / right alignment
+        $grand = array_fill(0, 6, 0.0);
+        $MON = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+        if (!$months) {
+            $text("A{$r}", 'No transactions for this period.');
+            $r++;
+        }
+
+        foreach ($months as $ym => $lines) {
+            // Taxable Month
+            $text("A{$r}", 'Taxable Month');
+            $text("B{$r}", $MON[(int) substr($ym, 5, 2) - 1] . ', ' . substr($ym, 0, 4));
+            $sh->getStyle("A{$r}")->getFont()->setBold(true);
+            $sh->getStyle("B{$r}")->getFont()->setItalic(true);
+            $sh->getStyle("A{$r}:B{$r}")->getFont()->setSize(10);
+            $r++;
+
+            // column captions (lines above and below)
+            foreach ($caps as $i => $t) $text(Coordinate::stringFromColumnIndex($i + 1) . $r, $t);
+            $sh->getStyle("A{$r}:H{$r}")->getFont()->setBold(true);
+            $sh->getStyle("A{$r}")->getAlignment()->setHorizontal('center');
+            $sh->getStyle("C{$r}:H{$r}")->getAlignment()->setHorizontal('right')->setIndent(1);
+            $line("A{$r}:H{$r}", 'top');
+            $line("A{$r}:H{$r}");
+            $r++;
+
+            $sum = array_fill(0, 6, 0.0);
+            foreach ($lines as $l) {
+                $vals = $nums($l);
+                $text("A{$r}", $tinText($l['tin']));
+                $text("B{$r}", mb_strtoupper($l['name']));
+                $sh->getStyle("B{$r}")->getAlignment()->setWrapText(true)->setVertical('top');
+                $sh->getStyle("A{$r}:H{$r}")->getAlignment()->setVertical('top');
+                $putNums($r, $vals);
+                $numCells[] = "C{$r}:H{$r}";
+                $sh->getStyle("A{$r}:H{$r}")->applyFromArray($mono);
+                $sh->getStyle("A{$r}")->getAlignment()->setHorizontal('center');
+                $r++;
+                if ($l['addr'] !== '') {
+                    $text("B{$r}", mb_strtoupper($l['addr']));
+                    $sh->getStyle("B{$r}")->applyFromArray($mono);
+                    $r++;
+                }
+                foreach ($vals as $i => $v) $sum[$i] += $v;
+            }
+
+            // Total for the Taxable Month
+            $text("B{$r}", 'Total for the Taxable Month');
+            $putNums($r, $sum);
+            $numCells[] = "C{$r}:H{$r}";
+            $sh->getStyle("B{$r}")->getFont()->setBold(true)->setSize(10);
+            $sh->getStyle("B{$r}")->getAlignment()->setHorizontal('right');
+            $sh->getStyle("C{$r}:H{$r}")->applyFromArray($mono);
+            $line("A{$r}:H{$r}", 'top');
+            $r += 2;
+            foreach ($sum as $i => $v) $grand[$i] += $v;
+        }
+
+        // Report Totals (double lines)
+        $text("B{$r}", 'Report Totals');
+        $putNums($r, $grand);
+        $numCells[] = "C{$r}:H{$r}";
+        $sh->getStyle("B{$r}")->getFont()->setBold(true)->setSize(11);
+        $sh->getStyle("B{$r}")->getAlignment()->setHorizontal('right');
+        $sh->getStyle("C{$r}:H{$r}")->applyFromArray($mono);
+        $line("A{$r}:H{$r}", 'top', Border::BORDER_DOUBLE);
+        $line("A{$r}:H{$r}", 'bottom', Border::BORDER_DOUBLE);
+
+        // numbers: 1,234.56 / -1,234.56, right aligned
+        foreach ($numCells as $rng) {
+            $sh->getStyle($rng)->getNumberFormat()->setFormatCode('#,##0.00;-#,##0.00');
+            $sh->getStyle($rng)->getAlignment()->setHorizontal('right')->setIndent(1);   // a space between the columns
+        }
+
+        // column widths + page
+        // Courier numbers need room: "1,793,200.00" = 12 characters + the indent
+        foreach (['A' => 17, 'B' => 46, 'C' => 18, 'D' => 17, 'E' => 17, 'F' => 18, 'G' => 18, 'H' => 17] as $col => $w) {
+            $sh->getColumnDimension($col)->setWidth($w);
+        }
+        $sh->setShowGridlines(false);
+        $sh->getPageSetup()->setOrientation(PageSetup::ORIENTATION_LANDSCAPE)->setPaperSize(PageSetup::PAPERSIZE_A4)
+            ->setFitToWidth(1)->setFitToHeight(0);
+        return $ss;
+    }
     /** "July 2026" or "July to September 2026" (old $LastDate) */
     private function esPeriodText(?string $from, ?string $to): string
     {
@@ -624,6 +807,8 @@ class PrintController extends ReportController
         }
 
         // narrower columns where there is empty space, then the total width
+        // a report can keep its own column widths (e.g. the RELIEF printout with Courier numbers)
+        $keep = (bool) $sh->getParent()?->getProperties()->getCustomPropertyValue('pdfKeepWidths');
         $default = $sh->getDefaultColumnDimension()->getWidth();
         $default = $default > 0 ? $default : 8.43;
         $total = 0.0;
@@ -632,7 +817,7 @@ class PrintController extends ReportController
             if (!$dim->getVisible()) continue;
             $w = $dim->getWidth();
             $w = $w > 0 ? $w : $default;
-            if ($need[$c] > 0) {
+            if ($need[$c] > 0 && !$keep) {
                 $fit = max(6, $need[$c] * 1.1 + 2);
                 if ($fit < $w) { $w = $fit; $dim->setWidth($w); }
             }

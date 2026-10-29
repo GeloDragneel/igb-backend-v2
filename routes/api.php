@@ -170,6 +170,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/bir/filing/{name}/payments', [BirReturnController::class, 'payStore']);
     Route::delete('/bir/payments/{id}', [BirReturnController::class, 'payDelete']);
     Route::get('/bir/payments/{id}/attachment', [BirReturnController::class, 'payAttachment']);
+    Route::get('bir/payables', [BirReturnController::class, 'payables']);
 
     Route::get('/reports/bir2307', [ReportController::class, 'bir2307Summary']);
     Route::get('/reports/vat-summary', [ReportController::class, 'vatSummary']);

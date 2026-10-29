@@ -4580,6 +4580,18 @@ class ReportController extends SalesController
         } elseif (in_array('record_status', $cols, true)) {
             $q->where('M.record_status', 'posted');
         }
+
+        // only invoices booked to the Accounts Receivable / Payable account (header "Accounts"; cash sales / cash purchases are not)
+        $byIds = array_values(array_unique(array_filter(array_merge($ids, [(int) $this->addedByFor($request)]))));
+        $arapCodes = ChartsOfAccount::whereIn('added_by', $byIds)->get(['account_code', 'account_name'])
+            ->filter(fn ($a) => preg_match($ar ? '/accounts?\s*receivable/i' : '/accounts?\s*payable/i', (string) $a->account_name))
+            ->pluck('account_code')->map(fn ($c) => (string) $c)->unique()->values()->all();
+        $q->whereIn('M.account_code', $arapCodes ?: [$ar ? '12200' : '21100']);
+
+        // only NOT paid: no receipt voucher (t_rvoucher_detail) / payment voucher (t_pvoucher_detail) at all
+        $vt = $ar ? 't_rvoucher_detail' : 't_pvoucher_detail';
+        $link = $ar ? 'invoice_no' : 'ap_invoice_no';
+        if (Schema::hasTable($vt)) $q->whereNotExists(fn ($v) => $v->from($vt)->whereColumn("{$vt}.{$link}", 'M.invoice_no'));
         if ($ft === 'AS') $q->where('M.transaction_date', '<=', $asOfDate);
         if ($ft === 'DM') $q->whereBetween('M.declared_month', [$from, $to]);
         if ($ft === 'DR') $q->whereBetween('M.transaction_date', [$from, $to]);

@@ -1290,5 +1290,120 @@ class BirReturnController extends ReportController
                     AND U.old_declared_month = LEFT({$month}, 7)
                   ORDER BY U.id DESC LIMIT 1), LEFT({$month}, 7))";
     }
+/* ======================= Home → Tax payables ======================= */
 
+    /**
+     * GET /api/bir/payables?from=2026-01&to=2026-12
+     * per tax: books = what the books say for the period · filed / paid / balance = BIR returns filed (FILE & SUBMITTED) for the period
+     *   vat    VAT payable                         books: Output VAT − Input VAT        returns: 2550M · 2550Q
+     *   ewt    Withholding tax (purchase/expense)  books: 2307 EWT on purchases + GRN   returns: 0619E · 1601EQ
+     *   income Income tax payable                  books: Income Tax Summary (page)     returns: 1701Q · 1701 · 1702Q · 1702RT · 1702EX
+     *   comp   Compensation (withholding)          books: none (not in the books)       returns: 1601C
+ *   ar     Accounts receivable                 = Books & Ledger → Receivables (this branch, as of the period end, AR account, no receipt voucher)
+ *   ap     Accounts payable                    = Books & Ledger → Payables    (this branch, as of the period end, AP account, no payment voucher)
+     */
+    public function payables(Request $request)
+    {
+        $d = $request->validate(['from' => ['required', 'date_format:Y-m'], 'to' => ['required', 'date_format:Y-m']]);
+        [$from, $to] = $d['from'] <= $d['to'] ? [$d['from'], $d['to']] : [$d['to'], $d['from']];
+        $by = $this->booksOf($request);
+        [$ids] = $this->journalScope($request, 'all');   // MAIN = every branch (same as the returns)
+
+        $kinds = [
+            'vat'    => ['2550M', '2550Q'],
+            'ewt'    => ['0619E', '1601EQ'],
+            'income' => ['1701Q', '1701', '1702Q', '1702RT', '1702EX'],
+            'comp'   => ['1601C'],
+        ];
+        // longest code first, so 1701Q is not taken as 1701 (forms are saved like "2550Q", "1701Qv2018" …)
+        $codes = [];
+        foreach ($kinds as $k => $list) foreach ($list as $c) $codes[$c] = $k;
+        uksort($codes, fn ($a, $b) => strlen($b) <=> strlen($a));
+        $kindOf = function (string $form) use ($codes): ?string {
+            $f = strtoupper(preg_replace('/[^0-9A-Za-z]/', '', $form));
+            foreach ($codes as $c => $k) if (str_starts_with($f, $c)) return $k;
+            return null;
+        };
+
+        $out = [];
+        foreach (array_keys($kinds) as $k) $out[$k] = ['books' => null, 'filed' => 0.0, 'paid' => 0.0, 'balance' => 0.0, 'returns' => 0];
+
+        // books
+        if ($ids) {
+            $output = $this->outputVat($ids, $from, $to);
+            $input  = $this->inputVat($ids, $from, $to);
+            $out['vat']['output'] = round($output, 2);
+            $out['vat']['input']  = round($input, 2);
+            $out['vat']['books']  = round($output - $input, 2);
+            $out['ewt']['books'] = round($this->ewt2307($ids, $from, $to), 2);
+        }
+
+        // filed returns whose period is inside from → to
+        if (Schema::hasTable(self::FILING)) {
+            $hasPeriod = Schema::hasColumn(self::FILING, 'period_from') && Schema::hasColumn(self::FILING, 'period_to');
+            $rows = DB::table(self::FILING)->where('added_by', $by)->get();
+            $names = [];
+            foreach ($rows as $r) {
+                $kind = $kindOf((string) $r->form);
+                if (!$kind) continue;
+                if ($hasPeriod && $r->period_from && $r->period_to) {
+                    [$pf, $pt] = [substr((string) $r->period_from, 0, 7), substr((string) $r->period_to, 0, 7)];
+                } else {
+                    $parts = explode('-', basename((string) $r->filename, '.xml'));
+                    [$pf, $pt] = $this->periodRange($parts[2] ?? '');
+                }
+                if ($pf < $from || $pt > $to) continue;
+                $names[$r->filename] = $kind;
+            }
+            foreach ($this->filings($by, array_keys($names)) as $name => $f) {   // skips deleted / voided filings
+                $k = $names[$name];
+                $out[$k]['filed']   += $f['amount'];
+                $out[$k]['paid']    += $f['paid'];
+                $out[$k]['balance'] += $f['balance'];
+                $out[$k]['returns']++;
+            }
+        }
+
+        foreach ($out as &$o) foreach (['filed', 'paid', 'balance'] as $x) $o[$x] = round($o[$x], 2);
+        unset($o);
+
+        // Accounts receivable / payable = the SAME rows as Books & Ledger → Receivables / Payables (agingReport, "as of" tab):
+        //   this branch · posted · not void · booked to the AR / AP account · dated up to the as-of day · no receipt / payment voucher
+        //   as-of = end of the period's last month, but never past the end of this month (same default as that page)
+        [$brIds] = $this->journalScope($request, 'current');
+        $asOf = min(
+            Carbon::createFromFormat('Y-m-d', "{$to}-01")->endOfMonth()->toDateString(),
+            now('Asia/Manila')->endOfMonth()->toDateString()
+        );
+        $voidId = (int) (DB::table('m_invoice_status')->whereRaw("UPPER(name) LIKE 'VOID%'")->value('id') ?: 5);
+        $open = function (bool $ar) use ($request, $brIds, $asOf, $voidId): array {
+            $mt = $ar ? 't_sales_invoice_master' : 't_purchase_expense_master';
+            if (!$brIds || !Schema::hasTable($mt)) return ['total' => 0.0, 'count' => 0, 'as_of' => $asOf];
+            $cols = Schema::getColumnListing($mt);
+
+            $byIds = array_values(array_unique(array_filter(array_merge($brIds, [(int) $this->addedByFor($request)]))));
+            $codes = ChartsOfAccount::whereIn('added_by', $byIds)->get(['account_code', 'account_name'])
+                ->filter(fn ($a) => preg_match($ar ? '/accounts?\s*receivable/i' : '/accounts?\s*payable/i', (string) $a->account_name))
+                ->pluck('account_code')->map(fn ($c) => (string) $c)->unique()->values()->all();
+
+            $q = DB::table("{$mt} as M")->whereIn('M.added_by', $brIds)
+                ->where(fn ($w) => $w->whereNull('M.invoice_status_id')->orWhere('M.invoice_status_id', '<>', $voidId))
+                ->whereIn('M.account_code', $codes ?: [$ar ? '12200' : '21100'])
+                ->where('M.transaction_date', '<=', $asOf)
+                ->whereRaw('ABS(COALESCE(M.grand_total, 0)) >= 0.005');
+            if ($ar) $q->where('M.trans_type', 'posted');
+            elseif (in_array('record_status', $cols, true)) $q->where('M.record_status', 'posted');
+
+            $vt = $ar ? 't_rvoucher_detail' : 't_pvoucher_detail';
+            $link = $ar ? 'invoice_no' : 'ap_invoice_no';
+            if (Schema::hasTable($vt)) $q->whereNotExists(fn ($v) => $v->from($vt)->whereColumn("{$vt}.{$link}", 'M.invoice_no'));
+
+            $r = $q->selectRaw('COUNT(*) AS n, COALESCE(SUM(ROUND(M.grand_total, 2)), 0) AS t')->first();
+            return ['total' => round((float) $r->t, 2), 'count' => (int) $r->n, 'as_of' => $asOf];
+        };
+        $out['ar'] = $open(true);
+        $out['ap'] = $open(false);
+
+        return response()->json(['from' => $from, 'to' => $to] + $out);
+    }
 }
