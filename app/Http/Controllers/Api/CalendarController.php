@@ -17,21 +17,21 @@ use Illuminate\Support\Facades\Schema;
      PATCH  /calendar/events/{id}/done                     tick / untick a task
      DELETE /calendar/events/{id}
      GET    /calendar/employees                            people to share with
-     GET    /calendar/access                               IT Officer: who may read / write / delete
-     PUT    /calendar/access/{employeeId}                  IT Officer: set it
+     GET    /calendar/access                               IT Development Head: who may read / write / delete
+     PUT    /calendar/access/{employeeId}                  IT Development Head: set it
 
-   Rights (m_calendar_access, set by the IT Officer):
+   Rights (m_calendar_access, set by the IT Development Head):
      read   = open the Calendar and see what is shared with you      (no row yet → yes)
      write  = add events / tasks and change your own                  (no row yet → no)
      delete = delete your own                                         (no row yet → no)
-   IT Officer (and IT Development Head) = everything, everyone's calendar, and the access list.
+   IT Development Head (m_user_type.id 1) = everything, everyone's calendar, and the access list.
 
    Who sees an event: the one who made it · the employees it is shared with · everyone when "Everyone" is ticked.
    ========================================================================= */
 class CalendarController extends Controller
 {
     private const TZ = 'Asia/Manila';
-    private const ADMINS = ['IT OFFICER', 'IT DEVELOPMENT HEAD'];
+    private const ADMIN_ROLE_IDS = [1]; // m_user_type.id 1 = IT DEVELOPMENT HEAD (full access + Manage access)
     private const KINDS = ['event', 'task', 'meeting', 'reminder'];
     private const REPEATS = ['none', 'daily', 'weekly', 'monthly', 'yearly'];
     private const MAX_OCCURRENCES = 800;
@@ -57,14 +57,10 @@ class CalendarController extends Controller
         return null;
     }
 
-    /** designation name of an employee (m_employee.designation_id → m_user_type) */
-    private function designationName(?int $emp): string
+    /** designation (m_user_type.id) of an employee */
+    private function designationId(?int $emp): int
     {
-        if (!$emp || !Schema::hasTable('m_user_type')) return '';
-        $des = (int) DB::table('m_employee')->where('id', $emp)->value('designation_id');
-        if (!$des) return '';
-        $col = collect(['name', 'description', 'user_type', 'UserType'])->first(fn ($c) => Schema::hasColumn('m_user_type', $c));
-        return $col ? strtoupper(trim((string) DB::table('m_user_type')->where('id', $des)->value($col))) : '';
+        return $emp ? (int) DB::table('m_employee')->where('id', $emp)->value('designation_id') : 0;
     }
 
     private function empName($e): string
@@ -78,7 +74,7 @@ class CalendarController extends Controller
     private function ctx(Request $request): array
     {
         $emp = $this->me($request);
-        $admin = in_array($this->designationName($emp), self::ADMINS, true);
+        $admin = in_array($this->designationId($emp), self::ADMIN_ROLE_IDS, true);
         abort_if(!$emp && !$admin, 403, 'The Calendar is for employees – your login has no employee record.');
 
         $row = $emp && Schema::hasTable('m_calendar_access') ? DB::table('m_calendar_access')->where('employee_id', $emp)->first() : null;
@@ -208,7 +204,7 @@ class CalendarController extends Controller
             ->map(fn ($h) => ['date' => substr((string) $h->holiday_date, 0, 10), 'name' => $h->name, 'type' => $h->holiday_type])->all();
     }
 
-    /** leaves in from → to: approved for everybody; pending only your own (IT Officer: all) */
+    /** leaves in from → to: approved for everybody; pending only your own (IT Development Head: all) */
     private function leaves(array $c, string $from, string $to, ?int $only = null): array
     {
         if (!Schema::hasTable('t_leave_request')) return [];
@@ -235,7 +231,7 @@ class CalendarController extends Controller
     public function index(Request $request)
     {
         $c = $this->ctx($request);
-        abort_unless($c['can']['read'], 403, "You don't have access to the Calendar. Ask the IT Officer.");
+        abort_unless($c['can']['read'], 403, "You don't have access to the Calendar. Ask the IT Development Head.");
         $d = $request->validate([
             'from' => ['required', 'date_format:Y-m-d'],
             'to'   => ['required', 'date_format:Y-m-d', 'after_or_equal:from'],
@@ -258,7 +254,7 @@ class CalendarController extends Controller
         $c = $this->ctx($request);
         if (!$c['can']['read']) return response()->json(['date' => null, 'events' => [], 'holidays' => [], 'leaves' => []]);
         $today = CarbonImmutable::now(self::TZ)->toDateString();
-        // the IT Officer sees only what is shared with him / made by him here, not the whole office
+        // the IT Development Head sees only what is shared with him / made by him here, not the whole office
         $me = $c['admin'] ? array_merge($c, ['admin' => false]) : $c;
         $events = array_values(array_filter($this->eventsBetween($me, $today, $today), fn ($e) => !($e['kind'] === 'task' && $e['is_done'])));
         return response()->json([
@@ -338,7 +334,7 @@ class CalendarController extends Controller
     public function store(Request $request)
     {
         $c = $this->ctx($request);
-        abort_unless($c['can']['write'], 403, "You can't add to the Calendar. Ask the IT Officer for Write access.");
+        abort_unless($c['can']['write'], 403, "You can't add to the Calendar. Ask the IT Development Head for Write access.");
         $d = $request->validate($this->rules());
         $id = DB::transaction(function () use ($d, $c) {
             $id = DB::table('t_calendar_event')->insertGetId($this->fill($d) + [
@@ -389,6 +385,7 @@ class CalendarController extends Controller
 
     /* ---------------- people ---------------- */
 
+    /** active employees (all of them when the "active" flag is missing / never set) */
     private function activeEmployees()
     {
         $cols = array_values(array_filter(['id', 'last_name', 'first_name', 'middle_name', 'designation_id'], fn ($c) => Schema::hasColumn('m_employee', $c)));
@@ -410,41 +407,45 @@ class CalendarController extends Controller
             'role' => (string) ($roles[$e->designation_id ?? 0] ?? ''),
         ])->values());
     }
+
+    /** m_user_type id → name */
     private function roleNames()
     {
         if (!Schema::hasTable('m_user_type')) return collect();
         $col = collect(['name', 'description', 'user_type', 'UserType'])->first(fn ($x) => Schema::hasColumn('m_user_type', $x));
         return $col ? DB::table('m_user_type')->pluck($col, 'id') : collect();
     }
-    /* GET /calendar/access (IT Officer) */
+
+    /* GET /calendar/access (IT Development Head) */
     public function access(Request $request)
     {
         $c = $this->ctx($request);
-        abort_unless($c['admin'], 403, 'Only the IT Officer can set Calendar access.');
+        abort_unless($c['admin'], 403, 'Only the IT Development Head can set Calendar access.');
         $rows = DB::table('m_calendar_access')->get()->keyBy('employee_id');
-        $col = Schema::hasTable('m_user_type')
-            ? collect(['name', 'description', 'user_type', 'UserType'])->first(fn ($x) => Schema::hasColumn('m_user_type', $x)) : null;
-        $roles = $col ? DB::table('m_user_type')->pluck($col, 'id') : collect();
+        $roles = $this->roleNames();
 
         return response()->json($this->activeEmployees()->map(function ($e) use ($rows, $roles) {
             $r = $rows[$e->id] ?? null;
-            $role = strtoupper(trim((string) ($roles[$e->designation_id] ?? '')));
-            $admin = in_array($role, self::ADMINS, true);
+            $des = (int) ($e->designation_id ?? 0);
+            $admin = in_array($des, self::ADMIN_ROLE_IDS, true);      // m_user_type.id 1 = IT DEVELOPMENT HEAD
             return [
-                'id' => (int) $e->id, 'name' => $this->empName($e), 'role' => $roles[$e->designation_id] ?? '', 'is_admin' => $admin,
-                'can_read' => $admin || ($r ? (bool) $r->can_read : true),
-                'can_write' => $admin || ($r ? (bool) $r->can_write : false),
+                'id'         => (int) $e->id,
+                'name'       => $this->empName($e),
+                'role'       => (string) ($roles[$des] ?? ''),
+                'is_admin'   => $admin,
+                'can_read'   => $admin || ($r ? (bool) $r->can_read : true),
+                'can_write'  => $admin || ($r ? (bool) $r->can_write : false),
                 'can_delete' => $admin || ($r ? (bool) $r->can_delete : false),
-                'set' => (bool) $r,
+                'set'        => (bool) $r,
             ];
         })->values());
     }
 
-    /* PUT /calendar/access/{employeeId} (IT Officer) { can_read, can_write, can_delete } */
+    /* PUT /calendar/access/{employeeId} (IT Development Head) { can_read, can_write, can_delete } */
     public function saveAccess(Request $request, int $employeeId)
     {
         $c = $this->ctx($request);
-        abort_unless($c['admin'], 403, 'Only the IT Officer can set Calendar access.');
+        abort_unless($c['admin'], 403, 'Only the IT Development Head can set Calendar access.');
         abort_unless(DB::table('m_employee')->where('id', $employeeId)->exists(), 404, 'Employee not found.');
         $d = $request->validate(['can_read' => ['required', 'boolean'], 'can_write' => ['required', 'boolean'], 'can_delete' => ['required', 'boolean']]);
         // write / delete without read makes no sense → read comes with them
