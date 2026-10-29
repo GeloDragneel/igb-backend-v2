@@ -27,7 +27,7 @@ use Illuminate\Support\Facades\Http;
  *
  *  SIGN UP   (new client) Google/Facebook account not linked → {FRONTEND}/login?social_signup=TOKEN (15 min)
  *            → Login page asks business name + owner name → POST /auth/signup
- *            → new client (IGB-####) + MAIN business account + client login + link, status PENDING, 15-day trial
+ *            → new client (IGB-####) + MAIN business account + client login + link, status FEDERATED, 15-day trial
  *            → signed in → Settings in "welcome" mode to fill up Profile … Business Accounts
  *
  *  Only accounts that were LINKED can sign in. A Google / Facebook account is never matched by email
@@ -288,16 +288,15 @@ class SocialAuthController extends Controller
         return array_intersect_key($row, $cache[$table]);
     }
 
-    /** status "PENDING" (or "NEW" / "PROSPECT") of a status table, null when there is none */
-    private function pendingStatus(string $table): ?int
+    /** client status of a Google / Facebook sign-up: FEDERATED (m_client_account_status.status_name), null when there is none */
+    private function signupStatus(): ?int
     {
-        if (!Schema::hasTable($table)) return null;
-        foreach (['name', 'description', 'status'] as $c) {
-            if (!Schema::hasColumn($table, $c)) continue;
-            foreach (['PENDING', 'NEW', 'PROSPECT', 'FOR APPROVAL'] as $w) {
-                $id = DB::table($table)->whereRaw("UPPER({$c}) LIKE ?", ["%{$w}%"])->value('id');
-                if ($id) return (int) $id;
-            }
+        $t = 'm_client_account_status';
+        if (!Schema::hasTable($t)) return null;
+        foreach (['status_name', 'name', 'description', 'status'] as $c) {
+            if (!Schema::hasColumn($t, $c)) continue;
+            $id = DB::table($t)->whereRaw("UPPER(TRIM({$c})) = 'FEDERATED'")->value('id');
+            if ($id) return (int) $id;
         }
         return null;
     }
@@ -346,14 +345,14 @@ class SocialAuthController extends Controller
                 'client_num' => $num, 'last_name' => $up($d['last_name']), 'first_name' => $up($d['first_name']),
                 'middle_name' => $up($d['middle_name'] ?? ''), 'email' => $email, 'email_address' => $email,
                 'phone_num' => $d['phone'] ?? null, 'mobile_num' => $d['phone'] ?? null,
-                'status_id' => $this->pendingStatus('m_client_account_status'), 'active' => 1, 'is_active' => 1,
+                'status_id' => $this->signupStatus(), 'active' => 1, 'is_active' => 1,
                 'remarks' => 'Signed up with ' . ucfirst($info['provider']), 'created_at' => $now, 'updated_at' => $now,
                 'trial_ends_at' => now('Asia/Manila')->addDays(15)->endOfDay(),      // 15-day free trial
             ]));
             $caid = DB::table('m_client_account')->insertGetId($this->cols('m_client_account', [
                 'client_num' => $num, 'trade_name' => $up($d['trade_name']), 'branch_type' => 'MAIN', 'branch_code' => '00000',
                 'email_address' => $email, 'phone_num' => $d['phone'] ?? null, 'is_active' => 1,
-                'status_id' => $this->pendingStatus('m_client_account_status'), 'created_at' => $now, 'updated_at' => $now,
+                'status_id' => $this->signupStatus(), 'created_at' => $now, 'updated_at' => $now,
             ]));
             $ca = Schema::hasColumn('m_user_client', 'caid') ? 'caid' : 'ca_id';
             $uid = DB::table('m_user_client')->insertGetId($this->cols('m_user_client', [
@@ -373,6 +372,52 @@ class SocialAuthController extends Controller
         $code = Str::random(40);
         Cache::put("social-code:{$code}", ['type' => 'Client', 'id' => (int) $userId, 'provider' => $info['provider']], now()->addSeconds(60));
         return response()->json(['code' => $code, 'message' => 'Account created.']);
+    }
+
+    /**
+     * GET /api/onboarding   (signed in) — new client from Google / Facebook: what is still missing in Settings
+     * → { show, name, provider, trial, steps: [{ key (Settings section), label, done }] }
+     * show = signed up with Google / Facebook (m_user_social on this client login) and something is still missing
+     */
+    public function onboarding(Request $request)
+    {
+        $u = $request->user();
+        $type = $this->typeOf($u);
+        if (!in_array($type, ['Client', 'ClientStaff'], true)) return response()->json(['show' => false]);
+
+        $acc = DB::table('m_client_account')->where('id', (int) ($u->caid ?? 0))->first();
+        $client = $acc ? DB::table('m_client')->where('client_num', $acc->client_num)->first() : null;
+        if (!$client) return response()->json(['show' => false]);
+
+        // only clients who signed up with Google / Facebook (their MAIN login is linked)
+        $logins = DB::table('m_user_client')->where(Schema::hasColumn('m_user_client', 'caid') ? 'caid' : 'ca_id', $acc->id)->pluck('id');
+        $social = DB::table(self::TABLE)->where('user_type', 'Client')->whereIn('user_id', $logins)->orderBy('id')->first();
+        if (!$social) return response()->json(['show' => false]);
+
+        $c = (array) $client;
+        $has = fn (string $k) => isset($c[$k]) && trim((string) $c[$k]) !== '' && (string) $c[$k] !== '0';
+        $ids = Schema::hasTable('m_client_valid_id')
+            ? DB::table('m_client_valid_id')->where('client_num', $client->client_num)->count()
+            : 0;
+        $steps = [
+            ['key' => 'profile',        'label' => 'Profile (name, gender, birthday)',          'done' => $has('last_name') && $has('first_name') && $has('gender')],
+            ['key' => 'contact',        'label' => 'Contact (mobile number)',                    'done' => $has('phone_num')],
+            ['key' => 'address',        'label' => 'Address',                                    'done' => $has('street') && $has('province_id') && $has('city_id') && $has('brgy_id')],
+            ['key' => 'ownership',      'label' => 'Business ownership type',                    'done' => $has('business_ownership_type_id')],
+            ['key' => 'classification', 'label' => 'Classification & Compliance (BIR returns)',  'done' => $has('classification_id') && $has('compliance_ids')],
+            ['key' => 'ids',            'label' => 'Valid IDs (BIR TIN)',                        'done' => $ids > 0],
+            ['key' => 'accounts',       'label' => 'Business account (nature of business, RDO)', 'done' => !empty($acc->nob_id ?? null) && !empty($acc->rdo ?? null)],
+        ];
+        $left = count(array_filter($steps, fn ($x) => !$x['done']));
+        return response()->json([
+            'show'     => $left > 0,
+            'name'     => trim(($c['first_name'] ?? '') . ' ' . ($c['last_name'] ?? '')),
+            'business' => $acc->trade_name ?? '',
+            'provider' => $social->provider,
+            'trial'    => \App\Http\Middleware\TrialGuard::trialOf($u),
+            'done'     => count($steps) - $left,
+            'steps'    => $steps,
+        ]);
     }
 
     /** GET /api/trial   (signed in) → { trial, ends_at, days_left, expired }  (trial false = full account) */
