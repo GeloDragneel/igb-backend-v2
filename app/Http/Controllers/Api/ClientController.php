@@ -622,11 +622,18 @@ class ClientController extends Controller
          PUT  /settings/twa                             { is_top_withholding_agent }
        ===================================================================== */
 
-    /** client # of the signed-in client / client staff (from its business account) */
+    /** client # of the signed-in client / client staff, or – for staff – the client picked in the header (token "caid:X") */
     private function myClientNum(Request $request): string
     {
         $u = $request->user();
         $caid = (int) ($u->caid ?? 0);
+        if (!$caid) {
+            // staff: the business account selected in the header is on the login token
+            $caid = (int) collect($u?->currentAccessToken()?->abilities ?? [])
+                ->map(fn ($a) => str_starts_with((string) $a, 'caid:') ? (int) substr($a, 5) : 0)
+                ->filter()
+                ->first();
+        }
         $num = $caid ? DB::table('m_client_account')->where('id', $caid)->value('client_num') : null;
         abort_if(!$num, 403, 'Your login is not linked to a client.');
         return (string) $num;
