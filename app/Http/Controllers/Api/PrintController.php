@@ -577,12 +577,87 @@ class PrintController extends ReportController
      * 2) if LibreOffice isn't there / fails: PhpSpreadsheet's PDF writer (mpdf, dompdf or tcpdf, if installed)
      * Stops with a readable 422 message when neither works.
      */
+    /**
+     * PDF layout for every report (called at the start of toPdf):
+     *   · keeps portrait / landscape as the report has it
+ *   · margins almost none (0.15" sides, 0.2" top/bottom, no header/footer space)
+     *   · fonts under 10pt → 10pt (easier to read)
+     *   · columns wider than their longest value are made narrower (only narrower, never wider)
+     *   · then the page is zoomed so the columns fill the whole paper width
+     *     (Excel "fit to width" only makes things smaller – this also makes small reports bigger)
+     */
+    private function pdfLayout(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sh): void
+    {
+        $ps = $sh->getPageSetup();
+        // keep the report's own orientation (landscape when it has none)
+        $portrait = $ps->getOrientation() === PageSetup::ORIENTATION_PORTRAIT;
+        if (!$portrait) $ps->setOrientation(PageSetup::ORIENTATION_LANDSCAPE);
+        $sh->getPageMargins()->setLeft(0.15)->setRight(0.15)->setTop(0.2)->setBottom(0.2)->setHeader(0)->setFooter(0);
+        $ps->setHorizontalCentered(true);
+
+        $lastCol = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($sh->getHighestDataColumn());
+        $lastRow = min($sh->getHighestDataRow(), 4000);                         // big reports: look at the first 4000 rows
+        if ($lastCol < 1 || $lastRow < 1) return;
+
+        // cells inside merged ranges (titles) don't decide a column's width
+        $merged = [];
+        foreach ($sh->getMergeCells() as $range) {
+            foreach (\PhpOffice\PhpSpreadsheet\Cell\Coordinate::extractAllCellReferencesInRange($range) as $ref) $merged[$ref] = true;
+        }
+
+        $need = array_fill(1, $lastCol, 0.0);                                    // longest value per column, in "characters at 11pt"
+        for ($r = 1; $r <= $lastRow; $r++) {
+            for ($c = 1; $c <= $lastCol; $c++) {
+                $col = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($c);
+                $ref = $col . $r;
+                if (!$sh->cellExists($ref)) continue;
+                $cell = $sh->getCell($ref);
+                $font = $sh->getStyle($ref)->getFont();
+                $size = (float) ($font->getSize() ?: 11);
+                if ($size < 10) { $font->setSize(10); $size = 10; }              // bigger text
+                if (isset($merged[$ref])) continue;
+                try { $text = (string) $cell->getFormattedValue(); } catch (\Throwable) { $text = (string) $cell->getValue(); }
+                if ($text === '') continue;
+                $len = max(array_map('mb_strlen', explode("\n", $text)));
+                $need[$c] = max($need[$c], $len * ($size / 11) * ($font->getBold() ? 1.08 : 1));
+            }
+        }
+
+        // narrower columns where there is empty space, then the total width
+        $default = $sh->getDefaultColumnDimension()->getWidth();
+        $default = $default > 0 ? $default : 8.43;
+        $total = 0.0;
+        for ($c = 1; $c <= $lastCol; $c++) {
+            $dim = $sh->getColumnDimension(\PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($c));
+            if (!$dim->getVisible()) continue;
+            $w = $dim->getWidth();
+            $w = $w > 0 ? $w : $default;
+            if ($need[$c] > 0) {
+                $fit = max(6, $need[$c] * 1.1 + 2);
+                if ($fit < $w) { $w = $fit; $dim->setWidth($w); }
+            }
+            $total += $w;
+        }
+        if ($total <= 0) return;
+
+        // zoom so the columns fill the paper width (1 width unit ≈ 5.25pt, + a little cell padding)
+        // paper [long side, short side] in inches – letter when not set
+        [$long, $short] = [
+            PageSetup::PAPERSIZE_A4 => [11.69, 8.27], PageSetup::PAPERSIZE_LEGAL => [14.0, 8.5], PageSetup::PAPERSIZE_FOLIO => [13.0, 8.5], PageSetup::PAPERSIZE_A3 => [16.54, 11.69],
+        ][$ps->getPaperSize()] ?? [11.0, 8.5];
+        $paper = $portrait ? $short : $long;
+        $printable = ($paper - 0.3) * 72;
+        $widthPts = $total * 5.25 + $lastCol * 3;
+        $scale = (int) floor($printable / $widthPts * 100 * 0.97);
+        $ps->setFitToWidth(0)->setFitToHeight(0)->setFitToPage(false);
+        $ps->setScale(max(10, min(160, $scale)), false);
+    }
+
     private function toPdf(Spreadsheet $ss): string
     {
         @set_time_limit(300);
-        foreach ($ss->getAllSheets() as $sh) {
-            $sh->getPageSetup()->setOrientation(PageSetup::ORIENTATION_LANDSCAPE)->setFitToWidth(1)->setFitToHeight(0);
-        }
+        // bigger text, (almost) no margins, columns fill the page width
+        foreach ($ss->getAllSheets() as $sh) $this->pdfLayout($sh);
 
         $xlsx = $this->tempFile('xlsx');
         (new Xlsx($ss))->save($xlsx);
