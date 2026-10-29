@@ -595,20 +595,20 @@ class PrintController extends ReportController
         $sh->getPageMargins()->setLeft(0.15)->setRight(0.15)->setTop(0.2)->setBottom(0.2)->setHeader(0)->setFooter(0);
         $ps->setHorizontalCentered(true);
 
-        $lastCol = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($sh->getHighestDataColumn());
+        $lastCol = Coordinate::columnIndexFromString($sh->getHighestDataColumn());
         $lastRow = min($sh->getHighestDataRow(), 4000);                         // big reports: look at the first 4000 rows
         if ($lastCol < 1 || $lastRow < 1) return;
 
         // cells inside merged ranges (titles) don't decide a column's width
         $merged = [];
         foreach ($sh->getMergeCells() as $range) {
-            foreach (\PhpOffice\PhpSpreadsheet\Cell\Coordinate::extractAllCellReferencesInRange($range) as $ref) $merged[$ref] = true;
+            foreach (Coordinate::extractAllCellReferencesInRange($range) as $ref) $merged[$ref] = true;
         }
 
         $need = array_fill(1, $lastCol, 0.0);                                    // longest value per column, in "characters at 11pt"
         for ($r = 1; $r <= $lastRow; $r++) {
             for ($c = 1; $c <= $lastCol; $c++) {
-                $col = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($c);
+                $col = Coordinate::stringFromColumnIndex($c);
                 $ref = $col . $r;
                 if (!$sh->cellExists($ref)) continue;
                 $cell = $sh->getCell($ref);
@@ -628,7 +628,7 @@ class PrintController extends ReportController
         $default = $default > 0 ? $default : 8.43;
         $total = 0.0;
         for ($c = 1; $c <= $lastCol; $c++) {
-            $dim = $sh->getColumnDimension(\PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($c));
+            $dim = $sh->getColumnDimension(Coordinate::stringFromColumnIndex($c));
             if (!$dim->getVisible()) continue;
             $w = $dim->getWidth();
             $w = $w > 0 ? $w : $default;
@@ -2504,8 +2504,8 @@ class PrintController extends ReportController
         ]);
         $clean = fn ($r) => array_map(fn ($v) => is_int($v) || is_float($v) ? (float) $v : mb_substr((string) ($v ?? ''), 0, 500), array_values($r));
 
-        $token = \Illuminate\Support\Str::random(32);
-        \Illuminate\Support\Facades\Cache::put($this->collectionExcelKey($request, $token), [
+        $token = Str::random(32);
+        Cache::put($this->collectionExcelKey($request, $token), [
             'from'  => $d['from'],
             'to'    => $d['to'],
             'type'  => $d['type'] ?? 'All',
@@ -2520,7 +2520,7 @@ class PrintController extends ReportController
     /* GET /api/print/collection-monitoring/{token} → CollectionMonitoring-{Username}.xlsx */
     public function collectionExcel(Request $request, string $token)
     {
-        $s = \Illuminate\Support\Facades\Cache::pull($this->collectionExcelKey($request, $token));
+        $s = Cache::pull($this->collectionExcelKey($request, $token));
         abort_if(!$s, 404, 'This export has expired. Press Excel again.');
         $who = $request->user()?->username ?? 'report';
 
@@ -2539,7 +2539,7 @@ class PrintController extends ReportController
                 'Street' => (string) ($h['address'] ?? ''), 'RDateRange' => "{$s['from']} - {$s['to']}",
             ]], $data);
             $xlsx = method_exists($this, 'tempFile') ? $this->tempFile('xlsx') : tempnam(sys_get_temp_dir(), 'col') . '.xlsx';
-            (new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($ss))->save($xlsx);
+            (new Xlsx($ss))->save($xlsx);
             $ss->disconnectWorksheets();
             return response()->download($xlsx, "CollectionMonitoring-{$who}.xlsx", [
                 'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -2547,31 +2547,31 @@ class PrintController extends ReportController
         }
 
         // no template: full sheet (all columns incl. Status)
-        $ss = new \PhpOffice\PhpSpreadsheet\Spreadsheet();
+        $ss = new Spreadsheet();
         $sh = $ss->getActiveSheet();
         $sh->setTitle('Collection Monitoring');
         $n = max(1, count($s['head']));
-        $last = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($n);
+        $last = Coordinate::stringFromColumnIndex($n);
         $amountCol = array_search('Amount received', $s['head'], true);
 
         $sh->setCellValue('A1', 'Collection Monitoring');
         $sh->getStyle('A1')->getFont()->setBold(true)->setSize(14);
-        $sh->setCellValueExplicit('A2', "PF · Return · EO payments  ·  Type: {$s['type']}  ·  {$s['from']} to {$s['to']}", \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
+        $sh->setCellValueExplicit('A2', "PF · Return · EO payments  ·  Type: {$s['type']}  ·  {$s['from']} to {$s['to']}", DataType::TYPE_STRING);
 
         $hr = 4;
-        foreach ($s['head'] as $c => $t) $sh->setCellValueExplicit(\PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($c + 1) . $hr, $t, \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
+        foreach ($s['head'] as $c => $t) $sh->setCellValueExplicit(Coordinate::stringFromColumnIndex($c + 1) . $hr, $t, DataType::TYPE_STRING);
         $sh->getStyle("A{$hr}:{$last}{$hr}")->applyFromArray([
             'font'      => ['bold' => true, 'color' => ['rgb' => 'FFFFFF']],
-            'fill'      => ['fillType' => \PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID, 'startColor' => ['rgb' => '1D4ED8']],
+            'fill'      => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => '1D4ED8']],
             'alignment' => ['vertical' => 'center'],
         ]);
 
         $r = $hr + 1;
         $put = function (array $line, int $r) use ($sh) {
             foreach ($line as $c => $val) {
-                $cell = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($c + 1) . $r;
+                $cell = Coordinate::stringFromColumnIndex($c + 1) . $r;
                 if (is_float($val) || is_int($val)) $sh->setCellValue($cell, $val);
-                elseif ($val !== '') $sh->setCellValueExplicit($cell, (string) $val, \PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
+                elseif ($val !== '') $sh->setCellValueExplicit($cell, (string) $val, DataType::TYPE_STRING);
             }
         };
         foreach ($s['rows'] as $line) $put($line, $r++);
@@ -2580,26 +2580,26 @@ class PrintController extends ReportController
             $put($s['total'], $r);
             $sh->getStyle("A{$r}:{$last}{$r}")->applyFromArray([
                 'font'    => ['bold' => true],
-                'fill'    => ['fillType' => \PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID, 'startColor' => ['rgb' => 'EEF2FF']],
-                'borders' => ['top' => ['borderStyle' => \PhpOffice\PhpSpreadsheet\Style\Border::BORDER_THIN], 'bottom' => ['borderStyle' => \PhpOffice\PhpSpreadsheet\Style\Border::BORDER_DOUBLE]],
+                'fill'    => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'EEF2FF']],
+                'borders' => ['top' => ['borderStyle' => Border::BORDER_THIN], 'bottom' => ['borderStyle' => Border::BORDER_DOUBLE]],
             ]);
             $r++;
         }
         $end = max($hr, $r - 1);
 
         if ($amountCol !== false) {
-            $col = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($amountCol + 1);
+            $col = Coordinate::stringFromColumnIndex($amountCol + 1);
             $sh->getStyle("{$col}" . ($hr + 1) . ":{$col}{$end}")->getNumberFormat()->setFormatCode('#,##0.00;(#,##0.00)');
             $sh->getStyle("{$col}{$hr}:{$col}{$end}")->getAlignment()->setHorizontal('right');
         }
-        $sh->getStyle("A{$hr}:{$last}{$end}")->getBorders()->getAllBorders()->setBorderStyle(\PhpOffice\PhpSpreadsheet\Style\Border::BORDER_THIN)->getColor()->setRGB('CBD5E1');
-        for ($c = 1; $c <= $n; $c++) $sh->getColumnDimension(\PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($c))->setAutoSize(true);
+        $sh->getStyle("A{$hr}:{$last}{$end}")->getBorders()->getAllBorders()->setBorderStyle(Border::BORDER_THIN)->getColor()->setRGB('CBD5E1');
+        for ($c = 1; $c <= $n; $c++) $sh->getColumnDimension(Coordinate::stringFromColumnIndex($c))->setAutoSize(true);
         $sh->freezePane('A' . ($hr + 1));
         $sh->setAutoFilter("A{$hr}:{$last}" . max($hr, $lastData));
 
         $name = "CollectionMonitoring-{$who}.xlsx";
         $xlsx = method_exists($this, 'tempFile') ? $this->tempFile('xlsx') : tempnam(sys_get_temp_dir(), 'col') . '.xlsx';
-        (new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($ss))->save($xlsx);
+        (new Xlsx($ss))->save($xlsx);
         $ss->disconnectWorksheets();
 
         return response()->download($xlsx, $name, [
