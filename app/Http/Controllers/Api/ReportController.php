@@ -122,23 +122,31 @@ class ReportController extends SalesController
             return is_scalar($v) ? trim((string) $v) : '';
         };
 
+        // a name from a lookup table by id (m_barangay / m_city_mun / m_province), whatever its name column is
+        $lookup = function (string $table, $id, array $cols) {
+            if (!$id || !Schema::hasTable($table)) return '';
+            $row = DB::table($table)->where('id', $id)->first();
+            if (!$row) return '';
+            foreach ($cols as $c) if (!empty($row->{$c})) return trim((string) $row->{$c});
+            return '';
+        };
+
+        $num  = $pick(['client_num']);
         $tin  = $pick(['tin', 'tin_no', 'tin_number']);
         $code = $pick(['branch_code']);
 
         // no TIN on the account → the client's BIR valid ID (m_client_valid_id, institution BIR) – same as E-Sub / BIR returns
-        if (preg_replace('/\D/', '', $tin) === '') {
-            $num = $pick(['client_num']);
-            if ($num !== '') {
-                $tin = (string) (ClientValidId::bir()->where('client_num', $num)->orderByDesc('id')
-                    ->pluck('id_num')
-                    ->first(fn ($t) => strlen(preg_replace('/\D/', '', (string) $t)) >= 9) ?? '');
-            }
+        if (preg_replace('/\D/', '', $tin) === '' && $num !== '') {
+            $tin = (string) (ClientValidId::bir()->where('client_num', $num)->orderByDesc('id')
+                ->pluck('id_num')
+                ->first(fn ($t) => strlen(preg_replace('/\D/', '', (string) $t)) >= 9) ?? '');
         }
         // 623-998-316 + branch 0000 → 623-998-316-0000 (a TIN that already has its branch part is left as it is)
         $digits = preg_replace('/\D/', '', $tin);
         if ($digits !== '' && strlen($digits) <= 9 && $code !== '') $tin = trim($tin) . '-' . $code;
         elseif ($digits === '') $tin = '';
 
+        // address of the business account …
         $address = implode(' ', array_filter([
             $pick(['street', 'address']),
             $text($account->barangay),
@@ -146,6 +154,22 @@ class ReportController extends SalesController
             $text($account->province),
             $pick(['zip_code', 'zipcode', 'zip']),
         ]));
+
+        // … else the client's address (Clients → Address: street, barangay, city, province, ZIP)
+        if (trim($address) === '' && $num !== '' && Schema::hasTable('m_client')) {
+            $c = DB::table('m_client')->where('client_num', $num)->first();
+            if ($c) {
+                $cityId = $c->city_id ?? null;
+                $zip = trim((string) ($c->zip_code ?? '')) ?: $lookup('m_city_mun', $cityId, ['zip_code', 'zipcode', 'zip']);
+                $address = implode(' ', array_filter([
+                    trim((string) ($c->street ?? '')),
+                    $lookup('m_barangay', $c->brgy_id ?? null, ['barangay', 'name', 'description']),
+                    $lookup('m_city_mun', $cityId, ['city_mun', 'citymun', 'name', 'description']),
+                    $lookup('m_province', $c->province_id ?? null, ['province', 'name', 'description']),
+                    $zip,
+                ]));
+            }
+        }
 
         return [
             'trade_name' => $pick(['trade_name', 'tradename', 'business_name', 'client_name']),
