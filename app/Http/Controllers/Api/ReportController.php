@@ -125,6 +125,20 @@ class ReportController extends SalesController
         $tin  = $pick(['tin', 'tin_no', 'tin_number']);
         $code = $pick(['branch_code']);
 
+        // no TIN on the account → the client's BIR valid ID (m_client_valid_id, institution BIR) – same as E-Sub / BIR returns
+        if (preg_replace('/\D/', '', $tin) === '') {
+            $num = $pick(['client_num']);
+            if ($num !== '') {
+                $tin = (string) (ClientValidId::bir()->where('client_num', $num)->orderByDesc('id')
+                    ->pluck('id_num')
+                    ->first(fn ($t) => strlen(preg_replace('/\D/', '', (string) $t)) >= 9) ?? '');
+            }
+        }
+        // 623-998-316 + branch 0000 → 623-998-316-0000 (a TIN that already has its branch part is left as it is)
+        $digits = preg_replace('/\D/', '', $tin);
+        if ($digits !== '' && strlen($digits) <= 9 && $code !== '') $tin = trim($tin) . '-' . $code;
+        elseif ($digits === '') $tin = '';
+
         $address = implode(' ', array_filter([
             $pick(['street', 'address']),
             $text($account->barangay),
@@ -135,7 +149,7 @@ class ReportController extends SalesController
 
         return [
             'trade_name' => $pick(['trade_name', 'tradename', 'business_name', 'client_name']),
-            'tin'        => trim($tin . ($code !== '' ? '-' . $code : ''), '-'),
+            'tin'        => $tin,
             'address'    => $address,
         ];
     }
