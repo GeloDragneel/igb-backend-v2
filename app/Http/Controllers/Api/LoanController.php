@@ -57,10 +57,16 @@ class LoanController extends SalesController
      * Amortization schedule.
      *   diminishing: equal monthly payment  P·r / (1 − (1+r)^−n), interest on remaining balance
      *   straight:    equal principal P/n, interest on the original principal (add-on)
+     *   actual360:   fixed payment, interest = balance × rate × actual days ÷ 360
      * The last row absorbs rounding so the balance ends at exactly 0.
      */
-    public static function schedule(float $principal, float $annualRate, int $months, string $method, string $firstDue): array
+    public static function schedule(float $principal, float $annualRate, int $months, string $method, string $firstDue,
+                                    ?string $releaseDate = null, ?float $fixedPay = null): array
     {
+        if ($method === 'actual360') {
+            return self::scheduleActual360($principal, $annualRate, $months, $firstDue, $releaseDate, $fixedPay);
+        }
+
         $r = $annualRate / 100 / 12;
         $rows = [];
         $bal = round($principal, 2);
@@ -87,11 +93,59 @@ class LoanController extends SalesController
         return $rows;
     }
 
+    /* actual days / 360 — like the bank's Excel: interest = balance × rate × days ÷ 360 */
+    private static function scheduleActual360(float $principal, float $annualRate, int $months, string $firstDue, ?string $releaseDate, ?float $fixedPay): array
+    {
+        $first = Carbon::parse($firstDue)->startOfDay();
+        $release = $releaseDate ? Carbon::parse($releaseDate)->startOfDay() : $first->copy()->subMonthNoOverflow();
+        $dues = [];
+        for ($k = 0; $k < $months; $k++) $dues[] = $first->copy()->addMonthsNoOverflow($k);
+        $daily = $annualRate / 100 / 360;
+
+        // payment: lender's fixed amount, or the smallest one (to the centavo) that clears the loan
+        $pay = $fixedPay && $fixedPay > 0 ? round($fixedPay, 2) : null;
+        if (!$pay) {
+            $endBal = function (float $p) use ($principal, $dues, $release, $daily) {
+                $b = $principal; $prev = $release;
+                foreach ($dues as $d) { $b += $b * $daily * $prev->diffInDays($d) - $p; $prev = $d; }
+                return $b;
+            };
+            $lo = 0.0; $hi = $principal * (1 + $daily * 31) ;
+            for ($i = 0; $i < 100; $i++) { $mid = ($lo + $hi) / 2; $endBal($mid) > 0 ? $lo = $mid : $hi = $mid; }
+            $pay = floor($hi * 100) / 100;
+        }
+
+        $rows = [];
+        $bal = round($principal, 2);
+        $prev = $release;
+        foreach ($dues as $i => $d) {
+            $k = $i + 1;
+            $days = (int) $prev->diffInDays($d);
+            $int = round($bal * $daily * $days, 2);
+            $prin = $k === $months ? $bal : round(min($bal, $pay - $int), 2);
+            $bal = round($bal - $prin, 2);
+            $rows[] = [
+                'no' => $k, 'due_date' => $d->toDateString(), 'days' => $days,
+                'principal' => $prin, 'interest' => $int, 'total' => round($prin + $int, 2), 'balance' => max(0, $bal),
+            ];
+            $prev = $d;
+        }
+        return $rows;
+    }
+
+    /* builds the schedule for a saved loan row (one place for summary / lnShow) */
+    private static function loanSchedule(object $loan): array
+    {
+        return self::schedule((float) $loan->principal, (float) $loan->annual_rate, (int) $loan->term_months, $loan->method,
+            (string) $loan->first_due_date, substr((string) $loan->release_date, 0, 10),
+            isset($loan->monthly_payment) ? (float) $loan->monthly_payment : null);
+    }
+
     private function summary(object $loan, array $paid): array
     {
         $paidP = (float) ($paid[$loan->id]['principal'] ?? 0);
         $paidI = (float) ($paid[$loan->id]['interest'] ?? 0);
-        $sched = self::schedule((float) $loan->principal, (float) $loan->annual_rate, (int) $loan->term_months, $loan->method, (string) $loan->first_due_date);
+        $sched = self::loanSchedule($loan);
 
         // next unpaid installment = first row whose cumulative principal is not covered yet
         $cum = 0; $next = null;
@@ -105,6 +159,7 @@ class LoanController extends SalesController
             'party_id' => $loan->party_id, 'party_name' => $loan->party_name, 'reference' => $loan->reference,
             'principal' => round((float) $loan->principal, 2), 'annual_rate' => (float) $loan->annual_rate,
             'term_months' => (int) $loan->term_months, 'method' => $loan->method,
+            'monthly_payment' => isset($loan->monthly_payment) && $loan->monthly_payment !== null ? (float) $loan->monthly_payment : null,
             'release_date' => substr((string) $loan->release_date, 0, 10), 'first_due_date' => substr((string) $loan->first_due_date, 0, 10),
             'loan_account' => $loan->loan_account, 'interest_account' => $loan->interest_account, 'cash_account' => $loan->cash_account,
             'status' => $loan->status, 'release_jv_no' => $loan->release_jv_no, 'remarks' => $loan->remarks,
@@ -151,10 +206,11 @@ class LoanController extends SalesController
     {
         $d = $request->validate([
             'principal' => ['required', 'numeric', 'gt:0'], 'annual_rate' => ['required', 'numeric', 'min:0', 'max:100'],
-            'term_months' => ['required', 'integer', 'min:1', 'max:600'], 'method' => ['required', 'in:diminishing,straight'],
-            'first_due_date' => ['required', 'date'],
+            'term_months' => ['required', 'integer', 'min:1', 'max:600'], 'method' => ['required', 'in:diminishing,straight,actual360'],
+            'first_due_date' => ['required', 'date'], 'release_date' => ['nullable', 'date'], 'monthly_payment' => ['nullable', 'numeric', 'min:0'],
         ]);
-        $rows = self::schedule((float) $d['principal'], (float) $d['annual_rate'], (int) $d['term_months'], $d['method'], $d['first_due_date']);
+        $rows = self::schedule((float) $d['principal'], (float) $d['annual_rate'], (int) $d['term_months'], $d['method'], $d['first_due_date'],
+            $d['release_date'] ?? null, isset($d['monthly_payment']) ? (float) $d['monthly_payment'] : null);
         return response()->json(['rows' => $rows, 'total_interest' => round(array_sum(array_column($rows, 'interest')), 2)]);
     }
 
@@ -168,7 +224,7 @@ class LoanController extends SalesController
         $paid = $this->paidByLoan($by, [$id]);
         $sum = $this->summary($loan, $paid);
         $paidP = $sum['paid_principal'];
-        $sched = self::schedule((float) $loan->principal, (float) $loan->annual_rate, (int) $loan->term_months, $loan->method, (string) $loan->first_due_date);
+        $sched = self::loanSchedule($loan);
         $cum = 0;
         foreach ($sched as &$row) {
             $cum += $row['principal'];
@@ -197,7 +253,8 @@ class LoanController extends SalesController
             'principal' => ['required', 'numeric', 'gt:0'],
             'annual_rate' => ['required', 'numeric', 'min:0', 'max:100'],
             'term_months' => ['required', 'integer', 'min:1', 'max:600'],
-            'method' => ['required', 'in:diminishing,straight'],
+            'method' => ['required', 'in:diminishing,straight,actual360'],
+            'monthly_payment' => ['nullable', 'numeric', 'min:0'],
             'release_date' => ['required', 'date'],
             'first_due_date' => ['required', 'date', 'after_or_equal:release_date'],
             'loan_account' => ['required', 'string', 'max:20'],
@@ -231,6 +288,7 @@ class LoanController extends SalesController
                 'loan_no' => $no, 'direction' => $d['direction'], 'party_id' => $d['party_id'] ?? null, 'party_name' => trim($d['party_name']),
                 'reference' => $d['reference'] ?? null, 'principal' => round((float) $d['principal'], 2), 'annual_rate' => $d['annual_rate'],
                 'term_months' => $d['term_months'], 'method' => $d['method'], 'release_date' => $d['release_date'], 'first_due_date' => $d['first_due_date'],
+                'monthly_payment' => ($d['method'] === 'actual360' && !empty($d['monthly_payment'])) ? round((float) $d['monthly_payment'], 2) : null,
                 'loan_account' => $d['loan_account'], 'interest_account' => $d['interest_account'], 'cash_account' => $d['cash_account'] ?? null,
                 'status' => 'active', 'release_jv_no' => $post ? $no : null, 'remarks' => $d['remarks'] ?? null,
                 'added_by' => $by, 'employee_id' => $request->user()->employee_id ?? null, 'created_at' => now(), 'updated_at' => now(),
@@ -259,7 +317,9 @@ class LoanController extends SalesController
         $hasPay = DB::table(self::P)->where('loan_id', $id)->where('status', 'posted')->exists();
         $termsChanged = abs((float) $d['principal'] - (float) $loan->principal) > 0.001 || abs((float) $d['annual_rate'] - (float) $loan->annual_rate) > 0.00001
             || (int) $d['term_months'] !== (int) $loan->term_months || $d['method'] !== $loan->method
-            || $d['first_due_date'] !== substr((string) $loan->first_due_date, 0, 10) || $d['direction'] !== $loan->direction;
+            || $d['first_due_date'] !== substr((string) $loan->first_due_date, 0, 10) || $d['direction'] !== $loan->direction
+            || ($d['method'] === 'actual360' && round((float) ($d['monthly_payment'] ?? 0), 2) !== round((float) ($loan->monthly_payment ?? 0), 2))
+            || ($d['method'] === 'actual360' && $d['release_date'] !== substr((string) $loan->release_date, 0, 10));
         if ($hasPay && $termsChanged) return response()->json(['message' => 'Payments are already recorded, so amount, rate, term, method and dates can\'t change. Void the payments first.'], 422);
 
         $releaseChanged = $loan->release_jv_no && (abs((float) $d['principal'] - (float) $loan->principal) > 0.001
@@ -273,6 +333,7 @@ class LoanController extends SalesController
             DB::table(self::L)->where('id', $loan->id)->update([
                 'direction' => $d['direction'], 'party_id' => $d['party_id'] ?? null, 'party_name' => trim($d['party_name']), 'reference' => $d['reference'] ?? null,
                 'principal' => round((float) $d['principal'], 2), 'annual_rate' => $d['annual_rate'], 'term_months' => $d['term_months'], 'method' => $d['method'],
+                'monthly_payment' => ($d['method'] === 'actual360' && !empty($d['monthly_payment'])) ? round((float) $d['monthly_payment'], 2) : null,
                 'release_date' => $d['release_date'], 'first_due_date' => $d['first_due_date'], 'loan_account' => $d['loan_account'],
                 'interest_account' => $d['interest_account'], 'cash_account' => $d['cash_account'] ?? null, 'remarks' => $d['remarks'] ?? null, 'updated_at' => now(),
             ]);
