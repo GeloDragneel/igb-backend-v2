@@ -146,13 +146,20 @@ class LoanController extends SalesController
         $paidP = (float) ($paid[$loan->id]['principal'] ?? 0);
         $paidI = (float) ($paid[$loan->id]['interest'] ?? 0);
         $sched = self::loanSchedule($loan);
-
+ 
         // next unpaid installment = first row whose cumulative principal is not covered yet
-        $cum = 0; $next = null;
+        // and every unpaid installment already past its due date
+        $cum = 0; $next = null; $odCount = 0; $odAmount = 0.0;
+        $today = date('Y-m-d');
         foreach ($sched as $row) {
             $cum += $row['principal'];
-            if ($cum - $paidP > 0.009) { $next = $row; break; }
+            if ($cum - $paidP <= 0.009) continue;               // fully paid
+            if (!$next) $next = $row;
+            if ($row['due_date'] >= $today) break;
+            $odCount++;
+            $odAmount += $row['total'];
         }
+        if ($loan->status !== 'active') { $odCount = 0; $odAmount = 0.0; }
         $outstanding = round((float) $loan->principal - $paidP, 2);
         return [
             'id' => $loan->id, 'loan_no' => $loan->loan_no, 'direction' => $loan->direction,
@@ -168,6 +175,7 @@ class LoanController extends SalesController
             'outstanding' => max(0, $outstanding),
             'next_due' => $next ? ['no' => $next['no'], 'date' => $next['due_date'], 'total' => $next['total']] : null,
             'overdue' => $next && $loan->status === 'active' && $next['due_date'] < date('Y-m-d'),
+            'overdue_count' => $odCount, 'overdue_amount' => round($odAmount, 2),
         ];
     }
 
