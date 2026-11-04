@@ -1688,13 +1688,13 @@ class MobileController extends Controller
     public function dashboard(Request $r)
     {
         $by = (int) $r->query('userId', 0);
-        $from = (string) $r->query('from', date('Y-m'));
-        $to = (string) $r->query('to', date('Y-m'));
+        $from = substr((string) $r->query('from', date('Y-m')), 0, 7);
+        $to = substr((string) $r->query('to', date('Y-m')), 0, 7);
         $voidId = (int) (DB::table('m_invoice_status')->whereRaw("UPPER(name) LIKE 'VOID%'")->value('id') ?: 5);
-
+ 
         $months = [];
         for ($i = 5; $i >= 0; $i--) $months[] = now()->startOfMonth()->subMonths($i)->format('Y-m');
-
+ 
         $sales = fn () => DB::table('t_sales_invoice_master')->where('added_by', $by)->where('invoice_status_id', '<>', $voidId)
             ->where(fn ($w) => $w->whereNull('trans_type')->orWhere('trans_type', 'posted'));
         $buy = function (string $type) use ($by, $voidId) {
@@ -1706,20 +1706,20 @@ class MobileController extends Controller
             return $q;
         };
         $vc = fn (string $type) => (int) DB::table('m_vendor_customer')->where('entry_by', $by)->where('user_type', $type)->count();
-
+ 
         $monthly = function ($q, string $key) use ($months) {
             $byMonth = $q->whereIn('declared_month', $months)->groupBy('declared_month')
                 ->selectRaw('declared_month AS m, SUM(grand_total) AS t')->pluck('t', 'm');
             $list = array_map(fn ($m) => ['month' => date('M Y', strtotime("$m-01")), $key => (float) ($byMonth[$m] ?? 0)], $months);
             return [$list, max(array_column($list, $key) ?: [0])];
         };
-
+ 
         try {
             [$mSales, $maxSales] = $monthly($sales(), 'sales');
             [$mPurch, $maxPurch] = $monthly($buy('purchases'), 'purchases');
             [$mExp, $maxExp] = $monthly($buy('expenses'), 'expenses');
-
-            return response()->json([
+ 
+            $old = [
                 'NoOfCustomer' => $vc('Customer'),
                 'noOfVendors' => $vc('Vendor'),
                 'totalSales' => round((float) $sales()->whereBetween('declared_month', [$from, $to])->sum('grand_total'), 2),
@@ -1732,10 +1732,74 @@ class MobileController extends Controller
                 'maxSales' => (float) $this->roundUpAdaptive($maxSales),
                 'maxPurchases' => (float) $this->roundUpAdaptive($maxPurch),
                 'maxExpenses' => (float) $this->roundUpAdaptive($maxExp),
-            ]);
+            ];
+ 
+            return response()->json($old + $this->webHome($by, $from, $to));
         } catch (Throwable $e) {
             return $this->err($e->getMessage());
         }
+    }
+ 
+    /** the web Home's data for this books owner (m_user_client id), called in-process as that client */
+    private function webHome(int $by, string $from, string $to): array
+    {
+        $user = \App\Models\UserClient::find($by);
+        if (!$user) return [];
+ 
+        $req = function () use ($user, $from, $to) {
+            $q = Request::create('/', 'GET', ['from' => $from, 'to' => $to, 'branch' => 'all']);
+            $q->setUserResolver(fn () => $user);
+            return $q;
+        };
+        $call = function (string $class, string $method) use ($req) {
+            try {
+                $res = app($class)->{$method}($req());
+                return $res->getStatusCode() < 300 ? (json_decode($res->getContent(), true) ?: []) : null;
+            } catch (Throwable $e) {
+                report($e);
+                return null;
+            }
+        };
+ 
+        $out = $call(\App\Http\Controllers\Api\DashboardController::class, 'summary') ?? [];
+        $pay = $call(\App\Http\Controllers\Api\BirReturnController::class, 'payables');
+        if ($pay) $out['payables'] = $pay;
+        $its = $call(\App\Http\Controllers\Api\ReportController::class, 'incomeTaxSummary');
+        if ($its) $out['income_tax'] = $this->itsPayable($its);
+        return $out;
+    }
+ 
+    /** Income tax payable — same as IncomeTaxSummary.jsx calc(fromApi(r)).payable (no saved adjustments, like the web Home) */
+    private function itsPayable(array $r): float
+    {
+        $sum = fn (array $rows, string $k) => array_sum(array_map(fn ($x) => (float) ($x[$k] ?? 0), $rows));
+        $S = $sum($r['sales'] ?? [], 'total');          $Sa = $sum($r['sales'] ?? [], 'adjustment');
+        $P = $sum($r['purchases'] ?? [], 'total');      $Pa = $sum($r['purchases'] ?? [], 'adjustment');
+        $E = $sum($r['expenses'] ?? [], 'total');       $Ea = $sum($r['expenses'] ?? [], 'adjustment');
+        $beg = (float) ($r['beginning'] ?? 0);
+ 
+        $subGross = $S - ($P + $beg);
+        $adjGross = $Sa - $Pa;
+        $taxable = ($subGross - $E) + ($adjGross - $Ea);
+ 
+        $amount = 0.0;
+        if (!empty($r['corporate'])) {
+            $amount = $taxable * 0.2;
+        } else {
+            $list = array_map(function ($b) {
+                $min = (float) ($b['min'] ?? 0);
+                $max = ($b['max'] ?? null) === null || $b['max'] === '' || !((float) $b['max'] > $min) ? null : (float) $b['max'];
+                return ['min' => $min, 'max' => $max, 'base' => (float) ($b['base'] ?? 0), 'rate' => (float) ($b['rate'] ?? 0)];
+            }, $r['brackets'] ?? []);
+            usort($list, fn ($a, $b) => $a['min'] <=> $b['min']);
+            $bracket = null;
+            foreach ($list as $b) {
+                if ($taxable >= $b['min'] && ($b['max'] === null || $taxable < $b['max'])) { $bracket = $b; break; }
+            }
+            if (!$bracket && $list && $taxable >= end($list)['min']) $bracket = end($list);
+            if ($bracket) $amount = ($taxable - $bracket['min']) * $bracket['rate'] + $bracket['base'];
+        }
+        return round($amount - (float) ($r['ewt2307'] ?? 0), 2);
     }
 
     /** chart max: round up to a "nice" number */
