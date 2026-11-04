@@ -849,7 +849,7 @@ class BillingController extends Controller
                     'dep_slip_number' => (string) ((int) DB::table('t_payment')->max(DB::raw('CAST(dep_slip_number AS UNSIGNED)')) + 1),
                     'prepared_by_id' => $me, 'prepared_date' => $date, 'is_prepared' => 1, 'is_deposited' => 1,
                     'payment_status' => 3, 'deposited_by_id' => $me, 'deposited_date' => $date]
-                : ['assigned_bank' => 0, 'assigned_by' => null, 'assigned_bank_date' => null, 'dep_slip_number' => null,
+                : ['assigned_bank' => null, 'assigned_by' => null, 'assigned_bank_date' => null, 'dep_slip_number' => null,
                     'prepared_by_id' => null, 'prepared_date' => null, 'is_prepared' => 0, 'is_deposited' => 0,
                     'payment_status' => 1, 'deposited_by_id' => $me, 'deposited_date' => null];
             DB::table('t_payment')->where('id', $p->id)->update($this->only('t_payment', $deposit + ['updated_at' => now()]));
