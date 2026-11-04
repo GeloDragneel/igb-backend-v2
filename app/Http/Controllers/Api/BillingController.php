@@ -195,16 +195,20 @@ class BillingController extends Controller
         $a = DB::table('m_client_account')->where('id', $caid)->first();
         if (!$a) return response()->json(['message' => 'Client account not found.'], 404);
         $c = DB::table('m_client')->where('client_num', $a->client_num)->first();
-
+ 
         $brgy = $this->firstTable(['m_barangay', 'm_brgy', 'm_barangays']);
         $city = $this->firstTable(['m_city', 'm_city_municipality', 'm_city_mun', 'm_cities']);
         $prov = $this->firstTable(['m_province', 'm_provinces']);
         $src = fn ($k) => $a->$k ?? $c->$k ?? null;
-
+ 
+        $stLabel = $this->pick('m_client_account_status', ['status_name', 'description', 'name']);
+        $status = $stLabel && !empty($a->status_id)
+            ? (string) (DB::table('m_client_account_status')->where('id', $a->status_id)->value($stLabel) ?? '') : '';
+ 
         $periods = DB::table('t_transaction')->where('ca_id', $caid)->whereNotNull('trans_number')
             ->orderByDesc('date_start')->orderByDesc('id')
             ->get(['id', 'trans_number', 'service_period', 'is_paid', 'ass_to_id']);
-
+ 
         return response()->json([
             'id' => $a->id,
             'tin' => $a->tin ?? $c->tin ?? '',
@@ -214,10 +218,11 @@ class BillingController extends Controller
             'barangay' => $this->placeName($brgy, $src('brgy_id')),
             'city' => $this->placeName($city, $src('city_id')),
             'province' => $this->placeName($prov, $src('province_id')),
+            'account_status' => $status,
+            'account_active' => isset($a->is_active) ? (int) $a->is_active : 1,
             'periods' => $periods,
         ]);
     }
-
     /* =====================================================================
        All services / payments (with filters)
        ===================================================================== */
@@ -995,26 +1000,32 @@ class BillingController extends Controller
             $version = $d['eo_version'] ?? ($versions->first() ?? 1);
         }
         $trade = $this->pick('m_client_account', ['trade_name', 'business_name', 'name']);
-
+        $stLabel = $this->pick('m_client_account_status', ['status_name', 'description', 'name']);
+        $hasActive = in_array('is_active', $this->cols('m_client_account'), true);
+ 
         $rows = DB::table('t_recurring_service as R')
             ->leftJoin('m_service_list as L', 'L.id', '=', 'R.ser_list_id')
             ->leftJoin('m_client_account as A', 'A.id', '=', 'R.ca_id')
             ->leftJoin('m_client as C', 'C.client_num', '=', 'A.client_num')
+            ->when($stLabel, fn ($q) => $q->leftJoin('m_client_account_status as AST', 'AST.id', '=', 'A.status_id'))
             ->where('R.total_service_fee', '>', 0)
             ->when($caid, fn ($q) => $q->where('R.ca_id', $caid)->where('R.eo_version', $version))
             ->when(!$caid, fn ($q) => $q->whereRaw('R.eo_version = (SELECT MAX(R2.eo_version) FROM t_recurring_service R2 WHERE R2.ca_id = R.ca_id)'))
             ->orderBy(DB::raw($this->clientNameSql()))->orderBy('A.branch_code')->orderByDesc('R.is_active')->orderBy('L.name')
             ->get(['R.*', DB::raw("COALESCE(L.name, '') AS service"), 'L.ser_type_id', 'A.branch_code',
-                DB::raw($trade ? "A.{$trade} AS trade_name" : "'' AS trade_name"), DB::raw($this->clientNameSql() . ' AS client_name')])
+                DB::raw($trade ? "A.{$trade} AS trade_name" : "'' AS trade_name"), DB::raw($this->clientNameSql() . ' AS client_name'),
+                DB::raw($stLabel ? "COALESCE(AST.{$stLabel}, '') AS account_status" : "'' AS account_status"),
+                DB::raw($hasActive ? 'COALESCE(A.is_active, 1) AS account_active' : '1 AS account_active')])
             ->map(function ($r) {
                 [$vat, $wh, $disc] = $this->inherited((float) $r->total_service_fee, $r);
                 foreach (['service_fee', 'surcharge', 'less', 'total_service_fee', 'less_other_percentage'] as $k) $r->$k = round((float) $r->$k, 2);
                 $r->vat = $vat; $r->wh = $wh; $r->discount = $disc;
                 $r->net = round((float) $r->total_service_fee + $vat - $wh - $disc, 2);
                 $r->is_active = (int) $r->is_active;
+                $r->account_active = (int) $r->account_active;
                 return $r;
             });
-
+ 
         return response()->json(['eo_version' => $version ? (int) $version : null, 'versions' => $versions, 'rows' => $rows,
             'total' => round($rows->where('is_active', 1)->sum('net'), 2)]);
     }
