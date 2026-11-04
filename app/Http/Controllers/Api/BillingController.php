@@ -1187,8 +1187,6 @@ class BillingController extends Controller
             'rep_type_id' => ['required', 'integer'],
         ], ['date_start.required' => 'Please provide all required data!', 'service_period.required' => 'Please provide all required data!', 'rep_type_id.required' => 'Please provide all required data!']);
 
-        if ($d['service_period'] > now()->format('Y-m')) return response()->json(['message' => 'Service period cannot be in the future.'], 422);
-
         $period = $this->periodLabel($d['service_period']);
         $eoVersion = (int) substr($d['service_period'], 0, 4);
         $employeeId = $this->me($request);

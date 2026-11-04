@@ -153,7 +153,7 @@ class LoanController extends SalesController
         $today = date('Y-m-d');
         foreach ($sched as $row) {
             $cum += $row['principal'];
-            if ($cum - $paidP <= 0.009) continue;               // fully paid
+            if ($cum - $paidP <= 0.009) continue; // fully paid
             if (!$next) $next = $row;
             if ($row['due_date'] >= $today) break;
             $odCount++;
