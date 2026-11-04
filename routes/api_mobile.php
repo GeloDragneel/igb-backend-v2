@@ -117,4 +117,5 @@ Route::prefix('mobile')->controller(MobileController::class)->group(function () 
 
     Route::match(['get', 'post'], 'profile_settings', 'profileSettings');
     Route::match(['get', 'post'], 'messenger/{path}', 'messenger')->where('path', '.*');
+    Route::post('biometric_login', 'biometricLogin');
 });

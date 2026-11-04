@@ -465,12 +465,33 @@ class MobileController extends Controller
             'FingerprintData' => $b->fingerprint_data,
             'TradeName' => $b->trade_name,
             'Username' => $b->username,
-            'Password' => $b->password,
+            // the password (hash) is no longer sent to the phone – biometric_login logs in on the server
             'DateAdded' => $b->created_at,
             'DateUpdated' => $b->updated_at,
         ];
     }
-
+    public function biometricLogin(Request $r)
+    {
+        $caid = (int) $r->input('CAID', 0);
+        $uid = (int) $r->input('UserID', 0);
+        if ($caid <= 0 || $uid <= 0) return response()->json(['result' => 'NotCorrect']);
+ 
+        $types = DB::table('m_biometric_register')->where('ca_id', $caid)->where('user_id', $uid)->pluck('user_type')->all();
+        if (!$types) return response()->json(['result' => 'NoBiometric']);
+ 
+        // the registered type first, then the other one (old registrations were all saved as "client")
+        $order = in_array('staff', $types, true) ? ['staff', 'client'] : ['client', 'staff'];
+        foreach ($order as $t) {
+            if ($t === 'client') {
+                $u = \App\Models\UserClient::query()->where('id', $uid)->where('caid', $caid)->where('is_active', 1)->first();
+                if ($u) return $this->mobileLoginPayload($u, 'User1');
+            } else {
+                $u = \App\Models\UserStaff::query()->where('id', $uid)->where('comid', $caid)->where('is_active', 1)->first();
+                if ($u) return $this->mobileLoginPayload($u, 'User2');
+            }
+        }
+        return response()->json(['result' => 'NotCorrect']);
+    }
     /** GET biometric_by_username?Username= */
     public function biometricByUsername(Request $r)
     {
@@ -2028,20 +2049,27 @@ class MobileController extends Controller
      * ========================================================= */
 
     /** POST login {username, password, loginAttempt} */
+    /** POST login {username, password, loginAttempt} */
     public function login(Request $r)
     {
         $username = trim((string) $r->input('username', ''));
         $password = (string) $r->input('password', '');
         $attempt = (int) $r->input('loginAttempt', 0);
         if ($username === '' || $password === '') return response()->json(['result' => 'NotCorrect']);
-
+ 
         $matches = array_values(array_filter($this->mobileCandidates($username), fn ($c) => $this->passwordMatches($c[0], $password)));
         if (count($matches) > 1) return response()->json(['result' => 'Duplicate']);
         if (!$matches) return response()->json(['result' => $attempt == 4 ? 'Attempt' : 'NotCorrect']);
-
+ 
         [$user, $type] = $matches[0];
+        return $this->mobileLoginPayload($user, $type);
+    }
+ 
+    /** the app's login answer for this user (password login and fingerprint login give the same thing) */
+    private function mobileLoginPayload($user, string $type)
+    {
         if (($rp = $this->pick($user->getTable(), ['reset_password'])) && (int) $user->$rp === 1) return response()->json(['result' => 'ResetPassword']);
-
+ 
         $acc = null;
         $emp = null;
         if ($type !== 'User2') {
@@ -2054,7 +2082,7 @@ class MobileController extends Controller
             $empId = $this->pick('m_user_client_staff', ['employee_id', 'emp_id']);
             $emp = $empId && $user->$empId ? DB::table('m_employee')->where('id', $user->$empId)->first() : null;
         }
-
+ 
         $designation = (int) ($emp->designation_id ?? 0);
         $position = '';
         if ($designation > 0 && ($col = $this->pick('m_user_type', ['name', 'description', 'user_type']))) {
@@ -2062,9 +2090,9 @@ class MobileController extends Controller
         }
         $workId = $emp ? ($emp->{$this->pick('m_employee', ['work_id', 'com_id']) ?? 'id'} ?? 0) : 0;
         $month = now('Asia/Manila')->format('Y-m');
-
+ 
         $token = method_exists($user, 'createToken') ? $user->createToken('mobile-' . $type)->plainTextToken : null;
-
+ 
         // every value as text, like the old login.php (the app reads them as String)
         return response()->json(array_map(fn ($v) => $v === null ? '' : (string) $v, [
             'result' => 'Success',
@@ -2090,7 +2118,6 @@ class MobileController extends Controller
             'position' => $position ?: ($type === 'User2' ? 'Staff' : ($type === 'User3' ? 'Client Staff' : '')),
         ]));
     }
-
     /** active logins with this username that may use the mobile app */
     private function mobileCandidates(string $username): array
     {
