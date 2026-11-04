@@ -1688,8 +1688,17 @@ class MobileController extends Controller
     public function dashboard(Request $r)
     {
         $by = (int) $r->query('userId', 0);
-        $from = substr((string) $r->query('from', date('Y-m')), 0, 7);
-        $to = substr((string) $r->query('to', date('Y-m')), 0, 7);
+        // any date the app sends (2026-01-01, 2026-01, 01/01/2026 …) → YYYY-MM
+        $ym = function ($v, string $fallback): string {
+            $v = trim((string) $v);
+            if (preg_match('/^\d{4}-\d{2}/', $v)) return substr($v, 0, 7);
+            $t = $v !== '' ? strtotime(str_replace('/', '-', $v)) : false;
+            if ($t === false && $v !== '') $t = strtotime($v);
+            return $t ? date('Y-m', $t) : $fallback;
+        };
+        $from = $ym($r->query('from'), date('Y') . '-01');
+        $to = $ym($r->query('to'), date('Y-m'));
+        if ($from > $to) [$from, $to] = [$to, $from];
         $voidId = (int) (DB::table('m_invoice_status')->whereRaw("UPPER(name) LIKE 'VOID%'")->value('id') ?: 5);
  
         $months = [];
@@ -3333,4 +3342,45 @@ class MobileController extends Controller
             'footer' => array_map(fn ($v) => ['value' => $v, 'formatted' => number_format($v, 2)], $foot),
         ]);
     }
+    public function profileSettings(Request $r)
+    {
+        $user = \App\Models\UserClient::find((int) $r->query('userId', 0));
+        if (!$user) return response()->json(['message' => 'User not found.'], 404);
+ 
+        $map = [
+            'show'           => ['GET', 'settingsShow', false],
+            'cities'         => ['GET', 'cities', false],
+            'barangays'      => ['GET', 'barangays', false],
+            'client'         => ['PUT', 'updateClient', false],
+            'account_store'  => ['POST', 'storeAccount', false],
+            'account_update' => ['PUT', 'updateAccount', true],
+            'account_delete' => ['DELETE', 'destroyAccount', true],
+            'id_store'       => ['POST', 'storeValidId', false],
+            'id_update'      => ['PUT', 'settingsUpdateValidId', true],
+            'id_delete'      => ['DELETE', 'destroyValidId', true],
+        ];
+        $action = (string) $r->query('action', 'show');
+        if (!isset($map[$action])) return response()->json(['message' => 'Unknown action.'], 422);
+        [$method, $fn, $withId] = $map[$action];
+ 
+        $params = $method === 'GET'
+            ? $r->query()
+            : (($r->isJson() ? $r->json()->all() : []) ?: $r->except(['userId', 'action', 'id']));
+        $req = Request::create('/', $method, $params);
+        $req->headers->set('Accept', 'application/json');
+        $req->setUserResolver(fn () => $user);
+ 
+        try {
+            $ctrl = app(\App\Http\Controllers\Api\SettingsController::class);
+            return $withId ? $ctrl->{$fn}($req, (int) $r->query('id', 0)) : $ctrl->{$fn}($req);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            return response()->json(['message' => collect($e->errors())->flatten()->first() ?: 'Check the form.', 'errors' => $e->errors()], 422);
+        } catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface $e) {
+            return response()->json(['message' => $e->getMessage() ?: 'Request failed.'], $e->getStatusCode());
+        } catch (Throwable $e) {
+            report($e);
+            return response()->json(['message' => $e->getMessage()], 500);
+        }
+    }
+
 }

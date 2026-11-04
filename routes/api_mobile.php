@@ -114,4 +114,6 @@ Route::prefix('mobile')->controller(MobileController::class)->group(function () 
     Route::get('purchases_info', 'expensesInfo');               // same tables as expenses_info
     Route::get('trial_balance', 'trialBalance');
     Route::get('transaction', 'transaction');
+
+    Route::match(['get', 'post'], 'profile_settings', 'profileSettings');
 });
