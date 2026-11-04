@@ -111,9 +111,10 @@ Route::prefix('mobile')->controller(MobileController::class)->group(function () 
     Route::get('sales_report', 'salesReport');
     Route::get('sales_info', 'salesInfo');
     Route::get('purchase_report', 'purchaseReport');
-    Route::get('purchases_info', 'expensesInfo');               // same tables as expenses_info
+    Route::get('purchases_info', 'expensesInfo'); // same tables as expenses_info
     Route::get('trial_balance', 'trialBalance');
     Route::get('transaction', 'transaction');
 
     Route::match(['get', 'post'], 'profile_settings', 'profileSettings');
+    Route::match(['get', 'post'], 'messenger/{path}', 'messenger')->where('path', '.*');
 });

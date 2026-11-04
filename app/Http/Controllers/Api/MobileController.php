@@ -3382,5 +3382,67 @@ class MobileController extends Controller
             return response()->json(['message' => $e->getMessage()], 500);
         }
     }
-
+    public function messenger(Request $r, string $path = '')
+    {
+        $emp = (int) $r->input('employeeId', 0);
+        if ($emp <= 0 || !DB::table('m_employee')->where('id', $emp)->exists()) {
+            return response()->json(['message' => 'Messenger is for employees only.'], 403);
+        }
+        $user = new \App\Models\UserStaff();
+        $user->employee_id = $emp;
+ 
+        // [method, path pattern, MessengerController function] – same list as routes/api_messenger.php
+        $map = [
+            ['GET', 'summary', 'summary'],
+            ['GET', 'people', 'people'],
+            ['GET', 'gifs', 'gifs'],
+            ['GET', 'giphy', 'giphy'],
+            ['POST', 'gifs', 'addGifs'],
+            ['DELETE', 'gifs/(\d+)', 'removeGif'],
+            ['GET', 'conversations', 'conversations'],
+            ['POST', 'direct', 'direct'],
+            ['POST', 'groups', 'createGroup'],
+            ['GET', 'conversations/(\d+)', 'show'],
+            ['PUT', 'conversations/(\d+)', 'rename'],
+            ['POST', 'conversations/(\d+)/messages', 'send'],
+            ['POST', 'conversations/(\d+)/read', 'read'],
+            ['POST', 'conversations/(\d+)/typing', 'typing'],
+            ['POST', 'conversations/(\d+)/members', 'addMembers'],
+            ['DELETE', 'conversations/(\d+)/members/(\d+)', 'removeMember'],
+            ['PUT', 'conversations/(\d+)/members/(\d+)/admin', 'setAdmin'],
+            ['GET', 'conversations/(\d+)/shared', 'shared'],
+            ['GET', 'conversations/(\d+)/search', 'search'],
+            ['PUT', 'conversations/(\d+)/customize', 'customize'],
+            ['POST', 'conversations/(\d+)/pin', 'pin'],
+            ['POST', 'messages/(\d+)/react', 'react'],
+            ['POST', 'messages/(\d+)/pin', 'pinMessage'],
+            ['POST', 'messages/(\d+)/forward', 'forward'],
+            ['DELETE', 'messages/(\d+)', 'unsend'],
+        ];
+ 
+        $method = strtoupper((string) $r->input('_method', $r->method()));
+        $path = trim($path, '/');
+ 
+        foreach ($map as [$m, $pattern, $fn]) {
+            if ($m !== $method || !preg_match('#^' . $pattern . '$#', $path, $hit)) continue;
+ 
+            $params = $r->except(['employeeId', 'userId', '_method']);
+            $req = Request::create('/api/messenger/' . $path, $method === 'GET' ? 'GET' : 'POST', $params, [], $r->allFiles());
+            $req->headers->set('Accept', 'application/json');
+            $req->setUserResolver(fn () => $user);
+            $args = array_map('intval', array_slice($hit, 1));
+ 
+            try {
+                return app(\App\Http\Controllers\Api\MessengerController::class)->{$fn}($req, ...$args);
+            } catch (\Illuminate\Validation\ValidationException $e) {
+                return response()->json(['message' => collect($e->errors())->flatten()->first() ?: 'Check the form.', 'errors' => $e->errors()], 422);
+            } catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface $e) {
+                return response()->json(['message' => $e->getMessage() ?: 'Request failed.'], $e->getStatusCode());
+            } catch (\Throwable $e) {
+                report($e);
+                return response()->json(['message' => $e->getMessage()], 500);
+            }
+        }
+        return response()->json(['message' => 'Unknown messenger action.'], 404);
+    }
 }
