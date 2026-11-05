@@ -74,6 +74,7 @@ Route::prefix('mobile')->controller(MobileController::class)->group(function () 
     Route::get('leave_duration', 'leaveDuration');
     Route::post('leave_registration', 'leaveRegistration');
     Route::post('overtime_registration', 'overtimeRegistration');
+    Route::match(['get', 'post', 'put'], 'hr/{path}', 'hr')->where('path', '.*');   // staff My profile → web /api/hr/...
 
     // login
     Route::post('login', 'login');

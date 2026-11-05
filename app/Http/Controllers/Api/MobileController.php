@@ -3498,4 +3498,37 @@ class MobileController extends Controller
         }
         return response()->json(['message' => 'Unknown messenger action.'], 404);
     }
+
+    /* =========================================================
+     * HR for the staff app ("My profile"): the web /api/hr/... routes, run as the staff login of userId
+     *   GET|POST|PUT  mobile/hr/{path}?userId=     e.g. hr/my-profile · hr/my-requests?year=2026 · hr/leaves
+     *   same answers as the web (ProfileController / HRManagmentController), nothing copied
+     * ========================================================= */
+    public function hr(Request $r, string $path)
+    {
+        $user = \App\Models\UserStaff::query()
+            ->whereKey((int) ($r->query('userId') ?? $r->input('userId', 0)))
+            ->where('is_active', 1)
+            ->first();
+        if (!$user) return response()->json(['message' => 'Unauthenticated.'], 401);
+        if (!preg_match('#^[A-Za-z0-9/_-]+$#', $path)) return response()->json(['message' => 'Not found.'], 404);
+
+        $sub = Request::create('/api/hr/' . $path, $r->method(), $r->except('userId'), [], $r->allFiles(), ['HTTP_ACCEPT' => 'application/json']);
+
+        // log in as this staff for the inner request (whatever guard the hr routes use)
+        foreach (['sanctum', 'web', 'api'] as $guard) {
+            try {
+                \Illuminate\Support\Facades\Auth::guard($guard)->setUser($user);
+            } catch (Throwable $e) {
+                // guard not configured
+            }
+        }
+        $sub->setUserResolver(fn () => $user);
+
+        try {
+            return \Illuminate\Support\Facades\Route::dispatch($sub);
+        } catch (Throwable $e) {
+            return app(\Illuminate\Contracts\Debug\ExceptionHandler::class)->render($sub, $e);   // validation / abort → JSON with message
+        }
+    }
 }
