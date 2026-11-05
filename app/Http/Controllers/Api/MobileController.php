@@ -3506,29 +3506,36 @@ class MobileController extends Controller
      * ========================================================= */
     public function hr(Request $r, string $path)
     {
-        $user = \App\Models\UserStaff::query()
-            ->whereKey((int) ($r->query('userId') ?? $r->input('userId', 0)))
-            ->where('is_active', 1)
-            ->first();
-        if (!$user) return response()->json(['message' => 'Unauthenticated.'], 401);
+        $userId = (int) ($r->query('userId') ?? $r->input('userId', 0));
+        $user = $userId > 0 ? \App\Models\UserStaff::query()->whereKey($userId)->first() : null;
+        if (!$user) {
+            return response()->json(['message' => "No staff login found for userId {$userId}. Log out and log in again as staff."], 401);
+        }
         if (!preg_match('#^[A-Za-z0-9/_-]+$#', $path)) return response()->json(['message' => 'Not found.'], 404);
 
         $sub = Request::create('/api/hr/' . $path, $r->method(), $r->except('userId'), [], $r->allFiles(), ['HTTP_ACCEPT' => 'application/json']);
 
-        // log in as this staff for the inner request (whatever guard the hr routes use)
-        foreach (['sanctum', 'web', 'api'] as $guard) {
-            try {
-                \Illuminate\Support\Facades\Auth::guard($guard)->setUser($user);
-            } catch (Throwable $e) {
-                // guard not configured
-            }
-        }
-        $sub->setUserResolver(fn () => $user);
-
         try {
-            return \Illuminate\Support\Facades\Route::dispatch($sub);
+            // the web route for this path (same controller method), run directly as this staff — no login middleware
+            $route = app('router')->getRoutes()->match($sub);
+            $sub->setRouteResolver(fn () => $route);
+            app()->instance('request', $sub);
+            $sub->setUserResolver(fn () => $user);
+            foreach (['sanctum', 'web', 'api'] as $guard) {
+                try {
+                    \Illuminate\Support\Facades\Auth::guard($guard)->setUser($user);
+                } catch (Throwable $e) {
+                    // guard not configured
+                }
+            }
+            app('router')->substituteBindings($route);
+            app('router')->substituteImplicitBindings($route);
+
+            return \Illuminate\Routing\Router::toResponse($sub, $route->run());
         } catch (Throwable $e) {
             return app(\Illuminate\Contracts\Debug\ExceptionHandler::class)->render($sub, $e);   // validation / abort → JSON with message
+        } finally {
+            app()->instance('request', $r);
         }
     }
 }
