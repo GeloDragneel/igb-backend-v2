@@ -434,7 +434,9 @@ class MobileController extends Controller
     private function biometricClients(callable $where)
     {
         $q = DB::table('m_biometric_register as B')
-            ->join('m_user_client as U', 'U.id', '=', 'B.user_id')
+            ->join('m_user_client as U', function ($j) {
+                $j->on('U.id', '=', 'B.user_id')->on('U.caid', '=', 'B.ca_id');   // the client of THAT account only
+            })
             ->leftJoin('m_client_account as A', 'A.id', '=', 'B.ca_id')
             ->where('B.user_type', 'client')
             ->select(['B.id', 'B.ca_id', 'B.user_id', 'B.fingerprint_data', 'A.trade_name', 'U.username', 'U.password', 'B.created_at', 'B.updated_at']);
@@ -443,12 +445,21 @@ class MobileController extends Controller
     }
 
     /** staff logins (m_user_staff → m_employee) with a fingerprint */
-    private function biometricStaff(callable $where)
+   private function biometricStaff(callable $where)
     {
         $q = DB::table('m_biometric_register as B')
-            ->join('m_user_staff as S', 'S.id', '=', 'B.user_id')
+            ->join('m_user_staff as S', function ($j) {
+                $j->on('S.id', '=', 'B.user_id')->on('S.comid', '=', 'B.ca_id');  // staff CAID = ComID
+            })
             ->leftJoin('m_employee as E', 'E.com_id', '=', 'S.comid')         // staff login → employee (same as AuthController)
-            ->where('B.user_type', 'staff')
+            ->where(function ($w) {
+                $w->where('B.user_type', 'staff')
+                  ->orWhere(function ($x) {
+                      $x->where('B.user_type', 'client')
+                        ->whereNotExists(fn ($c) => $c->from('m_user_client as UC')
+                            ->whereColumn('UC.id', 'B.user_id')->whereColumn('UC.caid', 'B.ca_id'));
+                  });
+            })
             ->select(['B.id', 'B.ca_id', 'B.user_id', 'B.fingerprint_data',
                 DB::raw("TRIM(CONCAT_WS(' ', E.last_name, E.first_name, E.middle_name)) AS trade_name"),
                 'S.username', 'S.password', 'B.created_at', 'B.updated_at']);
@@ -513,21 +524,36 @@ class MobileController extends Controller
         $userId = (int) $r->input('UserID', 0);
         $finger = trim((string) $r->input('FingerprintData', ''));
         $type = strtolower((string) $r->input('UserType', 'client')) === 'staff' ? 'staff' : 'client';
-
+ 
         if ($caid === 0) return $this->err('Invalid CAID');
         if ($userId === 0) return $this->err('Invalid UserID');
         if ($finger === '') return $this->err('Invalid FingerprintData');
-
+ 
         try {
+            // an old app (no UserType) on a staff login → staff
+            if ($type === 'client'
+                && !DB::table('m_user_client')->where('id', $userId)->where('caid', $caid)->exists()
+                && DB::table('m_user_staff')->where('id', $userId)->where('comid', $caid)->exists()) {
+                $type = 'staff';
+            }
+ 
+            // old staff fingerprints saved as "client" → "staff"
+            if ($type === 'staff') {
+                DB::table('m_biometric_register')->where('ca_id', $caid)->where('user_id', $userId)->where('user_type', 'client')
+                    ->whereNotExists(fn ($c) => $c->from('m_user_client as UC')
+                        ->where('UC.id', $userId)->where('UC.caid', $caid))
+                    ->update(['user_type' => 'staff', 'updated_at' => now()]);
+            }
+ 
             $q = fn () => DB::table('m_biometric_register')->where('ca_id', $caid)->where('user_id', $userId)->where('user_type', $type);
-
+ 
             if ($q()->where('fingerprint_data', $finger)->exists()) return $this->err('Biometric already registered');
-
+ 
             if ($q()->exists()) {
                 $q()->update(['fingerprint_data' => $finger, 'updated_at' => now()]);
                 return response()->json(['result' => 'Success', 'message' => 'Biometric updated for new device']);
             }
-
+ 
             DB::table('m_biometric_register')->insert([
                 'ca_id' => $caid, 'user_id' => $userId, 'user_type' => $type,
                 'fingerprint_data' => $finger, 'created_at' => now(), 'updated_at' => now(),
