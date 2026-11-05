@@ -3506,17 +3506,28 @@ class MobileController extends Controller
      * ========================================================= */
     public function hr(Request $r, string $path)
     {
+        if (!preg_match('#^[A-Za-z0-9/_-]+$#', $path)) return response()->json(['message' => 'Not found.'], 404);
+        return $this->asStaff($r, '/api/hr/' . $path);
+    }
+
+    /* PUT mobile/me/password?userId=   { current_password, password, password_confirmation } → the web /api/me/password */
+    public function mePassword(Request $r)
+    {
+        return $this->asStaff($r, '/api/me/password');
+    }
+
+    /** run a web API route (same controller method) as the staff login of userId — no login middleware */
+    private function asStaff(Request $r, string $uri)
+    {
         $userId = (int) ($r->query('userId') ?? $r->input('userId', 0));
         $user = $userId > 0 ? \App\Models\UserStaff::query()->whereKey($userId)->first() : null;
         if (!$user) {
             return response()->json(['message' => "No staff login found for userId {$userId}. Log out and log in again as staff."], 401);
         }
-        if (!preg_match('#^[A-Za-z0-9/_-]+$#', $path)) return response()->json(['message' => 'Not found.'], 404);
 
-        $sub = Request::create('/api/hr/' . $path, $r->method(), $r->except('userId'), [], $r->allFiles(), ['HTTP_ACCEPT' => 'application/json']);
+        $sub = Request::create($uri, $r->method(), $r->except('userId'), [], $r->allFiles(), ['HTTP_ACCEPT' => 'application/json']);
 
         try {
-            // the web route for this path (same controller method), run directly as this staff — no login middleware
             $route = app('router')->getRoutes()->match($sub);
             $sub->setRouteResolver(fn () => $route);
             app()->instance('request', $sub);
