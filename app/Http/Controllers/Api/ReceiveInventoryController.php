@@ -92,7 +92,7 @@ class ReceiveInventoryController extends SalesController
                 'qty' => $l['qty'], 'receive_qty' => $l['qty'], 'price' => $l['price'], 'total' => $gross,
                 'discount_amount' => $disc, 'input_vat' => $vat, 'net_of_vat' => $net,
                 'vat_exempt' => $exempt, 'non_vat' => $non, 'zero_rated' => $zero,
-                'po_id' => (int) ($l['po_id'] ?? 0), 'po_number' => $l['po_number'] ?? null, 'ap_invoice_no' => $l['ap_invoice_no'] ?? null,
+                'po_id' => (int) ($l['po_id'] ?? 0), 'po_number' => $l['po_number'] ?? null, 'invoice_no' => $l['invoice_no'] ?? null,
             ];
         }
         return $rows;
@@ -193,7 +193,7 @@ class ReceiveInventoryController extends SalesController
                     'account_code' => $l->account_code, 'unit_type_id' => $l->unit_type_id,
                     'qty' => max(0, (float) $l->qty - (float) $l->receive_qty), 'ordered' => (float) $l->qty, 'received' => (float) $l->receive_qty,
                     'price' => (float) $l->price, 'discount' => (float) $l->discount_amount,
-                    'vat_type' => $this->vatTypeOf($l), 'po_id' => $l->id, 'po_number' => $ref, 'ap_invoice_no' => null,
+                    'vat_type' => $this->vatTypeOf($l), 'po_id' => $l->id, 'po_number' => $ref, 'invoice_no' => null,
                 ])->filter(fn ($l) => $l['qty'] > 0)->values();
 
             return response()->json(['header' => [
@@ -213,7 +213,7 @@ class ReceiveInventoryController extends SalesController
                 'account_code' => $l->account_code, 'unit_type_id' => $l->unit_type_id,
                 'qty' => (float) $l->quantity, 'ordered' => (float) $l->quantity, 'received' => 0,
                 'price' => (float) $l->unit_price, 'discount' => (float) $l->discount_amount,
-                'vat_type' => $this->vatTypeOf($l), 'po_id' => 0, 'po_number' => null, 'ap_invoice_no' => $ref,
+                'vat_type' => $this->vatTypeOf($l), 'po_id' => 0, 'po_number' => null, 'invoice_no' => $ref,
             ]);
 
         return response()->json(['header' => [
@@ -250,7 +250,7 @@ class ReceiveInventoryController extends SalesController
                 'item_id' => $l->item_id, 'item_code' => $l->item_code, 'description' => $l->description,
                 'account_code' => $l->account_code, 'unit_type_id' => $l->unit_type_id,
                 'qty' => (float) $l->qty, 'price' => (float) $l->price, 'discount' => (float) $l->discount_amount,
-                'vat_type' => $this->vatTypeOf($l), 'po_id' => $l->po_id, 'po_number' => $l->po_number, 'ap_invoice_no' => $l->ap_invoice_no,
+                'vat_type' => $this->vatTypeOf($l), 'po_id' => $l->po_id, 'po_number' => $l->po_number, 'invoice_no' => $l->invoice_no,
             ]),
             'vendor' => VendorCustomer::find($m->vendor_id),
         ]);
@@ -324,7 +324,7 @@ class ReceiveInventoryController extends SalesController
             'lines.*.vat_type'      => ['required', 'in:vatable,exempt,zero,nonvat'],
             'lines.*.po_id'         => ['nullable', 'integer'],
             'lines.*.po_number'     => ['nullable', 'string', 'max:40'],
-            'lines.*.ap_invoice_no' => ['nullable', 'string', 'max:40'],
+            'lines.*.invoice_no' => ['nullable', 'string', 'max:40'],
         ], [
             'vendor_id.min' => 'Vendor is required', 'vendor_id.required' => 'Vendor is required',
             'location_id.min' => 'Location is required', 'location_id.required' => 'Location is required',
