@@ -2777,17 +2777,39 @@ class ReportController extends SalesController
     private function esParties($ids): array
     {
         $out = [];
+        // a value made of only "null" words (e.g. "null null null") counts as empty
+        $val = function (array $a, array $keys): string {
+            foreach ($keys as $k) {
+                $v = trim(preg_replace('/\s+/', ' ', preg_replace('/\bnull\b/i', '', (string) ($a[$k] ?? ''))));
+                if ($v !== '') return $v;
+            }
+            return '';
+        };
         // withoutGlobalScopes: a deleted / hidden customer still has its name and TIN on old invoices
         foreach (VendorCustomer::withoutGlobalScopes()->whereIn('id', collect($ids)->filter()->unique()->values())->get() as $v) {
             $a = $v->toArray();
             $tinRaw = $this->esFirst($a, ['tin']);
             $nameRaw = $this->esFirst($a, ['name', 'vendor_name', 'registered_name', 'trade_name']);
+ 
+            $street = $val($a, ['mail_to_address', 'address', 'street']);
+            $city = $val($a, ['mail_to_city_country', 'city_country', 'city']);
+ 
+            // nothing typed → from the ids on the record
+            $brgy = $this->esLookup('m_barangay', $a['barangay_id'] ?? $a['brgy_id'] ?? null, ['barangay', 'name', 'description']);
+            if ($street === '' && $brgy !== '') $street = $brgy;
+            if ($city === '') {
+                $city = trim(implode(' ', array_filter([
+                    $this->esLookup('m_city_mun', $a['city_id'] ?? $a['city_mun_id'] ?? null, ['city_mun', 'citymun', 'name', 'description']),
+                    $this->esLookup('m_province', $a['province_id'] ?? null, ['province', 'name', 'description']),
+                ])));
+            }
+ 
             $out[$v->id] = [
                 'tin'      => preg_replace('/\D/', '', $tinRaw),
                 'branch'   => $this->esClean($this->esFirst($a, ['branch_code'])),
                 'name'     => $this->esClean($nameRaw),
-                'address'  => $this->esClean($this->esFirst($a, ['mail_to_address', 'address', 'street'])),
-                'city'     => $this->esClean($this->esFirst($a, ['mail_to_city_country', 'city_country', 'city'])),
+                'address'  => $this->esClean($street),
+                'city'     => $this->esClean($city),
                 'tin_raw'  => $tinRaw,
                 'name_raw' => $nameRaw,
             ];
@@ -2907,7 +2929,7 @@ class ReportController extends SalesController
                 // exactly the old ajax/dat.php layout (Address 1 / Address 2 = the old "street barangay, city province zip" split at the comma)
                 $content .= "H,P,{$tin},{$X($name)}.,,,,{$X($c['trade_name'])},{$addr1},{$addr2},0,0,{$M($totals['exempt'])},{$M($totals['zero'])},{$M($totals['net'])},{$M($totals['vat'])},{$M($totals['vat'])},,{$c['rdo']},{$periodEnd},12\n";
                 // one DAT line per TIN (RELIEF); the table above keeps one line per reference
-                foreach ($this->esConsolidate($rows, ['php', 'net', 'vat', 'exempt', 'zero']) as $r) {
+                foreach ($rows as $r) {
                     // old layout: D,P,TIN,Name,,,,Address,City,0,0,Exempt,Zero,Net,VAT,Owner TIN,Period,,,,
                     $content .= "D,P,{$T($r['tin'])},{$X($r['_name_raw'] ?: $r['name'])},,,,{$A($r['address'])},{$A($r['city'])},0,0,{$M($r['exempt'])},{$M($r['zero'])},{$M($r['net'])},{$M($r['vat'])},{$tin},{$periodEnd},,,,\n";
                 }
@@ -2963,7 +2985,7 @@ class ReportController extends SalesController
                 // H,S,TIN,Name,Last,First,Middle,Trade,Address1,Address2,Exempt,Zero rated,Taxable,Output tax,RDO,Period,Fiscal month
                 // (Address 2 was missing: every field after it moved one place left → "Invalid RDO CODE" / "Invalid date on Tax Month")
                 $content .= "H,S,{$tin},{$X($name)},,,,{$X($c['trade_name'])},{$addr1},{$addr2},{$M($totals['exempt'])},{$M($totals['zero'])},{$M($totals['net'])},{$M($totals['vat'])},{$c['rdo']},{$periodEnd},12,\n";
-                foreach ($this->esConsolidate($rows, ['php', 'net', 'vat', 'exempt', 'zero']) as $r) {
+                foreach ($rows as $r) {
                     // old layout: D,S,TIN,Name,,,,Address,City,Exempt,Zero,Net,VAT,Owner TIN,Period,,,
                     $content .= "D,S,{$T($r['tin'])},{$X($r['_name_raw'] ?: $r['name'])},,,,{$A($r['address'])},{$A($r['city'])},{$M($r['exempt'])},{$M($r['zero'])},{$M($r['net'])},{$M($r['vat'])},{$tin},{$periodEnd},,,\n";
                 }

@@ -18,23 +18,30 @@ namespace App\Http\Controllers\Concerns;
 trait EsubValidation
 {
     /** RELIEF text: upper case, Ñ → N, no accents, no commas / quotes / line breaks, single spaces */
-    protected function esDatText($s): string
+    protected function esDatBase($s): string
     {
         $s = (string) $s;
-        $s = strtr($s, ['Ñ' => 'N', 'ñ' => 'N', '“' => '', '”' => '', '"' => '', "'" => "'", '’' => "'", '‘' => "'",
+        $s = strtr($s, ['Ñ' => 'N', 'ñ' => 'N', '“' => '', '”' => '', '"' => '', "'" => '', '’' => '', '‘' => '', '`' => '',
             ',' => ' ', "\r" => ' ', "\n" => ' ', "\t" => ' ', '–' => '-', '—' => '-']);
         if (function_exists('iconv')) {
             $t = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $s);
             if ($t !== false) $s = $t;
         }
         $s = preg_replace('/[^\x20-\x7E]/', '', $s);
+        $s = str_replace(["'", '`', '"'], '', $s);            // iconv can turn accents into ' or "
         return strtoupper(trim(preg_replace('/\s+/', ' ', $s)));
+    }
+ 
+    /** RELIEF names: apostrophes / quotes removed, other special characters → space; only A-Z 0-9 space & . - ( ) / are kept */
+    protected function esDatText($s): string
+    {
+        return trim(preg_replace('/\s+/', ' ', preg_replace('/[^A-Z0-9 &.\-()\/]/', ' ', $this->esDatBase($s))));
     }
 
     /** address / city: same as above and anything RELIEF doesn't take is dropped (fixed, not an error) */
     protected function esDatAddress($s): string
     {
-        return trim(preg_replace('/\s+/', ' ', preg_replace("/[^A-Z0-9 &.\-'()\/#]/", ' ', $this->esDatText($s))));
+        return trim(preg_replace('/\s+/', ' ', preg_replace('/[^A-Z0-9 &.\-()\/#]/', ' ', $this->esDatBase($s))));
     }
 
     /** TIN problem → message, null = fine */
@@ -55,14 +62,8 @@ trait EsubValidation
     protected function esNameProblem(string $raw): ?string
     {
         if (trim($raw) === '') return 'No registered name';
-        $clean = strtr($raw, ['Ñ' => 'N', 'ñ' => 'n', '’' => "'", '‘' => "'", '–' => '-', '—' => '-']);
-        if (function_exists('iconv')) {
-            $t = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $clean);
-            if ($t !== false) $clean = $t;
-        }
-        $bad = array_values(array_unique(str_split(preg_replace("/[A-Za-z0-9 ,&.\-'()\/]/", '', $clean))));
-        $bad = array_filter($bad, fn ($ch) => trim($ch) !== '');
-        return $bad ? 'Registered name has special characters: ' . implode(' ', $bad) : null;
+        if ($this->esDatText($raw) === '') return 'Registered name has no letters or numbers';
+        return null;
     }
 
     /** same TIN in one DAT → one line (RELIEF lists one line per TIN per period) */
@@ -149,10 +150,6 @@ trait EsubValidation
                     $add($warnings, $line, $r, 'Tax withheld', 'Tax ' . number_format($tax, 2) . " is not {$rate}% of " . number_format($base, 2) . ' (' . number_format($base * $rate / 100, 2) . ').');
                 }
             }
-        }
-
-        if ($isList && count($this->esConsolidate($rows, [])) < count($rows)) {
-            $fixed['merge'] = 'Lines with the same TIN were added together into one DAT line each (RELIEF lists one line per TIN).';
         }
         if (!$rows) $add($warnings, null, $none, 'Lines', 'No transactions for this period – the DAT has the header only.');
 
