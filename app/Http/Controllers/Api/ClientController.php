@@ -319,6 +319,7 @@ class ClientController extends Controller
     /* POST /api/clients   { …same fields as Settings, accounts: [ {business account}, … ] }  – client_num is generated (IGB-####) */
     public function storeClient(Request $request)
     {
+        $this->blankBadDates($request);
         $rules = $this->clientRules() + ['accounts' => ['required', 'array', 'min:1'], 'valid_ids' => ['required', 'array', 'min:1']];
         foreach ($this->accountRules() as $k => $r) $rules["accounts.*.{$k}"] = $r;
         foreach ($this->idRules() as $k => $r) $rules["valid_ids.*.{$k}"] = $r;
@@ -369,10 +370,24 @@ class ClientController extends Controller
     public function updateClient(Request $request, string $num)
     {
         $this->client($num);
+        $this->blankBadDates($request);
         $d = $this->cleanClient($request->validate($this->clientRules(), $this->clientMessages()));
         abort_unless(DB::table('m_client_account')->where('client_num', $num)->exists(), 422, 'Add at least one business account.');
         DB::table('m_client')->where('client_num', $num)->update($this->onlyColumns('m_client', $d + ['updated_at' => now()]));
         return response()->json(['client' => $this->client($num), 'message' => 'Client saved.']);
+    }
+
+    /** empty, "0000-00-00" or not a real date → null, so the dates can be left empty */
+    private function blankBadDates(Request $request): void
+    {
+        $fix = [];
+        foreach (['birthdate', 'date_of_engagement', 'date_of_disengagement', 'date_started', 'date_registered'] as $k) {
+            if (!$request->exists($k)) continue;
+            $v = substr(trim((string) $request->input($k)), 0, 10);
+            $ok = preg_match('/^\d{4}-\d{2}-\d{2}$/', $v) && !str_starts_with($v, '0000') && strtotime($v) !== false;
+            $fix[$k] = $ok ? $v : null;
+        }
+        if ($fix) $request->merge($fix);
     }
 
     /* =====================================================================
