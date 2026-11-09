@@ -1343,7 +1343,7 @@ class ClientController extends Controller
             $disk->putFileAs('Company_logo', $file, $a->id . '-' . $clean);
         } catch (\Throwable $e) {
             report($e);
-            return response()->json(['message' => 'Logo upload failed. Please try again.'], 422);
+            return response()->json(['message' => 'Logo upload failed: ' . $e->getMessage()], 422);
         }
         DB::table('m_client_account')->where('id', $a->id)->update(['logo' => $clean, 'updated_at' => now()]);
  
