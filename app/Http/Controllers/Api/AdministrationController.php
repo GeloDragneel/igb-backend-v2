@@ -379,7 +379,29 @@ class AdministrationController extends Controller
         $this->staffOnly($request);
         $t = $this->ticket($ticketNo);
         $where = $this->locate((string) $t->reference_no);
-        abort_unless($where, 404, 'The invoice of this ticket was not found.');
+        $who = $this->requesters([$t->request_by])[(int) $t->request_by] ?? [];
+        $ticketInfo = [
+            'ticket_no'    => $t->ticket_no,
+            'reference_no' => $t->reference_no,
+            'module'       => $t->module,
+            'action'       => strtoupper((string) $t->action),
+            'remarks'      => (string) $t->remarks,
+            'status'       => (int) $t->is_status,
+            'requested_by' => $who['username'] ?? '',
+            'trade_name'   => $who['trade_name'] ?? '',
+            'branch'       => $who['branch'] ?? '',
+            'date_added'   => $this->when($t->created_at),
+        ];
+        // reference not in this system (e.g. a Purchase Order from the old system) → still show the ticket so it can be declined
+        if (!$where) {
+            return response()->json([
+                'ticket'    => $ticketInfo,
+                'type'      => null,
+                'requested' => null,
+                'before'    => null,
+                'missing'   => "{$t->module} {$t->reference_no} is not in this system, so it can't be shown or approved here. You can still decline the ticket.",
+            ]);
+        }
         [$type, $mt, $dt, , $key] = $where;
  
         $live = DB::table($mt)->where($key, $t->reference_no)->first();
@@ -401,20 +423,8 @@ class AdministrationController extends Controller
             ? $shape($type, $mt, $dt, (array) $live, $liveLines, $live)
             : ($snap ? $shape($type, $mt, $dt, $this->arr($snap['master'] ?? []), $this->arr($snap['details'] ?? []), $live) : null);
  
-        $who = $this->requesters([$t->request_by])[(int) $t->request_by] ?? [];
         return response()->json([
-            'ticket' => [
-                'ticket_no'    => $t->ticket_no,
-                'reference_no' => $t->reference_no,
-                'module'       => $t->module,
-                'action'       => strtoupper((string) $t->action),
-                'remarks'      => (string) $t->remarks,
-                'status'       => (int) $t->is_status,
-                'requested_by' => $who['username'] ?? '',
-                'trade_name'   => $who['trade_name'] ?? '',
-                'branch'       => $who['branch'] ?? '',
-                'date_added'   => $this->when($t->created_at),
-            ],
+            'ticket' => $ticketInfo,
             'type'      => $type,
             'requested' => $requested,
             'before'    => $before,
