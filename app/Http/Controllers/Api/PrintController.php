@@ -2922,7 +2922,7 @@ class PrintController extends ReportController
         @unlink($xlsx);
         abort(response()->json(['message' => "Couldn't make the PDF (LibreOffice).", 'tried' => $tried], 422));
     }
-     private ?string $poLogoTmp = null;
+    private ?string $poLogoTmp = null;
  
     /** the account's logo from S3 (Company_logo/{caid}-{file}) → temp file for the sheet, null when none */
     private function poLogo(?object $a): ?string
@@ -2959,7 +2959,9 @@ class PrintController extends ReportController
         $ss->getProperties()->setCustomProperty('pdfAsIs', true);   // pdfLayout leaves this one as it is
         $sh = $ss->getActiveSheet();
         $sh->setTitle('PURCHASE ORDER');
-        // Arial 8 on the cells only – the default font stays Calibri 11 so the column widths come out right on the page
+        // default font Arial 10 (on every Windows; 1 column unit = 7px like Excel) → same widths on any PC,
+        // and the logo can be centered. The cells themselves use Lexend Deca 8.
+        $ss->getDefaultStyle()->getFont()->setName('Arial')->setSize(10);
         $sh->getStyle('A1:I120')->getFont()->setName('Lexend Deca')->setSize(8);
         $sh->setShowGridlines(false);
  
@@ -2981,14 +2983,24 @@ class PrintController extends ReportController
             $h = 60;
             $w = (int) round($size[0] * $h / max(1, $size[1]));
             if ($w > 520) { $w = 520; $h = (int) round($size[1] * $w / max(1, $size[0])); }
-            $sheetPx = 0;
-            foreach (['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'] as $c) $sheetPx += (int) round($sh->getColumnDimension($c)->getWidth() * 7 + 5);
+            // center: work in column units, anchor the picture in the column where its left edge falls
+            // (only the small offset inside that column is estimated, so it stays centered on any PC)
+            $cols = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
+            $widths = array_map(fn ($c) => (float) $sh->getColumnDimension($c)->getWidth(), $cols);
+            $pxPerUnit = 7.0;                                           // default font Arial 10: 1 unit = 7px
+            $leftUnits = max(0, array_sum($widths) / 2 - ($w / $pxPerUnit) / 2);
+            $anchor = 'A';
+            $start = 0.0;
+            foreach ($cols as $i => $c) {
+                if ($start + $widths[$i] > $leftUnits) { $anchor = $c; break; }
+                $start += $widths[$i];
+            }
             $img = new \PhpOffice\PhpSpreadsheet\Worksheet\Drawing();
             $img->setPath($p['logo']);
             $img->setResizeProportional(false);
             $img->setWidth($w)->setHeight($h);
-            $img->setCoordinates('A2');
-            $img->setOffsetX(max(0, (int) (($sheetPx - $w) / 2)));
+            $img->setCoordinates($anchor . '2');
+            $img->setOffsetX((int) round(($leftUnits - $start) * $pxPerUnit));
             $img->setOffsetY(2);
             $img->setWorksheet($sh);
             $sh->getRowDimension(2)->setRowHeight(max(48, $h * 0.75 + 4));
