@@ -107,6 +107,9 @@ class SalesController extends Controller
                 'customer_id', 'invoice_status_id', 'audit_status_id', 'invalid_reason',
             ]);
 
+        $reasons = DB::table('t_invalid_reason')->whereIn('reference_no', $list->pluck('invoice_no'))
+            ->orderBy('id')->pluck('reason', 'reference_no');
+
         // pending tickets for these invoices: invoice_no => ticket_no
         $tickets = RequestTicket::whereIn('reference_no', $list->pluck('invoice_no'))
             ->where('is_status', 0)
@@ -128,7 +131,7 @@ class SalesController extends Controller
             'status'           => $r->invoiceStatus->name ?? '',
             'audit_status'     => $r->auditStatus->name ?? '',
             'ticket_no'        => $tickets[$r->invoice_no] ?? null,
-            'reason'           => $r->invalid_reason,
+            'reason'           => $reasons[$r->invoice_no] ?? null,
             'scan_status'      => $scanStatus[$r->invoice_no] ?? null,
         ]);
 
