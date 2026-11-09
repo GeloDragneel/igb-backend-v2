@@ -172,6 +172,10 @@ class AdministrationController extends Controller
         if ($t !== null) {
             return [strtolower((string) $t) === 'expenses' ? 'expense' : 'purchase', 't_purchase_expense_master', 't_purchase_expense_detail', 'vendor_id', 'invoice_no'];
         }
+        // Vendors / Purchase Order (PurchaseOrderController)
+        if ($this->cols('t_porder_master') && DB::table('t_porder_master')->where('po_number', $referenceNo)->exists()) {
+            return ['po', 't_porder_master', 't_porder_detail', 'vendor_id', 'po_number'];
+        }
         foreach (self::TRADE as $type => $c) {
             if ($this->cols($c['master']) && DB::table($c['master'])->where($c['key'], $referenceNo)->exists()) {
                 return [$type, $c['master'], $c['detail'], $c['party'], $c['key']];
@@ -229,7 +233,7 @@ class AdministrationController extends Controller
         $per = (int) ($d['per'] ?? 15);
         $page = (int) ($d['page'] ?? 1);
         $term = trim($d['q'] ?? '');
-
+ 
         // search: ticket / reference / module / remarks / action / requester's username
         $search = function ($q) use ($term) {
             if ($term === '') return;
@@ -241,26 +245,28 @@ class AdministrationController extends Controller
                 if ($uname) $w->orWhereIn('request_by', DB::table('m_user_client')->where($uname, 'like', $like)->select('id'));
             });
         };
-
+ 
         $base = RequestTicket::query()->tap($search);
         $counts = (clone $base)->selectRaw('is_status, COUNT(*) AS n')->groupBy('is_status')->pluck('n', 'is_status');
         $list = (clone $base)->when($status !== 'all', fn ($q) => $q->where('is_status', (int) $status));
         $total = $status === 'all' ? (int) $counts->sum() : (int) ($counts[(int) $status] ?? 0);
         $pages = max(1, (int) ceil($total / $per));
         $page = min($page, $pages);
-
+ 
         $tickets = $list->orderByDesc('id')->forPage($page, $per)
             ->get(['id', 'ticket_no', 'reference_no', 'remarks', 'module', 'action', 'request_by', 'is_status', 'created_at']);
-
+ 
         // type of each reference (sales / purchase / expense) — only for this page
         $refs = $tickets->pluck('reference_no')->filter()->unique()->values();
         $sales = DB::table('t_sales_invoice_master')->whereIn('invoice_no', $refs)->pluck('invoice_no')->flip();
         $ap = DB::table('t_purchase_expense_master')->whereIn('invoice_no', $refs)->pluck('trans_type', 'invoice_no');
+        $po = $this->cols('t_porder_master') ? DB::table('t_porder_master')->whereIn('po_number', $refs)->pluck('po_number')->flip() : collect();
         $who = $this->requesters($tickets->pluck('request_by')->all());
-
-        $rows = $tickets->map(function ($t) use ($sales, $ap, $who) {
+ 
+        $rows = $tickets->map(function ($t) use ($sales, $ap, $po, $who) {
             $type = isset($sales[$t->reference_no]) ? 'sales'
-                : (isset($ap[$t->reference_no]) ? (strtolower((string) $ap[$t->reference_no]) === 'expenses' ? 'expense' : 'purchase') : null);
+                : (isset($ap[$t->reference_no]) ? (strtolower((string) $ap[$t->reference_no]) === 'expenses' ? 'expense'
+                : 'purchase') : (isset($po[$t->reference_no]) ? 'po' : null));
             $w = $who[(int) $t->request_by] ?? null;
             return [
                 'id'           => (int) $t->id,
@@ -276,7 +282,7 @@ class AdministrationController extends Controller
                 'date_added'   => $this->when($t->created_at),
             ];
         })->values();
-
+ 
         return response()->json([
             'rows'   => $rows,
             'total'  => $total,
@@ -299,7 +305,7 @@ class AdministrationController extends Controller
         $partyId = $m['customer_id'] ?? $m['vendor_id'] ?? null;
         $party = $partyId ? DB::table('m_vendor_customer')->where('id', $partyId)->first() : null;
         $addedBy = $m['added_by'] ?? $live->added_by ?? null;
-
+ 
         $accName = $this->pick('m_charts_of_account', ['account_name', 'name']) ?? 'account_name';
         $codes = collect($lines)->pluck('account_code')->push($m['account_code'] ?? null)->filter()->unique()->values();
         $accNames = $codes->isEmpty() ? collect() : DB::table('m_charts_of_account')
@@ -307,12 +313,12 @@ class AdministrationController extends Controller
             ->when($addedBy && $this->pick('m_charts_of_account', ['added_by']), fn ($q) => $q->where('added_by', $addedBy))
             ->pluck($accName, 'account_code');
         $acc = fn ($code) => $code ? trim($code . ' ' . ($accNames[$code] ?? '')) : '';
-
+ 
         $items = DB::table('m_items')->whereIn('id', collect($lines)->pluck('item_id')->filter()->unique())
             ->get(array_filter(['id', $this->pick('m_items', ['item_code']), $this->pick('m_items', ['description'])]))->keyBy('id');
         $unitName = $this->pick('m_unit_type', ['name', 'description']);
         $units = $unitName ? DB::table('m_unit_type')->whereIn('id', collect($lines)->pluck('unit_type_id')->filter()->unique())->pluck($unitName, 'id') : collect();
-
+ 
         $label = function (string $table, $id) {
             if (!$id || !$this->cols($table)) return '';
             $c = $this->pick($table, ['name', 'description']);
@@ -326,20 +332,23 @@ class AdministrationController extends Controller
             return trim(($a->name ?? '') . ($rate ? ' - ' . round($rate <= 1 ? $rate * 100 : $rate, 2) . '%' : ''));
         };
         $docType = $this->cols('m_document_type') ? 'm_document_type' : ($this->cols('m_document_types') ? 'm_document_types' : null);
-
+ 
         return [
             'type'             => $type,
             'id'               => (int) ($m['table_id'] ?? $m['id'] ?? $live->id ?? 0),
-            'invoice_no'       => $m['invoice_no'] ?? $live->invoice_no ?? '',
+            'invoice_no'       => $m['invoice_no'] ?? $m['po_number'] ?? $live->invoice_no ?? $live->po_number ?? '',
             'party'            => (string) ($party->name ?? ''),
             'party_tin'        => (string) ($party->tin ?? ''),
             'party_branch'     => (string) ($party->branch_code ?? ''),
             'party_address'    => array_values(array_filter([trim((string) ($party->address ?? '')), trim((string) ($party->city_country ?? ''))])),
-            'date'             => !empty($m['transaction_date']) ? substr((string) $m['transaction_date'], 0, 10) : null,
+            'date'             => ($d = $m['transaction_date'] ?? $m['po_date'] ?? null) ? substr((string) $d, 0, 10) : null,
             'currency'         => $m['currency'] ?? 'PHP',
             'ex_rate'          => (float) ($m['ex_rate'] ?? 1),
-            'invoice_status'   => $label('m_invoice_status', $m['invoice_status_id'] ?? null),
-            'invoice_status_id'=> (int) ($m['invoice_status_id'] ?? 0),
+            // Purchase Order: status from m_pos_status (5 = VOID)
+            'invoice_status'   => $type === 'po'
+                ? ((int) ($m['po_status_id'] ?? 0) === self::VOID ? 'VOID' : $label('m_pos_status', $m['po_status_id'] ?? null))
+                : $label('m_invoice_status', $m['invoice_status_id'] ?? null),
+            'invoice_status_id'=> (int) ($m['invoice_status_id'] ?? $m['po_status_id'] ?? 0),
             'remarks'          => (string) ($m['remarks'] ?? ''),
             'declared_month'   => (string) ($m['declared_month'] ?? ''),
             'document_no'      => (string) ($m['document_no'] ?? ''),
@@ -362,9 +371,9 @@ class AdministrationController extends Controller
                 'description' => (string) ($items[$l['item_id'] ?? 0]->description ?? ''),
                 'account'     => $acc($l['account_code'] ?? null),
                 'unit_type'   => (string) ($units[$l['unit_type_id'] ?? 0] ?? ''),
-                'quantity'    => (float) ($l['quantity'] ?? 0),
-                'price'       => (float) ($l['unit_price'] ?? 0),
-                'total'       => (float) ($l['amount'] ?? 0),
+                'quantity'    => (float) ($l['quantity'] ?? $l['qty'] ?? 0),          // PO lines: qty / price / total
+                'price'       => (float) ($l['unit_price'] ?? $l['price'] ?? 0),
+                'total'       => (float) ($l['amount'] ?? $l['total'] ?? 0),
                 'vat'         => (float) ($l['input_vat'] ?? 0),
                 'net_of_vat'  => (float) ($l['net_of_vat'] ?? 0),
                 'vat_exempt'  => (float) ($l['vat_exempt'] ?? 0),
@@ -454,6 +463,15 @@ class AdministrationController extends Controller
             $disk = Storage::disk('s3');
             $folder = self::TRADE[$type]['folder'];
             foreach (["{$folder}/{$live->id}-{$file}", "{$folder}/{$file}"] as $k) {
+                if ($disk->exists($k)) return $disk->response($k, $file, ['Cache-Control' => 'private, max-age=300']);
+            }
+            return response()->json(['missing' => true, 'message' => "{$file} is not on S3."]);
+        }
+ 
+        // Purchase Order: Vendor_Puchase_Order/{id}-{file} (same misspelled folder as the PO page)
+        if ($type === 'po') {
+            $disk = Storage::disk('s3');
+            foreach (["Vendor_Puchase_Order/{$live->id}-{$file}", "Vendor_Puchase_Order/{$file}"] as $k) {
                 if ($disk->exists($k)) return $disk->response($k, $file, ['Cache-Control' => 'private, max-age=300']);
             }
             return response()->json(['missing' => true, 'message' => "{$file} is not on S3."]);
@@ -560,6 +578,8 @@ class AdministrationController extends Controller
  
             if (isset(self::TRADE[$type])) {
                 $this->applyTradeTicket($t, $type, $live, $liveLines, $action, $now);
+            } elseif ($type === 'po') {
+                $this->applyPoTicket($t, $live, $liveLines, $action, $now);
             } elseif ($action === 'VOID') {
                 // 2) VOID (old doVoidInvoice / doVoidAP): status 5, lines removed (they stay in the snapshot)
                 DB::table($mt)->where('id', $live->id)->update($this->only($mt, ['invoice_status_id' => self::VOID, 'updated_at' => $now]));
@@ -628,6 +648,47 @@ class AdministrationController extends Controller
  
             return response()->json(['message' => 'Ticket Successfully Approved']);
         });
+    }
+        private function applyPoTicket(object $t, object $live, $liveLines, string $action, $now): void
+    {
+        $mt = 't_porder_master';
+        $dt = 't_porder_detail';
+        if ($action === 'VOID') {
+            DB::table($mt)->where('id', $live->id)->update($this->only($mt, ['po_status_id' => self::VOID, 'updated_at' => $now]));
+            DB::table($dt)->where('po_number', $live->po_number)->update($this->only($dt, ['po_status_id' => self::VOID, 'updated_at' => $now]));
+            return;
+        }
+        $data = TicketData::where('ticket_no', $t->ticket_no)->latest('id')->first();
+        abort_unless($data, 422, 'This ticket has no data to apply.');
+        $m = $this->arr($data->data_master);
+        $lines = $this->arr($data->data_detail);
+        abort_if(!$lines, 422, 'No details inserted');
+ 
+        unset($m['id'], $m['table_id'], $m['po_number'], $m['created_at']);
+        $m['updated_at'] = $now;
+        DB::table($mt)->where('id', $live->id)->update($this->fkClean($mt, $this->only($mt, $m)));
+        $master = DB::table($mt)->where('id', $live->id)->first();
+ 
+        $first = (array) ($liveLines->first() ?? []);
+        DB::table($dt)->where('po_number', $live->po_number)->delete();
+        $saved = 0;
+        foreach ($lines as $l) {
+            unset($l['id'], $l['table_id']);
+            $row = $l;
+            // the master's values for the shared columns (same as poStore)
+            foreach ([
+                'po_master_id' => $master->id, 'po_number' => $master->po_number, 'po_status_id' => $master->po_status_id ?? null,
+                'po_date' => $master->po_date ?? null, 'document_no' => $master->document_no ?? null, 'vendor_id' => $master->vendor_id ?? null,
+                'currency' => $master->currency ?? null, 'ex_rate' => $master->ex_rate ?? null, 'trans_type' => $master->trans_type ?? 'Purchases',
+                '2307_vt_declared_month' => $master->{'2307_vt_declared_month'} ?? null, '2307_it_declared_month' => $master->{'2307_it_declared_month'} ?? null,
+                'created_at' => $first['created_at'] ?? $now, 'updated_at' => $now,
+            ] as $k => $v) {
+                $row[$k] = $v;
+            }
+            DB::table($dt)->insert($this->fkClean($dt, $this->only($dt, $row)));
+            $saved++;
+        }
+        abort_if($saved === 0, 422, 'No details inserted');
     }
     private function applyTradeTicket(object $t, string $type, object $live, $liveLines, string $action, $now): void
     {
