@@ -106,15 +106,21 @@ class ReceiveInventoryController extends SalesController
         $d = $request->validate(['from' => ['required', 'date_format:Y-m'], 'to' => ['required', 'date_format:Y-m']]);
         $addedBy = $this->addedByFor($request);
         if (!$addedBy) return response()->json([]);
-
+ 
         $list = $this->base($addedBy)
             ->whereRaw("COALESCE(NULLIF(declared_month, ''), DATE_FORMAT(grn_date, '%Y-%m')) BETWEEN ? AND ?", [$d['from'], $d['to']])
             ->orderByDesc('id')->get();
-
+ 
         $vendors   = VendorCustomer::whereIn('id', $list->pluck('vendor_id')->filter()->unique())->pluck('name', 'id');
         $locations = DB::table('m_store_warehouse')->whereIn('id', $list->pluck('location_id')->filter()->unique())->pluck('description', 'id');
         $statuses  = InvoiceStatus::pluck('name', 'id');
-
+ 
+        // totals of the PO / vendor invoice each GRN came from + what was paid on them
+        $refs   = $list->pluck('ref_data')->filter()->unique()->values();
+        $totals = DB::table('t_porder_master')->where('added_by', $addedBy)->whereIn('po_number', $refs)->pluck('grand_total', 'po_number')
+            ->union(DB::table('t_purchase_expense_master')->where('added_by', $addedBy)->whereIn('invoice_no', $refs)->pluck('grand_total', 'invoice_no'));
+        $paid   = $this->refPaid($refs);
+ 
         return response()->json($list->map(fn ($m) => [
             'id'         => $m->id,
             'no'         => $m->grn_no,
@@ -123,10 +129,28 @@ class ReceiveInventoryController extends SalesController
             'location'   => $locations[$m->location_id] ?? '—',
             'po'         => $m->ref_data,
             'total'      => (float) $m->total,
-            'status'     => (int) $m->invoice_status_id === self::STATUS_VOID ? 'VOID' : ($statuses[$m->invoice_status_id] ?? 'RECEIVED'),
+            'paid'       => round((float) ($paid[$m->ref_data] ?? 0), 2),
+            'status'     => $this->payStatus($m->ref_data, $paid, $totals, $statuses, $m),
         ])->values());
     }
-
+    private function refPaid($refs)
+    {
+        $refs = collect($refs)->filter()->unique()->values();
+        if ($refs->isEmpty()) return collect();
+        return DB::table('t_pvoucher_detail')->whereIn('ap_invoice_no', $refs)
+            ->groupBy('ap_invoice_no')->selectRaw('ap_invoice_no, SUM(amount) AS paid')->pluck('paid', 'ap_invoice_no');
+    }
+ 
+    /** PAID / PARTIAL / UNPAID from the PO (or vendor invoice) total vs what was paid on it */
+    private function payStatus(?string $ref, $paid, $totals, $statuses, object $m): string
+    {
+        if ((int) $m->invoice_status_id === self::STATUS_VOID) return 'VOID';
+        if ($ref && isset($totals[$ref])) {
+            $id = \App\Support\PaymentAccounts::statusFor((float) $totals[$ref], (float) ($paid[$ref] ?? 0));
+            return $statuses[$id] ?? 'UNPAID';
+        }
+        return $statuses[$m->invoice_status_id] ?? 'RECEIVED';
+    }
     /* GET /api/inventory/receive/lookups */
     public function riLookups(Request $request)
     {
@@ -261,13 +285,13 @@ class ReceiveInventoryController extends SalesController
     {
         $addedBy = $this->addedByFor($request);
         $m = $this->base($addedBy)->where('grn_no', $grnNo)->first();
-        if (!$m || (int) $m->invoice_status_id === self::STATUS_VOID) return response()->json(['journal' => [], 'collection' => []]);
-
+        if (!$m || (int) $m->invoice_status_id === self::STATUS_VOID) return response()->json(['journal' => [], 'collection' => [], 'collection_label' => 'PAYMENT']);
+ 
         $vatCol = $this->hasCol('m_items', 'input_vat_account') ? 'input_vat_account' : null;
         $lines = DB::table(self::D . ' as L')->leftJoin('m_items as I', 'I.id', '=', 'L.item_id')->where('L.grn_no', $grnNo)
             ->get(array_filter(['L.account_code', 'L.input_vat', 'L.net_of_vat', 'L.vat_exempt', 'L.non_vat', 'L.zero_rated', $vatCol ? "I.$vatCol as vat_account" : null]));
         $names = ChartsOfAccount::where('added_by', $addedBy)->pluck('account_name', 'account_code');
-
+ 
         $rows = [['account_code' => self::AP_ACCOUNT, 'account_name' => $names[self::AP_ACCOUNT] ?? 'Accounts Payable', 'debit' => 0, 'credit' => round((float) $m->grand_total, 2)]];
         if ((float) $m->{'2307_it'} > 0) $rows[] = ['account_code' => '21910', 'account_name' => 'Withholding Tax', 'debit' => 0, 'credit' => round((float) $m->{'2307_it'}, 2)];
         if ((float) $m->{'2307_vt'} > 0) $rows[] = ['account_code' => '21910', 'account_name' => 'Withholding Tax', 'debit' => 0, 'credit' => round((float) $m->{'2307_vt'}, 2)];
@@ -279,7 +303,22 @@ class ReceiveInventoryController extends SalesController
             $rows[] = ['account_code' => (string) ($l->account_code ?: '0'), 'account_name' => $names[$l->account_code] ?? '',
                 'debit' => round((float) $l->net_of_vat + (float) $l->vat_exempt + (float) $l->non_vat + (float) $l->zero_rated, 2), 'credit' => 0];
         }
-        return response()->json(['journal' => $rows, 'collection' => []]);
+ 
+        // payments made on the PO / vendor invoice this GRN came from
+        $pays = $m->ref_data
+            ? DB::table('t_pvoucher_detail as D')->join('t_pvoucher_master as M', 'M.pvoucher_no', '=', 'D.pvoucher_no')
+                ->where('D.ap_invoice_no', $m->ref_data)->get(['M.bank', 'D.acc_code', 'D.amount'])
+            : collect();
+ 
+        $payment = [];
+        foreach ($pays->groupBy(fn ($p) => $p->acc_code ?: self::AP_ACCOUNT) as $code => $g) {
+            $payment[] = ['account_code' => (string) $code, 'account_name' => (string) ($names[$code] ?? ''), 'debit' => round((float) $g->sum('amount'), 2), 'credit' => 0];
+        }
+        foreach ($pays->groupBy(fn ($p) => $p->bank ?: '0') as $code => $g) {
+            $payment[] = ['account_code' => (string) $code, 'account_name' => (string) ($names[$code] ?? ''), 'debit' => 0, 'credit' => round((float) $g->sum('amount'), 2)];
+        }
+ 
+        return response()->json(['journal' => $rows, 'collection' => $payment, 'collection_label' => 'PAYMENT']);
     }
 
     /* =====================================================================

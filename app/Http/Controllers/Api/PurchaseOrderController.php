@@ -130,18 +130,24 @@ class PurchaseOrderController extends PurchaseController
     {
         $addedBy = $this->addedByFor($request);
         $po = $this->poFind($addedBy, 'po_number', $poNumber);
-        if (!$po || (int) $po->po_status_id === 5) return response()->json(['journal' => [], 'collection' => []]);
-
+        if (!$po || (int) $po->po_status_id === 5) return response()->json(['journal' => [], 'collection' => [], 'collection_label' => 'PAYMENT']);
+ 
         $vatCol = $this->apFirstCol('m_items', ['input_vat_account']);
         $lines = DB::table(self::PD . ' as L')
             ->leftJoin('m_items as I', 'I.id', '=', 'L.item_id')
             ->where('L.po_number', $po->po_number)
             ->get(array_filter(['L.account_code', 'L.input_vat', 'L.net_of_vat', 'L.vat_exempt', 'L.non_vat', 'L.zero_rated',
                 $vatCol ? "I.{$vatCol} as vat_account" : null]));
-
-        $codes = collect([$po->account_code])->merge($lines->pluck('account_code'))->merge($lines->pluck('vat_account'))->filter()->unique();
+ 
+        // payments made on this PO (Pay Bill saves ap_invoice_no = po_number)
+        $pays = DB::table('t_pvoucher_detail as D')->join('t_pvoucher_master as M', 'M.pvoucher_no', '=', 'D.pvoucher_no')
+            ->where('D.ap_invoice_no', $po->po_number)->orderBy('M.pv_date')->orderBy('M.id')
+            ->get(['M.pvoucher_no', 'M.pv_date', 'M.bank', 'D.acc_code', 'D.amount']);
+ 
+        $codes = collect([$po->account_code])->merge($lines->pluck('account_code'))->merge($lines->pluck('vat_account'))
+            ->merge($pays->pluck('bank'))->merge($pays->pluck('acc_code'))->filter()->unique();
         $names = ChartsOfAccount::where('added_by', $addedBy)->whereIn('account_code', $codes)->pluck('account_name', 'account_code');
-
+ 
         $rows = [];
         $rows[] = ['account_code' => (string) $po->account_code, 'account_name' => (string) ($names[$po->account_code] ?? ''), 'debit' => 0, 'credit' => round((float) $po->grand_total, 2)];
         if ((float) $po->{'2307_it'} > 0) $rows[] = ['account_code' => '21910', 'account_name' => 'Withholding Tax', 'debit' => 0, 'credit' => round((float) $po->{'2307_it'}, 2)];
@@ -155,8 +161,17 @@ class PurchaseOrderController extends PurchaseController
             $rows[] = ['account_code' => (string) $code, 'account_name' => (string) ($names[$code] ?? ''),
                 'debit' => round((float) $l->net_of_vat + (float) $l->vat_exempt + (float) $l->non_vat + (float) $l->zero_rated, 2), 'credit' => 0];
         }
-
-        return response()->json(['journal' => $rows, 'collection' => []]);
+ 
+        // PAYMENT: Debit the payable account(s), Credit the cash / bank account(s)
+        $payment = [];
+        foreach ($pays->groupBy(fn ($p) => $p->acc_code ?: $po->account_code) as $code => $g) {
+            $payment[] = ['account_code' => (string) $code, 'account_name' => (string) ($names[$code] ?? ''), 'debit' => round((float) $g->sum('amount'), 2), 'credit' => 0];
+        }
+        foreach ($pays->groupBy(fn ($p) => $p->bank ?: '0') as $code => $g) {
+            $payment[] = ['account_code' => (string) $code, 'account_name' => (string) ($names[$code] ?? ''), 'debit' => 0, 'credit' => round((float) $g->sum('amount'), 2)];
+        }
+ 
+        return response()->json(['journal' => $rows, 'collection' => $payment, 'collection_label' => 'PAYMENT']);
     }
 
     /* POST /api/purchase-orders   new PO (old save_transaction_po.php) */
@@ -311,4 +326,5 @@ class PurchaseOrderController extends PurchaseController
         }
         return response()->json(['message' => 'File not found on storage.'], 404);
     }
+    
 }

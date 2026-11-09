@@ -2814,4 +2814,322 @@ class PrintController extends ReportController
         $u = $request->user();
         return 'print:col:' . ($u ? class_basename($u) . ':' . $u->getKey() : 'guest') . ':' . preg_replace('/\W/', '', $token);
     }
+
+    /* GET /api/print/purchase-order/{poNumber}   → PURCHASE-ORDER-{po}.pdf (inline) */
+public function poPrint(Request $request, string $poNumber)
+    {
+        try {
+            $by = $this->addedByFor($request);
+            $po = \Illuminate\Support\Facades\DB::table('t_porder_master')->where('added_by', $by)->where('po_number', $poNumber)->first();
+            if (!$po) return response()->json(['message' => 'Purchase order not found.'], 404);
+ 
+            $DB = \Illuminate\Support\Facades\DB::class;
+            $lines = $DB::table('t_porder_detail as L')
+                ->leftJoin('m_items as I', 'I.id', '=', 'L.item_id')
+                ->leftJoin('m_unit_type as U', 'U.id', '=', 'L.unit_type_id')
+                ->where('L.po_number', $po->po_number)->orderBy('L.id')
+                ->get(['L.qty', 'L.price', 'L.discount_amount', 'L.net_of_vat', 'L.vat_exempt', 'L.non_vat', 'L.zero_rated',
+                    $DB::raw("COALESCE(NULLIF(I.description, ''), I.item_code, '') AS description"), $DB::raw("COALESCE(U.name, '') AS unit")]);
+ 
+            // company header = business account of the user
+            $caid = $this->caidFor($request);
+            $a = $caid ? $DB::table('m_client_account')->where('id', $caid)->first() : null;
+            $address = $a ? strtoupper(collect([
+                $a->street ?? null,
+                $this->poPlace('m_barangay', $a->brgy_id ?? null, ['barangay', 'name', 'description']),
+                $this->poPlace('m_city_mun', $a->city_id ?? null, ['city_mun', 'citymun', 'name', 'description']),
+                $this->poPlace('m_province', $a->province_id ?? null, ['province', 'name', 'description']),
+            ])->map(fn ($x) => trim((string) $x))->filter()->implode(' ')) : '';
+            $contact = $a ? collect([$a->phone_num ?? null, $a->tell_num ?? null])->map(fn ($x) => trim((string) $x))->filter()->implode(' / ') : '';
+ 
+            // withholding: 1% / 2% … from the ATC used
+            $rates = \App\Models\ATC::whereIn('id', array_filter([(int) ($po->atc_it_id ?? 0), (int) ($po->atc_vt_id ?? 0)]))->pluck('rate')
+                ->map(fn ($r) => ((float) $r > 1 ? (float) $r : (float) $r * 100))->filter()->map(fn ($r) => rtrim(rtrim(number_format($r, 2), '0'), '.') . '%')->implode(' + ');
+ 
+            $u = $request->user();
+            $prepared = trim((string) ($u->name ?? '')) ?: trim(($u->first_name ?? '') . ' ' . ($u->last_name ?? '')) ?: (string) ($u->username ?? '');
+ 
+            $ss = $this->poSheet([
+                'company'   => (string) ($a->trade_name ?? ''),
+                'address'   => $address,
+                'contact'   => $contact,
+                'no'        => (string) (($po->document_no ?? '') ?: $po->po_number),
+                'supplier'  => strtoupper((string) $DB::table('m_vendor_customer')->where('id', $po->vendor_id)->value('name')),
+                'date'      => $po->po_date ? \Carbon\Carbon::parse($po->po_date)->format('F j, Y') : '',
+                'remarks'   => (string) ($po->remarks ?? ''),
+                'rate'      => $rates,
+                'withhold'  => round((float) ($po->{'2307_it'} ?? 0) + (float) ($po->{'2307_vt'} ?? 0), 2),
+                'net'       => round((float) $po->grand_total, 2),
+                'netOfVat'  => round($lines->sum(fn ($l) => (float) $l->net_of_vat + (float) $l->vat_exempt + (float) $l->non_vat + (float) $l->zero_rated), 2),
+                'prepared'  => strtoupper($prepared),
+                'lines'     => $lines->map(fn ($l) => [
+                    'qty' => (float) $l->qty, 'unit' => (string) $l->unit, 'description' => strtoupper((string) $l->description),
+                    'price' => (float) $l->price, 'amount' => round((float) $l->qty * (float) $l->price - (float) $l->discount_amount, 2),
+                ])->all(),
+            ]);
+ 
+            $pdf = $this->poToPdf($ss);
+            return response()->download($pdf, "PURCHASE-ORDER-{$po->po_number}.pdf", ['Content-Type' => 'application/pdf'], 'inline')
+                ->deleteFileAfterSend(true);
+        } catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface | \Illuminate\Http\Exceptions\HttpResponseException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            report($e);
+            return response()->json(['message' => 'PO print failed: ' . $e->getMessage() . ' (' . basename($e->getFile()) . ':' . $e->getLine() . ')'], 422);
+        }
+    }
+ 
+    /** xlsx → PDF with LibreOffice, AS IS (no pdfLayout: the form keeps its own fonts, widths and margins) */
+    private function poToPdf(Spreadsheet $ss): string
+    {
+        @set_time_limit(300);
+        $xlsx = $this->tempFile('xlsx');
+        (new Xlsx($ss))->save($xlsx);
+        $ss->disconnectWorksheets();
+        $outDir = dirname($xlsx);
+        $pdf = $outDir . DIRECTORY_SEPARATOR . pathinfo($xlsx, PATHINFO_FILENAME) . '.pdf';
+ 
+        $win = PHP_OS_FAMILY === 'Windows';
+        $candidates = array_filter([
+            config('services.libreoffice.path'),
+            env('LIBREOFFICE_PATH'),
+            ...($win ? ['C:\\Program Files\\LibreOffice\\program\\soffice.com', 'C:\\Program Files\\LibreOffice\\program\\soffice.exe',
+                        'C:\\Program Files (x86)\\LibreOffice\\program\\soffice.com', 'C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe']
+                     : ['/usr/bin/soffice', '/usr/bin/libreoffice', '/usr/local/bin/soffice', '/opt/libreoffice/program/soffice']),
+        ]);
+        $profileUrl = 'file:///' . ltrim(str_replace('\\', '/', storage_path('app/libreoffice-profile')), '/');
+        $lock = fopen(storage_path('app/libreoffice.lock'), 'c');
+        $tried = [];
+ 
+        foreach (array_unique($candidates) as $soffice) {
+            if (!is_file($soffice)) continue;
+            if ($win && str_ends_with(strtolower($soffice), '.exe') && is_file(substr($soffice, 0, -4) . '.com')) $soffice = substr($soffice, 0, -4) . '.com';
+            if ($lock) flock($lock, LOCK_EX);
+            [$code, $out] = $this->run([$soffice, "-env:UserInstallation={$profileUrl}", '--headless', '--norestore', '--nologo',
+                '--convert-to', 'pdf', '--outdir', $outDir, $xlsx], 180);
+            for ($i = 0; $i < 40 && !is_file($pdf); $i++) usleep(250000);
+            if ($lock) flock($lock, LOCK_UN);
+            if (is_file($pdf) && filesize($pdf) > 0) {
+                if ($lock) fclose($lock);
+                @unlink($xlsx);
+                return $pdf;
+            }
+            $tried[] = "{$soffice}: exit {$code} " . trim(mb_substr($out, 0, 300));
+        }
+        if ($lock) fclose($lock);
+        @unlink($xlsx);
+        abort(response()->json(['message' => "Couldn't make the PDF (LibreOffice).", 'tried' => $tried], 422));
+    }
+ 
+    /** name of a barangay / city / province id (first name-like column that exists) */
+    private function poPlace(string $table, $id, array $cols): ?string
+    {
+        if (!$id || !\Illuminate\Support\Facades\Schema::hasTable($table)) return null;
+        $have = \Illuminate\Support\Facades\Schema::getColumnListing($table);
+        foreach ($cols as $c) if (in_array($c, $have, true)) return \Illuminate\Support\Facades\DB::table($table)->where('id', $id)->value($c);
+        return null;
+    }
+ 
+    /** PURCHASE ORDER FORM — columns A..I, letter portrait */
+    private function poSheet(array $p): Spreadsheet
+    {
+        $ss = new Spreadsheet();
+        $ss->getProperties()->setCustomProperty('pdfAsIs', true);   // pdfLayout leaves this one as it is
+        $sh = $ss->getActiveSheet();
+        $sh->setTitle('PURCHASE ORDER');
+        // Arial 8 on the cells only – the default font stays Calibri 11 so the column widths come out right on the page
+        $sh->getStyle('A1:I120')->getFont()->setName('Lexend Deca')->setSize(8);
+        $sh->setShowGridlines(false);
+ 
+        foreach (['A' => 15, 'B' => 13, 'C' => 8, 'D' => 9, 'E' => 18, 'F' => 4, 'G' => 17, 'H' => 5, 'I' => 16] as $col => $w) {
+            $sh->getColumnDimension($col)->setWidth($w);
+        }
+        $thin = ['borderStyle' => Border::BORDER_THIN];
+        $med  = ['borderStyle' => Border::BORDER_MEDIUM];
+        $txt  = fn (string $cell, $v) => $sh->setCellValueExplicit($cell, (string) $v, DataType::TYPE_STRING);
+        $bold = fn (string $range, float $size = 8) => $sh->getStyle($range)->getFont()->setBold(true)->setSize($size);
+        $num  = fn (string $cell, float $v) => $sh->setCellValue($cell, $v)->getStyle($cell)->getNumberFormat()->setFormatCode('#,##0.00');
+ 
+        // ---------- header ----------
+        $sh->getRowDimension(1)->setRowHeight(8);
+        $sh->mergeCells('A2:I2');
+        $txt('A2', $p['company']);
+        $bold('A2', 24);
+        $sh->getStyle('A2')->getAlignment()->setHorizontal('center')->setVertical('center');
+        $sh->getRowDimension(2)->setRowHeight(42);
+        $sh->getRowDimension(3)->setRowHeight(8);
+        $txt('A4', 'ADDRESS : ' . $p['address']);
+        $txt('A5', 'CONTACT NO. ' . $p['contact']);
+        $bold('A4:A5');
+ 
+        // ---------- title bar ----------
+        $sh->getRowDimension(6)->setRowHeight(8);
+        $sh->getStyle('A7:I7')->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setRGB('D9D9D9');
+        $sh->mergeCells('C7:E7');
+        $txt('C7', 'PURCHASE ORDER');
+        $sh->getStyle('C7')->getFont()->setName('Lexend Deca')->setBold(true)->setSize(13);
+        $sh->getStyle('C7')->getAlignment()->setHorizontal('center');
+        $sh->mergeCells('F7:I7');
+        $rt = new \PhpOffice\PhpSpreadsheet\RichText\RichText();
+        $rt->createTextRun('NO.')->getFont()->setName('Lexend Deca')->setBold(true)->setSize(13);
+        $red = $rt->createTextRun($p['no']);
+        $red->getFont()->setName('Lexend Deca')->setBold(true)->setSize(13)->getColor()->setRGB('FF0000');
+        $sh->setCellValue('F7', $rt);
+        $sh->getStyle('F7')->getAlignment()->setHorizontal('right')->setShrinkToFit(true);
+        $sh->getRowDimension(7)->setRowHeight(20);
+        $sh->getRowDimension(8)->setRowHeight(6);
+ 
+        // ---------- Supplier Information / SPECIFIC INSTRUCTION ----------
+        $txt('B9', 'Supplier Information');
+        $txt('I9', 'SPECIFIC INSTRUCTION');
+        $bold('B9:I9');
+        $sh->getStyle('B9')->getAlignment()->setHorizontal('center');
+        $sh->getStyle('I9')->getAlignment()->setHorizontal('right');
+        $sh->getStyle('A9')->getBorders()->getBottom()->applyFromArray($med);
+        $sh->getStyle('C9:D9')->getBorders()->getBottom()->applyFromArray($med);
+        $sh->getStyle('G9:H9')->getBorders()->getBottom()->applyFromArray($med);
+        $sh->getStyle('I9')->getBorders()->getBottom()->applyFromArray($med);
+ 
+        $left = [10 => ['Supplier:', $p['supplier']], 11 => ['Date Order :', $p['date']], 12 => ['Load Port :', ''], 13 => ['Mode of Payment:', ''], 14 => ['Attention:', '']];
+        foreach ($left as $r => [$k, $v]) {
+            $txt("A{$r}", $k);
+            $bold("A{$r}");
+            $sh->mergeCells("B{$r}:D{$r}");
+            $txt("B{$r}", $v);
+            $sh->getStyle("B{$r}:D{$r}")->getBorders()->getBottom()->applyFromArray($thin);
+            $sh->getRowDimension($r)->setRowHeight(16);
+        }
+        $bold('B10');
+        $sh->getStyle('B10:D14')->getAlignment()->setShrinkToFit(true);
+        $sh->getStyle('A10:A14')->getAlignment()->setShrinkToFit(true);
+        $sh->getStyle('G10:G13')->getAlignment()->setShrinkToFit(true);
+        $right = [10 => 'PICK UP BASIS', 11 => 'DELIVER BASIS', 13 => 'CHECK DUE DATE'];
+        foreach ($right as $r => $k) {
+            $txt("G{$r}", $k);
+            $txt("H{$r}", ':');
+            $bold("G{$r}:H{$r}");
+            $sh->getStyle("I{$r}")->getBorders()->getBottom()->applyFromArray($thin);
+        }
+        $sh->getStyle('I14')->getBorders()->getBottom()->applyFromArray($thin);
+        $sh->getRowDimension(15)->setRowHeight(6);
+        // the two boxes (open top: the caption line is the top)
+        foreach (['A10:D15', 'G10:I15'] as $box) {
+            $b = $sh->getStyle($box)->getBorders();
+            $b->getLeft()->applyFromArray($med);
+            $b->getRight()->applyFromArray($med);
+            $b->getBottom()->applyFromArray($med);
+        }
+        $sh->getStyle('A9')->getBorders()->getLeft()->applyFromArray($med);
+        $sh->getStyle('D9')->getBorders()->getRight()->applyFromArray($med);
+        $sh->getStyle('G9')->getBorders()->getLeft()->applyFromArray($med);
+        $sh->getStyle('I9')->getBorders()->getRight()->applyFromArray($med);
+ 
+        // ---------- gray band ----------
+        $sh->getRowDimension(16)->setRowHeight(10);
+        $sh->getStyle('A17:I17')->getFill()->setFillType(Fill::FILL_SOLID)->getStartColor()->setRGB('C8C8C8');
+        $sh->getRowDimension(17)->setRowHeight(9);
+        $sh->getRowDimension(18)->setRowHeight(14);
+ 
+        // ---------- items ----------
+        $h = 19;
+        $sh->mergeCells("A{$h}:B{$h}");
+        $sh->mergeCells("D{$h}:E{$h}");
+        $sh->mergeCells("H{$h}:I{$h}");
+        foreach (['A' => 'Quantity', 'C' => 'Units', 'D' => 'Product Description', 'H' => 'Amount'] as $c => $t) $txt("{$c}{$h}", $t);
+        $sh->mergeCells("F{$h}:G{$h}");
+        $txt("F{$h}", 'Unit Price');
+        $bold("A{$h}:I{$h}");
+        $sh->getStyle("A{$h}:I{$h}")->getAlignment()->setHorizontal('center');
+        $sh->getStyle("A{$h}:I{$h}")->getBorders()->getAllBorders()->applyFromArray($thin);
+ 
+        $r = $h + 1;
+        foreach ($p['lines'] as $l) {
+            $sh->mergeCells("A{$r}:B{$r}");
+            $num("A{$r}", $l['qty']);
+            $txt("C{$r}", $l['unit']);
+            $sh->mergeCells("D{$r}:E{$r}");
+            $txt("D{$r}", $l['description']);
+            $bold("D{$r}");
+            $sh->getStyle("D{$r}")->getAlignment()->setShrinkToFit(true);
+            $sh->mergeCells("F{$r}:G{$r}");
+            $num("F{$r}", $l['price']);
+            $txt("H{$r}", '=P=');
+            $sh->getStyle("H{$r}")->getFont()->setBold(true)->setSize(6);
+            $num("I{$r}", $l['amount']);
+            $bold("I{$r}");
+            $sh->getStyle("A{$r}:G{$r}")->getAlignment()->setHorizontal('center');
+            $r++;
+        }
+        $r++;
+        $sh->mergeCells("D{$r}:E{$r}");
+        $txt("D{$r}", '**** NOTHING FOLLOWS****');
+        $sh->getStyle("D{$r}")->getAlignment()->setHorizontal('center');
+        $end = $r + 1;
+        // column lines of the item table
+        foreach (["A{$h}:B{$end}", "C{$h}:C{$end}", "D{$h}:E{$end}", "F{$h}:G{$end}", "H{$h}:I{$end}"] as $col) {
+            $b = $sh->getStyle($col)->getBorders();
+            $b->getLeft()->applyFromArray($thin);
+            $b->getRight()->applyFromArray($thin);
+        }
+        $sh->getStyle("A{$end}:I{$end}")->getBorders()->getBottom()->applyFromArray($thin);
+ 
+        // ---------- totals (right) + remarks / prepared by (left) ----------
+        $r = $end + 4;
+        $txt("G{$r}", 'Total Amount:');
+        $bold("G{$r}");
+        $txt("H{$r}", '=P=');
+        $sh->getStyle("H{$r}")->getFont()->setBold(true)->setSize(6);
+        $num("I{$r}", round(array_sum(array_column($p['lines'], 'amount')), 2));
+        $sh->getStyle("I{$r}")->getFont()->setBold(true)->setSize(10)->setUnderline(\PhpOffice\PhpSpreadsheet\Style\Font::UNDERLINE_SINGLE);
+        $note = $r;
+        if ($p['remarks'] !== '') {
+            $txt("A{$note}", 'Note/Remarks:');
+            $bold("A{$note}");
+            $sh->mergeCells('A' . ($note + 1) . ':E' . ($note + 2));
+            $txt('A' . ($note + 1), $p['remarks']);
+            $sh->getStyle('A' . ($note + 1))->getAlignment()->setWrapText(true)->setVertical('top');
+        }
+ 
+        $r += 2;
+        $txt("G{$r}", 'Net of VAT');
+        $num("I{$r}", $p['netOfVat']);
+        $txt('A' . ($r + 1), 'PREPARED AND CONFIRMED BY:');
+        $bold('A' . ($r + 1));
+        if ($p['withhold'] > 0) {
+            $r++;
+            $txt("G{$r}", 'Withholding ' . $p['rate']);
+            $sh->getStyle("G{$r}")->getFont()->setSize(7);
+            $num("I{$r}", $p['withhold']);
+        }
+        $r++;
+        $txt("G{$r}", 'Net of withholding');
+        $num("I{$r}", $p['net']);
+        $bold("G{$r}:I{$r}");
+ 
+        $r += 2;
+        $sh->mergeCells("A{$r}:B{$r}");
+        $txt("A{$r}", $p['prepared']);
+        $bold("A{$r}");
+        $sh->getStyle("A{$r}")->getAlignment()->setHorizontal('center');
+        $sh->getStyle("A{$r}:B{$r}")->getBorders()->getBottom()->applyFromArray($thin);
+        $r++;
+        $sh->mergeCells("A{$r}:B{$r}");
+        $txt("A{$r}", 'SIGNATURE OVER PRINTED NAME');
+        $sh->getStyle("A{$r}")->getFont()->setBold(true)->setSize(6);
+        $sh->getStyle("A{$r}")->getAlignment()->setHorizontal('center');
+        $last = $r + 1;
+ 
+        $sh->getStyle("I1:I{$last}")->getAlignment()->setHorizontal('right');
+        $sh->getStyle('I9')->getAlignment()->setHorizontal('right');
+        $sh->getStyle("H{$h}")->getAlignment()->setHorizontal('center');
+        $sh->getStyle("A1:I{$last}")->getBorders()->getOutline()->applyFromArray($med);
+ 
+        $ps = $sh->getPageSetup();
+        $ps->setOrientation(PageSetup::ORIENTATION_PORTRAIT)->setPaperSize(PageSetup::PAPERSIZE_LETTER);
+        $ps->setPrintArea("A1:I{$last}");
+        $ps->setFitToPage(true)->setFitToWidth(1)->setFitToHeight(0);
+        $ps->setHorizontalCentered(true);
+        $sh->getPageMargins()->setLeft(0.15)->setRight(0.15)->setTop(0.2)->setBottom(0.2)->setHeader(0)->setFooter(0);
+        return $ss;
+    }
 }

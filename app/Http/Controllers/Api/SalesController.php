@@ -122,7 +122,7 @@ class SalesController extends Controller
 
         $rows = $list->map(fn ($r) => [
             'id'               => $r->id,
-            'customer_name'    => trim((string) ($r->customer->name ?? '')) ?: 'WALK IN',
+            'customer_name'    => trim((string) ($r->customer->name ?? '')) ?: 'Unknown',
             'invoice_no'       => $r->invoice_no,
             'document_no'      => $r->document_no,
             'transaction_date' => $r->transaction_date?->format('Y-m-d'),

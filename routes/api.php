@@ -768,6 +768,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/billing/deposit/r1', [PrintController::class, 'depositR1Print']);
     Route::post('/print/collection-monitoring', [PrintController::class, 'collectionExcelPrepare']);
     Route::get('/print/collection-monitoring/{token}', [PrintController::class, 'collectionExcel']);
+    Route::get('/print/purchase-order/{poNumber}', [PrintController::class, 'poPrint']);
 
     Route::get('/notifications', [NotificationController::class, 'index']);
     Route::put('/notifications/read', [NotificationController::class, 'read']);
