@@ -438,7 +438,7 @@ class PrintController extends ReportController
         $from = (string) $request->input('from');
         $to = (string) ($request->input('to') ?: $from);
         if ($to < $from) [$from, $to] = [$to, $from];
-
+ 
         // month by month (same numbers as the screen for that month)
         $months = [];
         $company = null;
@@ -457,13 +457,14 @@ class PrintController extends ReportController
             if ($lines) $months[$ym] = array_values($lines);
         }
         $company ??= [];
-
+ 
         $ss = new Spreadsheet();
         $ss->getProperties()->setCustomProperty('pdfKeepWidths', true);   // pdfLayout: don't make these columns narrower
+        $ss->getProperties()->setCustomProperty('pdfFitWidth', true);     // pdfLayout: fill the page width, small margins
         $sh = $ss->getActiveSheet();
         $sh->setTitle($isSales ? 'Summary List of Sales' : 'Summary List of Purchases');
         $ss->getDefaultStyle()->getFont()->setName('Arial')->setSize(9);
-
+ 
         $mono = ['font' => ['name' => 'Courier New', 'size' => 8]];
         $line = fn (string $rng, string $where = 'bottom', string $style = Border::BORDER_THIN) =>
             $sh->getStyle($rng)->getBorders()->{'get' . ucfirst($where)}()->setBorderStyle($style);
@@ -473,7 +474,7 @@ class PrintController extends ReportController
             if (strlen($d) < 9) return '-     -';
             return substr($d, 0, 3) . '-' . substr($d, 3, 3) . '-' . substr($d, 6, 3);
         };
-
+ 
         // ---------- header ----------
         $r = 1;
         foreach (['Bureau of Internal Revenue', 'Reconciliation of Listings for Enforcement System',
@@ -485,11 +486,11 @@ class PrintController extends ReportController
         $sh->getStyle("A1:A{$r}")->getFont()->setSize(10);
         $line("A{$r}:H{$r}");
         $r += 2;
-
+ 
         $ownerTin = preg_replace('/\D/', '', (string) ($company['tin'] ?? ''));
         $addr = (string) ($company['address'] ?? '');
         [$addr1, $addr2] = array_pad(array_map('trim', explode(',', $addr, 2)), 2, '');
-
+ 
         // label in A, value in B:D (merged) – columns keep their widths in the PDF, so nothing runs over
         $owner = function (int $row, string $label, string $value, bool $strong = false) use ($sh, $text) {
             $text("A{$row}", $label);
@@ -512,8 +513,9 @@ class PrintController extends ReportController
         $sh->getStyle("F{$r}")->getAlignment()->setHorizontal('left');
         $sh->getStyle('A' . ($r - 2) . ":H{$r}")->getFont()->setSize(10);
         $line("A{$r}:H{$r}");
+        $headEnd = $r;                                     // BIR + owner header: printed on top of every page
         $r += 2;
-
+ 
         // ---------- columns ----------
         $caps = ['T.I.N.', 'Registered Name', $isSales ? 'Total Sales' : 'Total Purchases', 'Zero Rated', 'Exempt',
             'Gross Taxable', 'Taxable Net', $isSales ? 'Output Tax' : 'Input Tax'];
@@ -524,12 +526,13 @@ class PrintController extends ReportController
         $numCells = [];                                    // only these get the number format / right alignment
         $grand = array_fill(0, 6, 0.0);
         $MON = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
-
+ 
         if (!$months) {
             $text("A{$r}", 'No transactions for this period.');
             $r++;
         }
-
+ 
+        $lastYm = array_key_last($months);
         foreach ($months as $ym => $lines) {
             // Taxable Month
             $text("A{$r}", 'Taxable Month');
@@ -538,7 +541,7 @@ class PrintController extends ReportController
             $sh->getStyle("B{$r}")->getFont()->setItalic(true);
             $sh->getStyle("A{$r}:B{$r}")->getFont()->setSize(10);
             $r++;
-
+ 
             // column captions (lines above and below)
             foreach ($caps as $i => $t) $text(Coordinate::stringFromColumnIndex($i + 1) . $r, $t);
             $sh->getStyle("A{$r}:H{$r}")->getFont()->setBold(true);
@@ -547,7 +550,7 @@ class PrintController extends ReportController
             $line("A{$r}:H{$r}", 'top');
             $line("A{$r}:H{$r}");
             $r++;
-
+ 
             $sum = array_fill(0, 6, 0.0);
             foreach ($lines as $l) {
                 $vals = $nums($l);
@@ -567,7 +570,7 @@ class PrintController extends ReportController
                 }
                 foreach ($vals as $i => $v) $sum[$i] += $v;
             }
-
+ 
             // Total for the Taxable Month
             $text("B{$r}", 'Total for the Taxable Month');
             $putNums($r, $sum);
@@ -576,10 +579,12 @@ class PrintController extends ReportController
             $sh->getStyle("B{$r}")->getAlignment()->setHorizontal('right');
             $sh->getStyle("C{$r}:H{$r}")->applyFromArray($mono);
             $line("A{$r}:H{$r}", 'top');
+            // one page per month: new page after this month's total (the last month keeps the Report Totals)
+            if ($ym !== $lastYm) $sh->setBreak("A{$r}", \PhpOffice\PhpSpreadsheet\Worksheet\Worksheet::BREAK_ROW);
             $r += 2;
             foreach ($sum as $i => $v) $grand[$i] += $v;
         }
-
+ 
         // Report Totals (double lines)
         $text("B{$r}", 'Report Totals');
         $putNums($r, $grand);
@@ -589,13 +594,13 @@ class PrintController extends ReportController
         $sh->getStyle("C{$r}:H{$r}")->applyFromArray($mono);
         $line("A{$r}:H{$r}", 'top', Border::BORDER_DOUBLE);
         $line("A{$r}:H{$r}", 'bottom', Border::BORDER_DOUBLE);
-
+ 
         // numbers: 1,234.56 / -1,234.56, right aligned
         foreach ($numCells as $rng) {
             $sh->getStyle($rng)->getNumberFormat()->setFormatCode('#,##0.00;-#,##0.00');
             $sh->getStyle($rng)->getAlignment()->setHorizontal('right')->setIndent(1);   // a space between the columns
         }
-
+ 
         // column widths + page
         // Courier numbers need room: "1,793,200.00" = 12 characters + the indent
         foreach (['A' => 17, 'B' => 46, 'C' => 18, 'D' => 17, 'E' => 17, 'F' => 18, 'G' => 18, 'H' => 17] as $col => $w) {
@@ -603,7 +608,9 @@ class PrintController extends ReportController
         }
         $sh->setShowGridlines(false);
         $sh->getPageSetup()->setOrientation(PageSetup::ORIENTATION_LANDSCAPE)->setPaperSize(PageSetup::PAPERSIZE_A4)
-            ->setFitToWidth(1)->setFitToHeight(0);
+            ->setFitToPage(true)->setFitToWidth(1)->setFitToHeight(0);
+        $sh->getPageSetup()->setRowsToRepeatAtTopByStartAndEnd(1, $headEnd);
+        $sh->getPageMargins()->setLeft(0.1)->setRight(0.1)->setTop(0.15)->setBottom(0.15)->setHeader(0)->setFooter(0);
         return $ss;
     }
     /** "July 2026" or "July to September 2026" (old $LastDate) */
@@ -775,19 +782,22 @@ class PrintController extends ReportController
         // keep the report's own orientation (landscape when it has none)
         $portrait = $ps->getOrientation() === PageSetup::ORIENTATION_PORTRAIT;
         if (!$portrait) $ps->setOrientation(PageSetup::ORIENTATION_LANDSCAPE);
-        $sh->getPageMargins()->setLeft(0.15)->setRight(0.15)->setTop(0.2)->setBottom(0.2)->setHeader(0)->setFooter(0);
+        // a report can ask to fill the page width exactly with smaller margins (the RELIEF printout)
+        $fitWidth = (bool) $sh->getParent()?->getProperties()->getCustomPropertyValue('pdfFitWidth');
+        $sh->getPageMargins()->setLeft($fitWidth ? 0.1 : 0.15)->setRight($fitWidth ? 0.1 : 0.15)
+            ->setTop($fitWidth ? 0.15 : 0.2)->setBottom($fitWidth ? 0.15 : 0.2)->setHeader(0)->setFooter(0);
         $ps->setHorizontalCentered(true);
-
+ 
         $lastCol = Coordinate::columnIndexFromString($sh->getHighestDataColumn());
         $lastRow = min($sh->getHighestDataRow(), 4000);                         // big reports: look at the first 4000 rows
         if ($lastCol < 1 || $lastRow < 1) return;
-
+ 
         // cells inside merged ranges (titles) don't decide a column's width
         $merged = [];
         foreach ($sh->getMergeCells() as $range) {
             foreach (Coordinate::extractAllCellReferencesInRange($range) as $ref) $merged[$ref] = true;
         }
-
+ 
         $need = array_fill(1, $lastCol, 0.0);                                    // longest value per column, in "characters at 11pt"
         for ($r = 1; $r <= $lastRow; $r++) {
             for ($c = 1; $c <= $lastCol; $c++) {
@@ -805,7 +815,7 @@ class PrintController extends ReportController
                 $need[$c] = max($need[$c], $len * ($size / 11) * ($font->getBold() ? 1.08 : 1));
             }
         }
-
+ 
         // narrower columns where there is empty space, then the total width
         // a report can keep its own column widths (e.g. the RELIEF printout with Courier numbers)
         $keep = (bool) $sh->getParent()?->getProperties()->getCustomPropertyValue('pdfKeepWidths');
@@ -824,7 +834,14 @@ class PrintController extends ReportController
             $total += $w;
         }
         if ($total <= 0) return;
-
+ 
+        // fill the width: 1 page wide, as many pages tall as needed (page breaks are kept)
+        if ($fitWidth) {
+            $ps->setScale(100, false);
+            $ps->setFitToPage(true)->setFitToWidth(1)->setFitToHeight(0);
+            return;
+        }
+ 
         // zoom so the columns fill the paper width (1 width unit ≈ 5.25pt, + a little cell padding)
         // paper [long side, short side] in inches – letter when not set
         [$long, $short] = [
