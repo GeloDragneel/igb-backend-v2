@@ -442,4 +442,69 @@ class BankingController extends SalesController
             ->map(fn ($l) => ['account_code' => $l->account_code, 'account_name' => $names[$l->account_code] ?? '',
                 'debit' => (float) $l->debit, 'credit' => (float) $l->credit, 'remarks' => $l->remarks]));
     }
+
+    private function unpaidOnly($q, string $alias): void
+    {
+        $q->where("{$alias}.invoice_status_id", '<>', 5)
+            ->where(fn ($w) => $w->whereRaw("UPPER(COALESCE(S.name, '')) LIKE '%UNPAID%'")
+            ->orWhereRaw("UPPER(COALESCE(S.name, '')) LIKE '%PARTIAL%'"));
+    }
+ 
+    /* GET /api/banking/receivables   all unpaid / partial sales on a Receivable account (any month) */
+    public function arUnpaid(Request $request)
+    {
+        $by = $this->addedByFor($request);
+        if (!$by) return response()->json([]);
+        $codes = ChartsOfAccount::where('added_by', $by)->where('account_name', 'like', '%receivable%')->pluck('account_code');
+ 
+        $q = DB::table('t_sales_invoice_master as I')
+            ->leftJoin('m_vendor_customer as C', 'C.id', '=', 'I.customer_id')
+            ->leftJoin('m_invoice_status as S', 'S.id', '=', 'I.invoice_status_id')
+            ->where('I.added_by', $by)
+            ->whereIn('I.account_code', $codes);
+        $this->unpaidOnly($q, 'I');
+        $rows = $q->orderBy('I.transaction_date')->orderBy('I.id')
+            ->get(['I.*', DB::raw("COALESCE(C.name, 'WALK IN') AS party"), DB::raw('S.name AS status_name')]);
+ 
+        return response()->json($rows->map(fn ($r) => [
+            'id' => $r->id, 'invoice_no' => $r->invoice_no, 'document_no' => $r->document_no,
+            'date' => $r->transaction_date ? substr((string) $r->transaction_date, 0, 10) : null,
+            'declared_month' => $r->declared_month ? substr((string) $r->declared_month, 0, 7) : null,
+            'party' => $r->party, 'total' => round((float) ($r->grand_total ?? $r->total ?? 0), 2), 'status' => $r->status_name,
+        ])->values());
+    }
+ 
+    /* GET /api/banking/payables   all unpaid / partial purchases + expenses on a Payable account (any month) */
+    public function apUnpaid(Request $request)
+    {
+        $by = $this->addedByFor($request);
+        if (!$by) return response()->json([]);
+        $codes = ChartsOfAccount::where('added_by', $by)->where('account_name', 'like', '%payable%')->pluck('account_code');
+        $party = Schema::hasColumn('t_purchase_expense_master', 'vendor_id') ? 'vendor_id' : 'customer_id';
+ 
+        $q = DB::table('t_purchase_expense_master as I')
+            ->leftJoin('m_vendor_customer as V', 'V.id', '=', "I.{$party}")
+            ->leftJoin('m_invoice_status as S', 'S.id', '=', 'I.invoice_status_id')
+            ->where('I.added_by', $by)
+            ->whereIn('I.account_code', $codes);
+        $this->unpaidOnly($q, 'I');
+        $rows = $q->orderBy('I.transaction_date')->orderBy('I.id')
+            ->get(['I.*', DB::raw("COALESCE(V.name, '—') AS party"), DB::raw('S.name AS status_name')]);
+ 
+        // paid so far (same as Pay Bill: t_pvoucher_detail.amount per invoice)
+        $paid = DB::table('t_pvoucher_detail')->whereIn('ap_invoice_no', $rows->pluck('invoice_no'))
+            ->groupBy('ap_invoice_no')->selectRaw('ap_invoice_no, SUM(amount) AS t')->pluck('t', 'ap_invoice_no');
+ 
+        return response()->json($rows->map(function ($r) use ($paid) {
+            $total = round((float) ($r->grand_total ?? $r->total ?? 0), 2);
+            $p = round((float) ($paid[$r->invoice_no] ?? 0), 2);
+            return [
+                'id' => $r->id, 'invoice_no' => $r->invoice_no, 'document_no' => $r->document_no,
+                'type' => strtolower((string) $r->trans_type) === 'expenses' ? 'expenses' : 'purchases',
+                'date' => $r->transaction_date ? substr((string) $r->transaction_date, 0, 10) : null,
+                'party' => $r->party, 'total' => $total, 'paid' => $p, 'balance' => round($total - $p, 2), 'status' => $r->status_name,
+            ];
+        })->values());
+    }
+
 }

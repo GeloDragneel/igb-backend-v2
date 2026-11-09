@@ -770,12 +770,12 @@ class PrintController extends ReportController
     /**
      * PDF layout for every report (called at the start of toPdf):
      *   · keeps portrait / landscape as the report has it
- *   · margins almost none (0.15" sides, 0.2" top/bottom, no header/footer space)
+    *   · margins almost none (0.15" sides, 0.2" top/bottom, no header/footer space)
      *   · fonts under 10pt → 10pt (easier to read)
      *   · columns wider than their longest value are made narrower (only narrower, never wider)
      *   · then the page is zoomed so the columns fill the whole paper width
      *     (Excel "fit to width" only makes things smaller – this also makes small reports bigger)
-     */
+    */
     private function pdfLayout(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sh): void
     {
         $ps = $sh->getPageSetup();

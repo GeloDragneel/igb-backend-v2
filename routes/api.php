@@ -379,6 +379,9 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/banking/petty-cash/history', [BankingController::class, 'pcHistory']);
     Route::get('/banking/petty-cash/journal/{jvNo}', [BankingController::class, 'pcJournal']);
 
+    Route::get('/banking/receivables', [BankingController::class, 'arUnpaid']);
+    Route::get('/banking/payables', [BankingController::class, 'apUnpaid']);
+
     Route::get('/reports/financial-statement', [ReportController::class, 'financialStatement']);
     Route::get('/reports/aging', [ReportController::class, 'agingReport']);
 
