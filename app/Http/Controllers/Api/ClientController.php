@@ -1310,4 +1310,54 @@ class ClientController extends Controller
 
         return response()->json(['message' => 'Assigned DA / Auditor saved.', 'da_id' => $newDa, 'auditor_id' => $newAu]);
     }
+    public function accountLogo(int $id)
+    {
+        $a = $this->account($id);
+        $file = trim((string) ($a->logo ?? ''));
+        if ($file === '') return response()->json(['message' => 'No logo.'], 404);
+ 
+        $disk = \Illuminate\Support\Facades\Storage::disk('s3');
+        foreach (["Company_logo/{$a->id}-{$file}", "Company_logo/{$file}"] as $key) {
+            if ($disk->exists($key)) {
+                return response($disk->get($key), 200, [
+                    'Content-Type'  => $disk->mimeType($key) ?: 'image/png',
+                    'Cache-Control' => 'private, max-age=300',
+                ]);
+            }
+        }
+        return response()->json(['message' => 'Logo not found on storage.'], 404);
+    }
+ 
+    /* POST /api/client-accounts/{id}/logo   (multipart: file) */
+    public function uploadAccountLogo(Request $request, int $id)
+    {
+        $request->validate(['file' => ['required', 'file', 'max:2048', 'mimes:png,jpg,jpeg']],
+            ['file.max' => 'Logo is too big (2 MB max).', 'file.mimes' => 'Logo must be PNG or JPG.']);
+        $a = $this->account($id);
+ 
+        $file  = $request->file('file');
+        $clean = preg_replace('/[^A-Za-z0-9_\.-]/', '_', $file->getClientOriginalName());
+        $disk  = \Illuminate\Support\Facades\Storage::disk('s3');
+        try {
+            if (!empty($a->logo) && $a->logo !== $clean) $disk->delete("Company_logo/{$a->id}-{$a->logo}");
+            $disk->putFileAs('Company_logo', $file, $a->id . '-' . $clean);
+        } catch (\Throwable $e) {
+            report($e);
+            return response()->json(['message' => 'Logo upload failed. Please try again.'], 422);
+        }
+        DB::table('m_client_account')->where('id', $a->id)->update(['logo' => $clean, 'updated_at' => now()]);
+ 
+        return response()->json(['logo' => $clean, 'message' => 'Logo saved.']);
+    }
+ 
+    /* DELETE /api/client-accounts/{id}/logo */
+    public function deleteAccountLogo(int $id)
+    {
+        $a = $this->account($id);
+        if (!empty($a->logo)) {
+            try { \Illuminate\Support\Facades\Storage::disk('s3')->delete("Company_logo/{$a->id}-{$a->logo}"); } catch (\Throwable $e) { report($e); }
+        }
+        DB::table('m_client_account')->where('id', $a->id)->update(['logo' => null, 'updated_at' => now()]);
+        return response()->json(['message' => 'Logo removed.']);
+    }
 }

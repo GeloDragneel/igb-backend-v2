@@ -512,6 +512,10 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/settings/accounts/{id}/extras', [ClientController::class, 'mySaveAccountExtras'])->whereNumber('id');
     Route::put('/settings/twa', [ClientController::class, 'mySaveTwa']);
 
+    Route::get('/client-accounts/{id}/logo', [ClientController::class, 'accountLogo'])->whereNumber('id');
+    Route::post('/client-accounts/{id}/logo', [ClientController::class, 'uploadAccountLogo'])->whereNumber('id');
+    Route::delete('/client-accounts/{id}/logo', [ClientController::class, 'deleteAccountLogo'])->whereNumber('id');
+
     // ---------- Monitoring → Reconciliation Monitoring (year grid) ----------
     Route::get('/monitoring/reconciliation', [MonitoringController::class, 'monitoring']);
     Route::get('/monitoring/reconciliation/compliance', [MonitoringController::class, 'complianceList']);

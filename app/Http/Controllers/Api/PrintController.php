@@ -2816,7 +2816,7 @@ class PrintController extends ReportController
     }
 
     /* GET /api/print/purchase-order/{poNumber}   → PURCHASE-ORDER-{po}.pdf (inline) */
-public function poPrint(Request $request, string $poNumber)
+    public function poPrint(Request $request, string $poNumber)
     {
         try {
             $by = $this->addedByFor($request);
@@ -2851,6 +2851,7 @@ public function poPrint(Request $request, string $poNumber)
  
             $ss = $this->poSheet([
                 'company'   => (string) ($a->trade_name ?? ''),
+                'logo'      => $this->poLogo($a),     // temp file of the account's logo (S3 Company_logo/), or null
                 'address'   => $address,
                 'contact'   => $contact,
                 'no'        => (string) (($po->document_no ?? '') ?: $po->po_number),
@@ -2869,6 +2870,7 @@ public function poPrint(Request $request, string $poNumber)
             ]);
  
             $pdf = $this->poToPdf($ss);
+            if ($this->poLogoTmp) @unlink($this->poLogoTmp);
             return response()->download($pdf, "PURCHASE-ORDER-{$po->po_number}.pdf", ['Content-Type' => 'application/pdf'], 'inline')
                 ->deleteFileAfterSend(true);
         } catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface | \Illuminate\Http\Exceptions\HttpResponseException $e) {
@@ -2920,7 +2922,27 @@ public function poPrint(Request $request, string $poNumber)
         @unlink($xlsx);
         abort(response()->json(['message' => "Couldn't make the PDF (LibreOffice).", 'tried' => $tried], 422));
     }
+     private ?string $poLogoTmp = null;
  
+    /** the account's logo from S3 (Company_logo/{caid}-{file}) → temp file for the sheet, null when none */
+    private function poLogo(?object $a): ?string
+    {
+        $file = trim((string) ($a->logo ?? ''));
+        if (!$a || $file === '') return null;
+        try {
+            $disk = \Illuminate\Support\Facades\Storage::disk('s3');
+            foreach (["Company_logo/{$a->id}-{$file}", "Company_logo/{$file}"] as $key) {
+                if (!$disk->exists($key)) continue;
+                $tmp = $this->tempFile(strtolower(pathinfo($file, PATHINFO_EXTENSION)) ?: 'png');
+                file_put_contents($tmp, $disk->get($key));
+                $this->poLogoTmp = $tmp;
+                return $tmp;
+            }
+        } catch (\Throwable $e) {
+            report($e);
+        }
+        return null;
+    }
     /** name of a barangay / city / province id (first name-like column that exists) */
     private function poPlace(string $table, $id, array $cols): ?string
     {
@@ -2953,10 +2975,28 @@ public function poPrint(Request $request, string $poNumber)
         // ---------- header ----------
         $sh->getRowDimension(1)->setRowHeight(8);
         $sh->mergeCells('A2:I2');
-        $txt('A2', $p['company']);
-        $bold('A2', 24);
-        $sh->getStyle('A2')->getAlignment()->setHorizontal('center')->setVertical('center');
-        $sh->getRowDimension(2)->setRowHeight(42);
+        $sh->getRowDimension(2)->setRowHeight(48);
+        if (!empty($p['logo']) && ($size = @getimagesize($p['logo']))) {
+            // the account's logo, centered (max 60px high, max 520px wide)
+            $h = 60;
+            $w = (int) round($size[0] * $h / max(1, $size[1]));
+            if ($w > 520) { $w = 520; $h = (int) round($size[1] * $w / max(1, $size[0])); }
+            $sheetPx = 0;
+            foreach (['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'] as $c) $sheetPx += (int) round($sh->getColumnDimension($c)->getWidth() * 7 + 5);
+            $img = new \PhpOffice\PhpSpreadsheet\Worksheet\Drawing();
+            $img->setPath($p['logo']);
+            $img->setResizeProportional(false);
+            $img->setWidth($w)->setHeight($h);
+            $img->setCoordinates('A2');
+            $img->setOffsetX(max(0, (int) (($sheetPx - $w) / 2)));
+            $img->setOffsetY(2);
+            $img->setWorksheet($sh);
+            $sh->getRowDimension(2)->setRowHeight(max(48, $h * 0.75 + 4));
+        } else {
+            $txt('A2', $p['company']);
+            $bold('A2', 24);
+            $sh->getStyle('A2')->getAlignment()->setHorizontal('center')->setVertical('center');
+        }
         $sh->getRowDimension(3)->setRowHeight(8);
         $txt('A4', 'ADDRESS : ' . $p['address']);
         $txt('A5', 'CONTACT NO. ' . $p['contact']);
