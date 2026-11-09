@@ -167,7 +167,6 @@ class BankingController extends SalesController
     const F = 't_petty_cash_fund';
     const V = 't_petty_cash_voucher';
     const R = 't_petty_cash_replenishment';
-
     private function nextNo(string $table, string $col, string $prefix): string
     {
         $p = $prefix . '-' . date('ymd') . '-';
@@ -491,9 +490,28 @@ class BankingController extends SalesController
         $rows = $q->orderBy('I.transaction_date')->orderBy('I.id')
             ->get(['I.*', DB::raw("COALESCE(V.name, '—') AS party"), DB::raw('S.name AS status_name')]);
  
-        // paid so far (same as Pay Bill: t_pvoucher_detail.amount per invoice)
-        $paid = DB::table('t_pvoucher_detail')->whereIn('ap_invoice_no', $rows->pluck('invoice_no'))
+        // Purchase Orders on a Payable account (not VOID); paid / balance like the invoices
+        $pos = DB::table('t_porder_master as P')
+            ->leftJoin('m_vendor_customer as V', 'V.id', '=', 'P.vendor_id')
+            ->leftJoin('m_pos_status as S', 'S.id', '=', 'P.po_status_id')
+            ->where('P.added_by', $by)->whereIn('P.account_code', $codes)->where('P.po_status_id', '<>', 5)
+            ->orderBy('P.po_date')->orderBy('P.id')
+            ->get(['P.id', 'P.po_number', 'P.document_no', 'P.po_date', 'P.grand_total', 'P.total', DB::raw("COALESCE(V.name, '—') AS party"), DB::raw('S.name AS status_name')]);
+ 
+        // paid so far (same as Pay Bill: t_pvoucher_detail.amount per invoice / PO number)
+        $paid = DB::table('t_pvoucher_detail')->whereIn('ap_invoice_no', $rows->pluck('invoice_no')->merge($pos->pluck('po_number')))
             ->groupBy('ap_invoice_no')->selectRaw('ap_invoice_no, SUM(amount) AS t')->pluck('t', 'ap_invoice_no');
+ 
+        $poRows = $pos->map(function ($r) use ($paid) {
+            $total = round((float) ($r->grand_total ?: $r->total), 2);
+            $p = round((float) ($paid[$r->po_number] ?? 0), 2);
+            return [
+                'id' => $r->id, 'invoice_no' => $r->po_number, 'document_no' => $r->document_no, 'type' => 'po',
+                'date' => $r->po_date ? substr((string) $r->po_date, 0, 10) : null,
+                'party' => $r->party, 'total' => $total, 'paid' => $p, 'balance' => round($total - $p, 2),
+                'status' => 'PO · ' . ($p > 0 ? 'PARTIAL' : 'UNPAID'),
+            ];
+        })->filter(fn ($r) => $r['balance'] > 0.009);
  
         return response()->json($rows->map(function ($r) use ($paid) {
             $total = round((float) ($r->grand_total ?? $r->total ?? 0), 2);
@@ -504,7 +522,6 @@ class BankingController extends SalesController
                 'date' => $r->transaction_date ? substr((string) $r->transaction_date, 0, 10) : null,
                 'party' => $r->party, 'total' => $total, 'paid' => $p, 'balance' => round($total - $p, 2), 'status' => $r->status_name,
             ];
-        })->values());
+        })->concat($poRows)->sortBy('date')->values());
     }
-
 }

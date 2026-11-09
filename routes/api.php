@@ -407,6 +407,11 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/sales/collections/{rvoucherNo}/attachment', [ReceiveMoneyController::class, 'rmAttachment']);
     Route::get('/{type}/payments/{pvoucherNo}/attachment', [PayBillController::class, 'pbAttachment'])->whereIn('type', ['purchases', 'expenses']);
 
+    Route::get('/{type}/invoice/{invoiceNo}/payments', [PayBillController::class, 'pbShow'])->whereIn('type', ['purchases', 'expenses', 'po']);
+    Route::post('/{type}/invoice/{invoiceNo}/payments', [PayBillController::class, 'pbStore'])->whereIn('type', ['purchases', 'expenses', 'po']);
+    Route::delete('/{type}/payments/{pvoucherNo}', [PayBillController::class, 'pbVoid'])->whereIn('type', ['purchases', 'expenses', 'po']);
+    Route::get('/{type}/payments/{pvoucherNo}/attachment', [PayBillController::class, 'pbAttachment'])->whereIn('type', ['purchases', 'expenses', 'po']);
+
     Route::get('/{type}/invoice/{invoiceNo}/2307', [InvoiceExtrasController::class, 'form2307'])->whereIn('type', ['sales', 'purchases', 'expenses']);
     Route::get('/{type}/invoice/{invoiceNo}/logs', [InvoiceExtrasController::class, 'logs'])->whereIn('type', ['sales', 'purchases', 'expenses']);
 

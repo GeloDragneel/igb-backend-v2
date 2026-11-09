@@ -50,6 +50,14 @@ class PayBillController extends SalesController
     }
     private function invoice(int $by, string $type, string $no): ?object
     {
+        if ($type === 'po') {
+            $po = DB::table('t_porder_master')->where('added_by', $by)->where('po_number', $no)->first();
+            if (!$po) return null;
+            $po->invoice_no = $po->po_number; // same field names as an invoice
+            $po->invoice_status_id = (int) $po->po_status_id;
+            $po->is_po = true;
+            return $po;
+        }
         return DB::table(self::IM)->where('added_by', $by)->where('invoice_no', $no)
             ->whereRaw('LOWER(trans_type) = ?', [$type])->first();
     }
@@ -73,6 +81,7 @@ class PayBillController extends SalesController
     private function settle(object $inv): array
     {
         $paid = $this->paid($inv->invoice_no);
+        if (!empty($inv->is_po)) return [$paid, null];     // a PO has no paid / unpaid status
         $status = PA::statusFor((float) $inv->grand_total, $paid);
         $upd = ['invoice_status_id' => $status, 'updated_at' => now()];
         if ($status === PA::statusId('PAID') && strtolower((string) ($inv->record_status ?? '')) === 'billing') $upd['record_status'] = 'posted';
@@ -123,19 +132,20 @@ class PayBillController extends SalesController
             'particulars'  => ['nullable', 'string', 'max:1000'],
             'attachment'   => self::FILE_RULE,
         ], ['bank.required' => 'Pick the cash / bank account the money comes from', 'amount.gt' => 'Enter the amount paid', 'attachment.max' => 'Attachment is too big (10 MB max).']);
-
+ 
         $by = $this->addedByFor($request);
         $inv = $this->invoice($by, $type, $invoiceNo);
         if (!$inv) return response()->json(['message' => 'Invoice not found.'], 404);
-        if ((int) $inv->invoice_status_id === 5 || preg_match('/void|cancel/i', (string) DB::table('m_invoice_status')->where('id', $inv->invoice_status_id)->value('name'))) {
+        if ((int) $inv->invoice_status_id === 5
+            || (empty($inv->is_po) && preg_match('/void|cancel/i', (string) DB::table('m_invoice_status')->where('id', $inv->invoice_status_id)->value('name')))) {
             return response()->json(['message' => 'This invoice is void / cancelled.'], 422);
         }
-
+ 
         $amount = round((float) $d['amount'], 2);
         $balance = round((float) $inv->grand_total - $this->paid($inv->invoice_no), 2);
         if ($amount > $balance + 0.01) return response()->json(['message' => 'More than the balance (' . number_format($balance, 2) . ').'], 422);
-        // no Declared Month lock here: paying a bill doesn't change what was declared
-
+        if ($this->isLocked($this->caidFor($request), [substr($d['pv_date'], 0, 7)])) return response()->json(['message' => 'Declared Month is disabled'], 422);
+ 
         do { $no = 'PV-' . date('ymd-his') . random_int(10000, 99999); } while (DB::table(self::PM)->where('pvoucher_no', $no)->exists());
         try {
             $file = $this->upload($request, self::FOLDER, $no);
@@ -143,12 +153,12 @@ class PayBillController extends SalesController
             report($e);
             return response()->json(['message' => 'Attachment upload failed. Please try again.'], 422);
         }
-
+ 
         return DB::transaction(function () use ($by, $d, $inv, $amount, $no, $file) {
-            $vendorId = (int) ($inv->{$this->vendorCol()} ?? 0);
+            $vendorId = (int) (!empty($inv->is_po) ? $inv->vendor_id : ($inv->{$this->vendorCol()} ?? 0));
             $vendor = $vendorId ? DB::table('m_vendor_customer')->where('id', $vendorId)->value('name') : null;
             $ex = (float) ($inv->ex_rate ?? 1) ?: 1;
-
+ 
             DB::table(self::PM)->insert(PA::only(self::PM, [
                 'pvoucher_no' => $no, 'pv_date' => $d['pv_date'], 'vendor_id' => $vendorId, 'pay_to' => $vendor,
                 'particulars' => $d['particulars'] ?? null, 'total_amount' => $amount, 'total_f_amount' => round($amount / $ex, 4),
@@ -159,18 +169,18 @@ class PayBillController extends SalesController
             ]));
             DB::table(self::PD)->insert(PA::only(self::PD, [
                 'pvoucher_no' => $no, 'voucher_date' => $d['pv_date'], 'acc_code' => $inv->account_code, 'account_no' => $d['bank'],
-                'item_id' => 0, 'ap_invoice_no' => $inv->invoice_no, 'ap_id' => $inv->id, 'po_id' => 0, 'qty' => 0,
+                'item_id' => 0, 'ap_invoice_no' => $inv->invoice_no,
+                'ap_id' => empty($inv->is_po) ? $inv->id : 0, 'po_id' => empty($inv->is_po) ? 0 : $inv->id, 'qty' => 0,
                 'f_amount' => round($amount / $ex, 4), 'amount' => $amount, 'ref_data' => $d['ref_data'] ?? null,
                 'payment_type' => $d['payment_type'] ?? null, 'created_at' => now(), 'updated_at' => now(),
             ]));
-
+ 
             [$paid] = $this->settle($inv);
             $left = round((float) $inv->grand_total - $paid, 2);
             return response()->json(['pvoucher_no' => $no, 'balance' => $left,
                 'message' => $left <= 0.009 ? "{$no} saved – bill fully paid" : "{$no} saved – balance " . number_format($left, 2)]);
         });
     }
-
     /* GET /api/{purchases|expenses}/payments/{pvoucherNo}/attachment */
     public function pbAttachment(Request $request, string $type, string $pvoucherNo)
     {
