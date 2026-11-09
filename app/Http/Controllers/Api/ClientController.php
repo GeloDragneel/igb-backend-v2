@@ -1340,7 +1340,7 @@ class ClientController extends Controller
         $disk  = \Illuminate\Support\Facades\Storage::disk('s3');
         try {
             if (!empty($a->logo) && $a->logo !== $clean) $disk->delete("Company_logo/{$a->id}-{$a->logo}");
-            $disk->putFileAs('Company_logo', $file, $a->id . '-' . $clean);
+            $disk->put("Company_logo/{$a->id}-{$clean}", file_get_contents($file->getPathname()));
         } catch (\Throwable $e) {
             report($e);
             return response()->json(['message' => 'Logo upload failed: ' . $e->getMessage()], 422);
