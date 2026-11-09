@@ -265,22 +265,25 @@ abstract class ApInvoiceController extends SalesController
         ]);
         $addedBy = $this->addedByFor($request);
         if (!$addedBy) return response()->json([]);
-
+ 
         $q = $this->apBase($addedBy)->whereBetween('declared_month', [$d['from'], $d['to']]);
         $type = $d['trans_type'] ?? null;
         if ($type === 'posted') $q->where(fn ($w) => $w->where('record_status', 'posted')->orWhereNull('record_status'));
         elseif ($type) $q->where('record_status', $type);
-
+ 
         $cols = ['id', 'invoice_no', 'document_no', 'transaction_date', 'declared_month', 'grand_total', 'vendor_id', 'invoice_status_id', 'audit_status_id'];
-        if (in_array('invalid_reason', $this->apCols(self::M), true)) $cols[] = 'invalid_reason';
         $list = $q->orderByDesc('id')->get($cols);
-
+ 
+        // invalid reason from t_invalid_reason (latest per invoice)
+        $reasons = DB::table('t_invalid_reason')->whereIn('reference_no', $list->pluck('invoice_no'))
+            ->orderBy('id')->pluck('reason', 'reference_no');
+ 
         $vendors  = VendorCustomer::whereIn('id', $list->pluck('vendor_id')->filter()->unique())->pluck('name', 'id');
         $statuses = InvoiceStatus::pluck('name', 'id');
         $audits   = AuditStatus::pluck('name', 'id');
         $tickets  = RequestTicket::whereIn('reference_no', $list->pluck('invoice_no'))->where('is_status', 0)->pluck('ticket_no', 'reference_no');
         $scans    = MobileTransaction::where('added_by', $addedBy)->whereIn('reference_no', $list->pluck('invoice_no'))->pluck('trans_status', 'reference_no');
-
+ 
         return response()->json($list->map(fn ($r) => [
             'id'               => $r->id,
             'customer_name'    => trim((string) ($vendors[$r->vendor_id] ?? '')) ?: '—',
@@ -292,7 +295,7 @@ abstract class ApInvoiceController extends SalesController
             'status'           => $statuses[$r->invoice_status_id] ?? '',
             'audit_status'     => $audits[$r->audit_status_id] ?? '',
             'ticket_no'        => $tickets[$r->invoice_no] ?? null,
-            'reason'           => $r->invalid_reason ?? null,
+            'reason'           => $reasons[$r->invoice_no] ?? null,
             'scan_status'      => $scans[$r->invoice_no] ?? null,
         ])->values());
     }
@@ -663,35 +666,35 @@ abstract class ApInvoiceController extends SalesController
             'scan_action'           => ['nullable', 'in:invalid,partial_invalid,cancel'],
             'invalid_reason'        => ['required_if:scan_action,invalid,partial_invalid', 'nullable', 'string', 'max:1000'],
         ], ['invalid_reason.required_if' => 'Reason is required.']);
-
+ 
         $addedBy = $this->addedByFor($request);
         $caid    = $this->caidFor($request);
         if (!$addedBy) return response()->json(['message' => 'No client account selected.'], 422);
-
+ 
         if ($this->apLocked($caid, [$d['declared_month'], $d['vt_month'] ?? null, $d['it_month'] ?? null])) {
             return response()->json(['message' => 'Declared Month is disabled'], 422);
         }
-
+ 
         $scanAction = $d['scan_action'] ?? null;
         $record     = $scanAction ? 'invalid' : ($d['trans_type'] ?? 'posted');
-
+ 
         // document number already used (123 vs 123-155-125 …) → supervisor override (doc_override_token)
         if (!$scanAction && ($refuse = $this->docGuard($request, (int) $addedBy, $d['document_no'] ?? null, null))) {
             return $refuse;
         }
-
+ 
         $lineRows = $this->apLineRows($d['lines']);
         $linesNet = array_sum(array_map(fn ($l) => $l['amount'] - $l['discount_amount'], $lineRows));
         $wtaxVt = $this->r4($d['2307_vt'] ?? 0);
         $wtaxIt = $this->r4($d['2307_it'] ?? 0);
         $grand  = $this->r4($d['grand_total']);
         $exRate = (float) ($d['ex_rate'] ?? 1) ?: 1;
-
+ 
         $expected = $this->r4($linesNet * $exRate - ($wtaxVt + $wtaxIt));
         if (abs($expected - $grand) > 0.01) {
             return response()->json(['message' => "Grand total doesn't match the items (expected {$expected}, got {$grand}). Please refresh and try again."], 422);
         }
-
+ 
         $scanStatus = match ($scanAction) {
             'invalid' => 2, 'partial_invalid' => 3, 'cancel' => 5,
             default   => $record === 'billing' ? 4 : 1,
@@ -699,19 +702,19 @@ abstract class ApInvoiceController extends SalesController
         $scan = !empty($d['mobile_transaction_id'])
             ? MobileTransaction::where('id', $d['mobile_transaction_id'])->where('added_by', $addedBy)->first()
             : null;
-
+ 
         return DB::transaction(function () use ($d, $addedBy, $caid, $lineRows, $wtaxVt, $wtaxIt, $grand, $scan, $record, $scanStatus) {
             $account = $caid ? ClientAccount::find($caid) : null;
-
+ 
             do {
                 $invoiceNo = 'AP-' . date('ymd-his') . random_int(10000, 99999);
             } while (DB::table(self::M)->where('invoice_no', $invoiceNo)->exists());
-
+ 
             $statusId = $this->apStatusFor($addedBy, $d['account_code'] ?? null);
             $auditId  = $this->apStatusId(AuditStatus::class, ['PENDING']);
             $vt = ($d['atc_vt_id'] ?? null) ? ($d['vt_month'] ?? null) : null;
             $it = ($d['atc_it_id'] ?? null) ? ($d['it_month'] ?? null) : null;
-
+ 
             $master = [
                 'vendor_id'              => $d['customer_id'] ?: null,
                 'added_by'               => $addedBy,
@@ -734,7 +737,6 @@ abstract class ApInvoiceController extends SalesController
                 '2307_vt_declared_month' => $vt,
                 '2307_it_declared_month' => $it,
                 'remarks'                => $d['remarks'] ?? null,
-                'invalid_reason'         => $d['invalid_reason'] ?? null,
                 'attachment'             => $scan ? $scan->filename : null,
                 'is_scanned'             => $scan ? 1 : 0,
                 'document_type_id'       => $d['document_type_id'] ?? null,
@@ -749,7 +751,7 @@ abstract class ApInvoiceController extends SalesController
                 'updated_at'             => now(),
             ];
             $id = DB::table(self::M)->insertGetId($this->apOnly(self::M, $master));
-
+ 
             foreach ($lineRows as $l) {
                 DB::table(self::D)->insert($this->apOnly(self::D, $l + [
                     'invoice_no'             => $invoiceNo,
@@ -769,9 +771,20 @@ abstract class ApInvoiceController extends SalesController
                     'updated_at'             => now(),
                 ]));
             }
-
+ 
             if ($scan) $scan->update(['trans_status' => $scanStatus, 'reference_no' => $invoiceNo]);
-
+ 
+            // INVALID / PARTIAL INVALID reason → t_invalid_reason
+            $reason = trim((string) ($d['invalid_reason'] ?? ''));
+            if ($reason !== '') {
+                DB::table('t_invalid_reason')->insert([
+                    'reference_no' => $invoiceNo,
+                    'reason'       => $reason,
+                    'created_at'   => now(),
+                    'updated_at'   => now(),
+                ]);
+            }
+ 
             return response()->json(['id' => $id, 'invoice_no' => $invoiceNo]);
         });
     }
