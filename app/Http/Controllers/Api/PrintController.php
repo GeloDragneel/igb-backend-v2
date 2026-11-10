@@ -2972,9 +2972,65 @@ private function reliefSheet(Request $request, string $type, array $pick = []): 
     public function poPrint(Request $request, string $poNumber)
     {
         try {
+            [$pdf, $po] = $this->poMakePdf($request, $poNumber);
+            return response()->download($pdf, "PURCHASE-ORDER-{$po->po_number}.pdf", ['Content-Type' => 'application/pdf'], 'inline')
+                ->deleteFileAfterSend(true);
+        } catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface | \Illuminate\Http\Exceptions\HttpResponseException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            report($e);
+            return response()->json(['message' => 'PO print failed: ' . $e->getMessage() . ' (' . basename($e->getFile()) . ':' . $e->getLine() . ')'], 422);
+        }
+    }
+     public function poShareLink(Request $request, string $poNumber)
+    {
+        try {
+            [$pdf, $po] = $this->poMakePdf($request, $poNumber);
+            $key = 'Shared_PO/' . preg_replace('/[^A-Za-z0-9_-]/', '_', $po->po_number) . '-' . bin2hex(random_bytes(8)) . '.pdf';
+            $disk = \Illuminate\Support\Facades\Storage::disk('s3');
+            $disk->put($key, file_get_contents($pdf), ['ContentType' => 'application/pdf', 'ContentDisposition' => 'inline; filename="PURCHASE-ORDER-' . $po->po_number . '.pdf"']);
+            @unlink($pdf);
+            return response()->json(['url' => $disk->temporaryUrl($key, now()->addDays(7)), 'expires' => now()->addDays(7)->toDateString()]);
+        } catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface | \Illuminate\Http\Exceptions\HttpResponseException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            report($e);
+            return response()->json(['message' => 'Could not make the link: ' . $e->getMessage()], 422);
+        }
+    }
+ 
+    /* POST /api/print/purchase-order/{poNumber}/email   { to: ["a@x.com", "b@y.com"], subject, message } → PDF attached, to all of them */
+    public function poEmail(Request $request, string $poNumber)
+    {
+        $d = $request->validate([
+            'to'      => ['required', 'array', 'min:1', 'max:20'],
+            'to.*'    => ['required', 'email'],
+            'subject' => ['nullable', 'string', 'max:200'],
+            'message' => ['nullable', 'string', 'max:5000'],
+        ], ['to.required' => 'Add at least one email address.', 'to.*.email' => 'One of the email addresses is not valid.']);
+        try {
+            [$pdf, $po] = $this->poMakePdf($request, $poNumber);
+            $name = "PURCHASE-ORDER-{$po->po_number}.pdf";
+            $subject = trim((string) ($d['subject'] ?? '')) ?: 'Purchase Order ' . (($po->document_no ?? '') ?: $po->po_number);
+            \Illuminate\Support\Facades\Mail::raw((string) ($d['message'] ?? '') ?: 'Please see the attached purchase order.', function ($m) use ($d, $subject, $pdf, $name) {
+                $m->to(array_values(array_unique($d['to'])))->subject($subject)->attach($pdf, ['as' => $name, 'mime' => 'application/pdf']);
+            });
+            @unlink($pdf);
+            return response()->json(['message' => 'Sent to ' . count(array_unique($d['to'])) . ' email address(es).']);
+        } catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface | \Illuminate\Http\Exceptions\HttpResponseException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            report($e);
+            return response()->json(['message' => 'Email not sent: ' . $e->getMessage()], 422);
+        }
+    }
+ 
+    /** builds the Purchase Order PDF → [pdf path, po row] */
+    private function poMakePdf(Request $request, string $poNumber): array
+    {
             $by = $this->addedByFor($request);
             $po = \Illuminate\Support\Facades\DB::table('t_porder_master')->where('added_by', $by)->where('po_number', $poNumber)->first();
-            if (!$po) return response()->json(['message' => 'Purchase order not found.'], 404);
+            abort_if(!$po, 404, 'Purchase order not found.');
  
             $DB = \Illuminate\Support\Facades\DB::class;
             $lines = $DB::table('t_porder_detail as L')
@@ -3024,16 +3080,8 @@ private function reliefSheet(Request $request, string $type, array $pick = []): 
  
             $pdf = $this->poToPdf($ss);
             if ($this->poLogoTmp) @unlink($this->poLogoTmp);
-            return response()->download($pdf, "PURCHASE-ORDER-{$po->po_number}.pdf", ['Content-Type' => 'application/pdf'], 'inline')
-                ->deleteFileAfterSend(true);
-        } catch (\Symfony\Component\HttpKernel\Exception\HttpExceptionInterface | \Illuminate\Http\Exceptions\HttpResponseException $e) {
-            throw $e;
-        } catch (\Throwable $e) {
-            report($e);
-            return response()->json(['message' => 'PO print failed: ' . $e->getMessage() . ' (' . basename($e->getFile()) . ':' . $e->getLine() . ')'], 422);
-        }
+            return [$pdf, $po];
     }
- 
     /** xlsx → PDF with LibreOffice, AS IS (no pdfLayout: the form keeps its own fonts, widths and margins) */
     private function poToPdf(Spreadsheet $ss): string
     {
@@ -3075,7 +3123,7 @@ private function reliefSheet(Request $request, string $type, array $pick = []): 
         @unlink($xlsx);
         abort(response()->json(['message' => "Couldn't make the PDF (LibreOffice).", 'tried' => $tried], 422));
     }
-    private ?string $poLogoTmp = null;
+private ?string $poLogoTmp = null;
  
     /** the account's logo from S3 (Company_logo/{caid}-{file}) → temp file for the sheet, null when none */
     private function poLogo(?object $a): ?string
@@ -3096,6 +3144,7 @@ private function reliefSheet(Request $request, string $type, array $pick = []): 
         }
         return null;
     }
+ 
     /** name of a barangay / city / province id (first name-like column that exists) */
     private function poPlace(string $table, $id, array $cols): ?string
     {

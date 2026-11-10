@@ -108,7 +108,6 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/expenses/document-check', [ExpenseController::class, 'documentCheck']);
     Route::post('/expenses/document-override', [ExpenseController::class, 'documentOverride']);
 
-
     Route::get('/accounts', [ChartOfAccountController::class, 'listAccounts']);
     Route::post('/accounts', [ChartOfAccountController::class, 'storeAccount']);
     Route::put('/accounts/{code}', [ChartOfAccountController::class, 'updateAccount']);
@@ -120,6 +119,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/contacts/{type}', [VendorCustomerController::class, 'storeContact'])->whereIn('type', ['customer', 'vendor']);
     Route::put('/contacts/{type}/{id}', [VendorCustomerController::class, 'updateContact'])->whereIn('type', ['customer', 'vendor'])->whereNumber('id');
     Route::post('/contacts/{type}/{id}/default', [VendorCustomerController::class, 'setDefaultContact'])->whereIn('type', ['customer', 'vendor'])->whereNumber('id');
+    Route::get('/contacts-socials/{id}', [VendorCustomerController::class, 'contactSocials'])->whereNumber('id');
 
     Route::get('/products-lookups', [ProductController::class, 'productLookups']);
     Route::get('/products/beginning', [ProductController::class, 'begBalances']);
@@ -775,6 +775,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/print/collection-monitoring', [PrintController::class, 'collectionExcelPrepare']);
     Route::get('/print/collection-monitoring/{token}', [PrintController::class, 'collectionExcel']);
     Route::get('/print/purchase-order/{poNumber}', [PrintController::class, 'poPrint']);
+    Route::post('/print/purchase-order/{poNumber}/link', [PrintController::class, 'poShareLink']);
+    Route::post('/print/purchase-order/{poNumber}/email', [PrintController::class, 'poEmail']);
 
     Route::get('/notifications', [NotificationController::class, 'index']);
     Route::put('/notifications/read', [NotificationController::class, 'read']);

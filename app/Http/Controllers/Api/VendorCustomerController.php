@@ -7,6 +7,8 @@ use App\Models\ClientAccount;
 use App\Models\TaxType;
 use App\Models\VendorCustomer;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 class VendorCustomerController extends SalesController
 {
@@ -26,6 +28,57 @@ class VendorCustomerController extends SalesController
         return $caid && (int) $mainCaid === (int) $caid;
     }
 
+    /* ---------- Email / Viber / Messenger / WeChat / WhatsApp / Telegram of a vendor or customer ----------
+       m_social_list (the apps) · m_social_party (vendor_id = m_vendor_customer.id, social_list_id, value) */
+    private function hasSocial(): bool
+    {
+        static $has = null;
+        return $has ??= Schema::hasTable('m_social_list') && Schema::hasTable('m_social_party');
+    }
+
+    /** [vendor_id => [{social_list_id, name, value}, …]] */
+    private function socialsOf(array $ids): array
+    {
+        if (!$ids || !$this->hasSocial()) return [];
+        $out = [];
+        foreach (DB::table('m_social_party as P')->join('m_social_list as L', 'L.id', '=', 'P.social_list_id')
+            ->whereIn('P.vendor_id', $ids)->orderBy('L.id')->orderBy('P.id')
+            ->get(['P.vendor_id', 'P.social_list_id', 'L.name', 'P.value']) as $r) {
+            $out[$r->vendor_id][] = ['social_list_id' => (int) $r->social_list_id, 'name' => $r->name, 'value' => $r->value];
+        }
+        return $out;
+    }
+
+    /** replaces the contact's list with what was sent (empty values are skipped) */
+    private function saveSocials(int $vendorId, ?array $socials): void
+    {
+        if ($socials === null || !$this->hasSocial()) return;      // not sent → keep as is
+        $valid = DB::table('m_social_list')->pluck('id')->map(fn ($x) => (int) $x)->all();
+        DB::transaction(function () use ($vendorId, $socials, $valid) {
+            DB::table('m_social_party')->where('vendor_id', $vendorId)->delete();
+            $now = now();
+            $seen = [];
+            foreach ($socials as $s) {
+                $id = (int) ($s['social_list_id'] ?? 0);
+                $v = trim((string) ($s['value'] ?? ''));
+                if (!$id || $v === '' || !in_array($id, $valid, true) || isset($seen["{$id}|{$v}"])) continue;
+                $seen["{$id}|{$v}"] = true;
+                DB::table('m_social_party')->insert([
+                    'vendor_id' => $vendorId, 'social_list_id' => $id, 'value' => mb_substr($v, 0, 255),
+                    'created_at' => $now, 'updated_at' => $now,
+                ]);
+            }
+        });
+    }
+
+    /* GET /api/contacts-socials/{id}   one vendor / customer's Email, Viber … (Send via popup) */
+    public function contactSocials(Request $request, int $id)
+    {
+        $ok = VendorCustomer::where('id', $id)->where('entry_by', $this->addedByFor($request))->exists();
+        if (!$ok) return response()->json([]);
+        return response()->json($this->socialsOf([$id])[$id] ?? []);
+    }
+
     /* GET /api/contacts/{type} */
     public function listContacts(Request $request, string $type)
     {
@@ -39,6 +92,7 @@ class VendorCustomerController extends SalesController
             ->where('entry_by', $addedBy)
             ->orderBy('name')
             ->get();
+        $socials = $this->socialsOf($rows->pluck('id')->all());
 
         return response()->json($rows->map(fn ($r) => [
             'id'             => $r->id,
@@ -54,6 +108,7 @@ class VendorCustomerController extends SalesController
             'link_caid'      => (int) ($r->link_caid ?? 0),
             'is_default'     => (bool) $r->is_default,
             'created_at'     => $r->created_at?->format('Y-m-d H:i:s'),
+            'socials'        => $socials[$r->id] ?? [],
         ])->values());
     }
 
@@ -66,6 +121,7 @@ class VendorCustomerController extends SalesController
             'branch_types' => BranchType::orderBy('name')->get(['id', 'name']),
             'tax_types'    => TaxType::orderBy('name')->get(['id', 'name']),
             'can_sync'     => $canSync,
+            'social_list'  => $this->hasSocial() ? DB::table('m_social_list')->orderBy('id')->get(['id', 'name']) : [],
             'clients'      => $canSync
                 ? ClientAccount::where('id', '<>', $this->caidFor($request))
                     ->orderBy('trade_name')
@@ -104,6 +160,9 @@ class VendorCustomerController extends SalesController
             'address'        => ['nullable', 'string', 'max:255'],
             'city_country'   => ['nullable', 'string', 'max:255'],
             'link_caid'      => ['nullable', 'integer'],
+            'socials'                  => ['nullable', 'array', 'max:30'],
+            'socials.*.social_list_id' => ['required', 'integer'],
+            'socials.*.value'          => ['nullable', 'string', 'max:255'],
         ];
     }
 
@@ -125,6 +184,8 @@ class VendorCustomerController extends SalesController
         if (!$addedBy) return response()->json(['message' => 'No client account selected.'], 422);
 
         $d = $request->validate($this->contactRules(), $this->contactMessages());
+        $socials = $d['socials'] ?? null;
+        unset($d['socials']);
 
         $c = VendorCustomer::create($d + [
             'user_type'     => $this->userType($type),
@@ -133,6 +194,8 @@ class VendorCustomerController extends SalesController
             'link_caid'     => $d['link_caid'] ?? 0,
             'is_default'    => 0,
         ]);
+
+        $this->saveSocials((int) $c->id, $socials);
 
         return response()->json(['message' => "{$c->name} added", 'id' => $c->id]);
     }
@@ -147,7 +210,10 @@ class VendorCustomerController extends SalesController
         if (!$c) return response()->json(['message' => 'Record not found.'], 404);
 
         $d = $request->validate($this->contactRules(), $this->contactMessages());
+        $socials = array_key_exists('socials', $d) ? ($d['socials'] ?? []) : null;
+        unset($d['socials']);
         $c->update($d + ['link_caid' => $d['link_caid'] ?? 0]);
+        $this->saveSocials((int) $c->id, $socials);
 
         return response()->json(['message' => "{$c->name} updated"]);
     }
