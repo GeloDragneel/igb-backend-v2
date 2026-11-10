@@ -90,7 +90,7 @@ class VendorCustomerController extends SalesController
             'tax_type'     => !empty($d['tax_type_id']) ? (int) $d['tax_type_id'] : null,
             'address'      => $d['address'] ?? null,
             'city_country' => $d['city_country'] ?? null,
-            'link_by_caid' => (int) ($d['link_caid'] ?? 0),
+            'link_by_caid' => !empty($d['link_caid']) ? (int) $d['link_caid'] : null,
         ];
     }
 
