@@ -5832,19 +5832,23 @@ class ReportController extends SalesController
         $in = $this->vsIn($users);
         $void = self::VS_VOID;
         [$peJoin] = $this->vsPeType();
-        $daSql = $daId > 0 ? ' AND A.assigned_daid = ?' : '';
-        $daBind = $daId > 0 ? [$daId] : [];
+        // Data analyst filters the CLIENTS only (m_client_account.assigned_daid in incomeClientsSummary).
+        // Not the transactions: their assigned_daid is who was assigned when they were saved (old / empty / another DA),
+        // so filtering them dropped amounts and the totals changed.
+        $daSql = '';
+        $daBind = [];
         $r = fn (string $x) => $roundPerLine ? "SUM(ROUND(COALESCE({$x}, 0), 2))" : "ROUND(COALESCE(SUM({$x}), 0), 2)";
         $all = 'A.net_of_vat + A.vat_exempt + A.non_vat + A.zero_rated';
+        $salesNonVat = $this->vsPick('t_sales_invoice_detail', ['non_vat']) ? 'A.non_vat' : '0';   // non-VAT sales (Cash Sales - Nonvat …)
         $rows = DB::select("
-            SELECT A.added_by AS uid, 'S' AS k, {$r('A.net_of_vat')} AS nv, {$r('A.vat_exempt')} AS ve, {$r('A.zero_rated')} AS zr
+            SELECT A.added_by AS uid, 'S' AS k, {$r('A.net_of_vat')} AS nv, {$r('A.vat_exempt')} AS ve, {$r('A.zero_rated')} AS zr, {$r($salesNonVat)} AS nt
             FROM t_sales_invoice_detail A
             WHERE A.added_by IN ({$in}) AND A.declared_month BETWEEN ? AND ?
               AND A.invoice_status_id <> {$void} AND A.amount != 0{$this->vsSalesPosted('A')} {$daSql}
             GROUP BY A.added_by
             UNION ALL
             SELECT A.added_by, CASE WHEN A.account_code LIKE '5%' THEN 'C' ELSE 'E' END,
-                   ROUND(COALESCE(SUM({$all}), 0), 2), 0, 0
+                   ROUND(COALESCE(SUM({$all}), 0), 2), 0, 0, 0
             FROM t_purchase_expense_detail A {$peJoin}
             WHERE A.added_by IN ({$in}) AND A.declared_month BETWEEN ? AND ?
               AND A.invoice_status_id <> {$void} AND {$this->vsPeTotal()} != 0
@@ -5859,20 +5863,20 @@ class ReportController extends SalesController
     /** one row of the list (old formulas: gross = total sales − COGS · rate = gross ÷ VATable sales × 100) */
     private function isRow(array $by, array $uids): array
     {
-        $nv = $ve = $zr = $cogs = $exp = 0.0;
+        $nv = $ve = $zr = $nt = $cogs = $exp = 0.0;
         foreach ($uids as $u) {
             $x = $by[$u] ?? [];
-            if (isset($x['S'])) { $nv += (float) $x['S']->nv; $ve += (float) $x['S']->ve; $zr += (float) $x['S']->zr; }
+            if (isset($x['S'])) { $nv += (float) $x['S']->nv; $ve += (float) $x['S']->ve; $zr += (float) $x['S']->zr; $nt += (float) ($x['S']->nt ?? 0); }
             if (isset($x['C'])) $cogs += (float) $x['C']->nv;
             if (isset($x['E'])) $exp += (float) $x['E']->nv;
         }
-        $sales = $nv + $ve + $zr;
+        $sales = $nv + $ve + $zr + $nt;
         $gross = $sales - $cogs;
         return [
             'total_sales'       => $this->vsMoney($sales),
             'cogs'              => $this->vsMoney($cogs),
             'gross_amount'      => $this->vsMoney($gross),
-            'gross_profit_rate' => $nv > 0 ? round($gross / $nv * 100, 2) : 0.0,
+            'gross_profit_rate' => abs($sales) > 0.004 ? round($gross / $sales * 100, 2) : 0.0,
             'expenses'          => $this->vsMoney($exp),
             'income_subject'    => $this->vsMoney($gross - $exp),
         ];
