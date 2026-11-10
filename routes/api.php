@@ -325,6 +325,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/general-journal/accounts', [GeneralJournalController::class, 'gjAccounts']);
     Route::get('/general-journal/entry/{jvNo}', [GeneralJournalController::class, 'gjShow']);
     Route::delete('/general-journal/entry/{jvNo}', [GeneralJournalController::class, 'gjDelete']);
+    Route::get('/general-journal/next-no', [GeneralJournalController::class, 'gjNextNo']);
 
     // ---------- Task → Fixed Asset Management ----------
     Route::get('/fixed-assets', [FixedAssetController::class, 'faIndex']);

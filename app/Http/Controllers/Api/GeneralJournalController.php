@@ -112,11 +112,40 @@ class GeneralJournalController extends SalesController
 
     /* POST /api/general-journal   new or edit (old save_general_journal.php)
        body: { original_jv_no?, jv_no, transaction_date, declared_month, lines: [{account_code, remarks, debit, credit, job}] } */
+    private function jvPrefix(string $type, ?string $date): string
+    {
+        $year = substr((string) $date, 0, 4) ?: date('Y');
+        return ($type === 'ADJUSTING' ? 'AJE' : 'JE') . $year . '-';
+    }
+ 
+    /** next free reference of this account: JE2026-00001, JE2026-00002 … (AJE2026-… for adjusting) */
+    private function nextJvNo(int $by, string $type, ?string $date): string
+    {
+        $prefix = $this->jvPrefix($type, $date);
+        $max = (int) DB::table(self::T)->where('added_by', $by)->where('jv_no', 'like', $prefix . '%')
+            ->selectRaw('MAX(CAST(SUBSTRING(jv_no, ?) AS UNSIGNED)) AS n', [strlen($prefix) + 1])->value('n');
+        do {
+            $no = $prefix . str_pad((string) ++$max, 5, '0', STR_PAD_LEFT);
+        } while (DB::table(self::T)->where('added_by', $by)->where('jv_no', $no)->exists());
+        return $no;
+    }
+ 
+    /* GET /api/general-journal/next-no?type=NORMAL|ADJUSTING&date=2026-11-10   preview of the auto reference */
+    public function gjNextNo(Request $request)
+    {
+        $d = $request->validate(['type' => ['nullable', 'in:NORMAL,ADJUSTING,normal,adjusting'], 'date' => ['nullable', 'date']]);
+        $by = $this->addedByFor($request);
+        if (!$by) return response()->json(['jv_no' => '']);
+        return response()->json(['jv_no' => $this->nextJvNo($by, strtoupper($d['type'] ?? 'NORMAL'), $d['date'] ?? date('Y-m-d'))]);
+    }
+ 
+    /* POST /api/general-journal   new or edit (old save_general_journal.php)
+       body: { original_jv_no?, jv_no, transaction_date, declared_month, lines: [{account_code, remarks, debit, credit, job}] } */
     public function gjSave(Request $request)
     {
         $d = $request->validate([
             'original_jv_no'         => ['nullable', 'string', 'max:60'],
-            'jv_no'                  => ['required', 'string', 'max:60'],
+            'jv_no'                  => ['nullable', 'string', 'max:60'],   // empty on a new entry → auto JE2026-00001 / AJE2026-00001
             'transaction_date'       => ['required', 'date'],
             'declared_month'         => ['required', 'date_format:Y-m'],
             'entry_type'             => ['nullable', 'in:NORMAL,ADJUSTING,normal,adjusting'],
@@ -130,10 +159,10 @@ class GeneralJournalController extends SalesController
             'jv_no.required' => 'Please input reference no',
             'lines.min' => 'Add at least two lines (a debit and a credit).',
         ]);
-
+ 
         $by = $this->addedByFor($request);
         if (!$by) return response()->json(['message' => 'No client account selected.'], 422);
-
+ 
         $dr = round(array_sum(array_map(fn ($l) => (float) ($l['debit'] ?? 0), $d['lines'])), 2);
         $cr = round(array_sum(array_map(fn ($l) => (float) ($l['credit'] ?? 0), $d['lines'])), 2);
         if ($dr <= 0) return response()->json(['message' => 'Enter the amounts.'], 422);
@@ -143,8 +172,12 @@ class GeneralJournalController extends SalesController
                 return response()->json(['message' => 'Row ' . ($i + 1) . ': put the amount in Debit or Credit, not both.'], 422);
             }
         }
-
+ 
         $original = $d['original_jv_no'] ?? null;
+        $d['jv_no'] = trim((string) ($d['jv_no'] ?? ''));
+        if ($original && $d['jv_no'] === '') $d['jv_no'] = $original;
+        $auto = !$original && $d['jv_no'] === '';                    // new entry → reference made when saving
+        if ($auto) $d['jv_no'] = $this->nextJvNo($by, strtoupper($d['entry_type'] ?? 'NORMAL'), $d['transaction_date']);
         $oldMonths = $original ? DB::table(self::T)->where('added_by', $by)->where('jv_no', $original)->pluck('declared_month')->all() : [];
         // closing entries (CE-YYYY) are not blocked by the Declared Month lock
         $isClosing = str_starts_with(strtoupper($d['jv_no']), 'CE-') || str_starts_with(strtoupper((string) $original), 'CE-');
@@ -154,13 +187,18 @@ class GeneralJournalController extends SalesController
         if ($d['jv_no'] !== $original && DB::table(self::T)->where('added_by', $by)->where('jv_no', $d['jv_no'])->exists()) {
             return response()->json(['message' => 'Reference no already in use'], 422);
         }
-
+ 
         // CE-… = Closing Entry · a Fixed Asset depreciation entry stays an Adjusting Entry
         $dep = $this->depreciationJvNos($by);
         $entryType = $isClosing ? 'CLOSING'
             : ((isset($dep[$d['jv_no']]) || ($original && isset($dep[$original]))) ? 'ADJUSTING' : strtoupper($d['entry_type'] ?? 'NORMAL'));
-
-        DB::transaction(function () use ($d, $by, $original, $request, $entryType) {
+ 
+        DB::transaction(function () use (&$d, $by, $original, $request, $entryType, $auto) {
+            // two users saving at the same time: take the next free number inside the transaction
+            if ($auto) {
+                DB::table(self::T)->where('added_by', $by)->where('jv_no', 'like', $this->jvPrefix($entryType, $d['transaction_date']) . '%')->lockForUpdate()->count();
+                $d['jv_no'] = $this->nextJvNo($by, $entryType, $d['transaction_date']);
+            }
             if ($original) DB::table(self::T)->where('added_by', $by)->where('jv_no', $original)->delete();
             // a renamed depreciation entry keeps its link to Fixed Assets
             if ($original && $original !== $d['jv_no'] && Schema::hasTable('t_fixed_asset_depreciation')) {
@@ -176,7 +214,7 @@ class GeneralJournalController extends SalesController
                 ] + ($this->hasType() ? ['entry_type' => $entryType] : []));
             }
         });
-
+ 
         return response()->json(['message' => 'Record successfully saved', 'jv_no' => $d['jv_no'], 'entry_type' => $entryType]);
     }
 
