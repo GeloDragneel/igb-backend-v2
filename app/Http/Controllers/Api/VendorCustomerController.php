@@ -79,6 +79,21 @@ class VendorCustomerController extends SalesController
         return response()->json($this->socialsOf([$id])[$id] ?? []);
     }
 
+    /** form fields → m_vendor_customer columns (the table has branch_type, tax_type, link_by_caid) */
+    private function contactRow(array $d): array
+    {
+        return [
+            'name'         => $d['name'],
+            'tin'          => $d['tin'] ?? null,
+            'branch_code'  => $d['branch_code'],
+            'branch_type'  => (int) $d['branch_type_id'],
+            'tax_type'     => !empty($d['tax_type_id']) ? (int) $d['tax_type_id'] : null,
+            'address'      => $d['address'] ?? null,
+            'city_country' => $d['city_country'] ?? null,
+            'link_by_caid' => (int) ($d['link_caid'] ?? 0),
+        ];
+    }
+
     /* GET /api/contacts/{type} */
     public function listContacts(Request $request, string $type)
     {
@@ -99,13 +114,13 @@ class VendorCustomerController extends SalesController
             'name'           => $r->name,
             'tin'            => $r->tin,
             'branch_code'    => $r->branch_code,
-            'branch_type_id' => $r->branch_type_id,
-            'branch_type'    => $branchTypes[$r->branch_type_id] ?? null,
-            'tax_type_id'    => $r->tax_type_id,
-            'tax_type'       => $taxTypes[$r->tax_type_id] ?? null,
+            'branch_type_id' => $r->branch_type,
+            'branch_type'    => $branchTypes[$r->branch_type] ?? null,
+            'tax_type_id'    => $r->tax_type,
+            'tax_type'       => $taxTypes[$r->tax_type] ?? null,
             'address'        => $r->address,
             'city_country'   => $r->city_country,
-            'link_caid'      => (int) ($r->link_caid ?? 0),
+            'link_caid'      => (int) ($r->link_by_caid ?? 0),
             'is_default'     => (bool) $r->is_default,
             'created_at'     => $r->created_at?->format('Y-m-d H:i:s'),
             'socials'        => $socials[$r->id] ?? [],
@@ -187,13 +202,13 @@ class VendorCustomerController extends SalesController
         $socials = $d['socials'] ?? null;
         unset($d['socials']);
 
-        $c = VendorCustomer::create($d + [
-            'user_type'     => $this->userType($type),
-            'entry_by'      => $addedBy,
-            'entry_by_caid' => $this->caidFor($request),
-            'link_caid'     => $d['link_caid'] ?? 0,
-            'is_default'    => 0,
-        ]);
+        // forceFill: saves every field even when the model's $fillable doesn't list it (branch_type_id, tax_type_id …)
+        $c = new VendorCustomer();
+        $c->forceFill($this->contactRow($d) + [
+            'user_type'  => $this->userType($type),
+            'entry_by'   => $addedBy,
+            'is_default' => 0,
+        ])->save();
 
         $this->saveSocials((int) $c->id, $socials);
 
@@ -212,7 +227,7 @@ class VendorCustomerController extends SalesController
         $d = $request->validate($this->contactRules(), $this->contactMessages());
         $socials = array_key_exists('socials', $d) ? ($d['socials'] ?? []) : null;
         unset($d['socials']);
-        $c->update($d + ['link_caid' => $d['link_caid'] ?? 0]);
+        $c->forceFill($this->contactRow($d))->save();   // Branch Type → branch_type, Tax Registration → tax_type
         $this->saveSocials((int) $c->id, $socials);
 
         return response()->json(['message' => "{$c->name} updated"]);
