@@ -42,6 +42,7 @@ use App\Http\Controllers\Api\BirReturnSummaryController;
 use App\Http\Controllers\Api\AccountPasswordController;
 use App\Http\Controllers\Api\SocialAuthController;
 use App\Http\Controllers\Api\CalendarController;
+use App\Http\Controllers\Api\InventoryReportController;
 
 use Illuminate\Support\Facades\Route;
 
@@ -810,6 +811,9 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::delete('calendar/events/{id}', [CalendarController::class, 'destroy'])->whereNumber('id');
     Route::get('calendar/access', [CalendarController::class, 'access']);
     Route::put('calendar/access/{employeeId}', [CalendarController::class, 'saveAccess'])->whereNumber('employeeId');
+
+    Route::get('/reports/inventory/{report}/excel', [InventoryReportController::class, 'invExcel'])->whereIn('report', ['costing', 'profitability', 'cogs', 'adjustment']);
+    Route::get('/reports/inventory/{report}', [InventoryReportController::class, 'invReport'])->whereIn('report', ['costing', 'profitability', 'cogs', 'adjustment']);
 
     require __DIR__ . '/api_messenger.php';
 });
