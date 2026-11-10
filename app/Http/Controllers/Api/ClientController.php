@@ -94,7 +94,7 @@ class ClientController extends Controller
         $bot = collect($this->options(['m_business_ownership_type'], ['name', 'description']))
             ->sortBy('id')->values()
             ->map(fn ($t) => $t + ['details' => $botDetails->where('business_ownership_type_id', $t['id'])->values()->map(fn ($d) => ['id' => $d->id, 'label' => $d->name])->all()]);
-
+ 
         return response()->json([
             'has_rdo' => Schema::hasColumn('m_client_account', 'rdo'),
             'lookups' => [
@@ -108,10 +108,14 @@ class ClientController extends Controller
                 'branch_types'   => $this->options(['m_branch_type'], ['name', 'description']),
                 'tax_reg'        => $this->options(['m_tax_registration', 'm_tax_registrations'], ['description', 'name', 'registration']),
                 'provinces'      => $this->options(['m_province'], ['province_name']),
+                'social'         => $this->socialList(),   // Email, Viber, Messenger, WeChat, WhatsApp, Telegram
             ],
         ]);
     }
-
+    private function socialList(): array
+    {
+        return $this->hasClientSocial() ? DB::table('m_social_list')->orderBy('id')->get(['id', 'name'])->all() : [];
+    }
     /** page + per_page from the request (per_page 1–200, default 25) */
     private function pageArgs(Request $request): array
     {
@@ -239,6 +243,8 @@ class ClientController extends Controller
             'client' => $this->client($num),
             'accounts' => $this->accountsOf($num),
             'valid_ids' => $this->validIds($num),
+            'socials' => $this->clientSocials($num),
+            'social_list' => $this->socialList(),
         ]);
     }
 
@@ -320,7 +326,7 @@ class ClientController extends Controller
     public function storeClient(Request $request)
     {
         $this->blankBadDates($request);
-        $rules = $this->clientRules() + ['accounts' => ['required', 'array', 'min:1'], 'valid_ids' => ['required', 'array', 'min:1']];
+        $rules = $this->clientRules() + $this->socialRules() + ['accounts' => ['required', 'array', 'min:1'], 'valid_ids' => ['required', 'array', 'min:1']];
         foreach ($this->accountRules() as $k => $r) $rules["accounts.*.{$k}"] = $r;
         foreach ($this->idRules() as $k => $r) $rules["valid_ids.*.{$k}"] = $r;
         $d = $request->validate($rules, $this->clientMessages() + [
@@ -331,20 +337,21 @@ class ClientController extends Controller
             'accounts.*.branch_type.required' => 'Every business account needs a branch type.',
             'accounts.*.branch_code.required' => 'Every business account needs a branch code.',
         ] + $this->loginMessages('accounts.*.'));
-
+ 
         $codes = array_map(fn ($a) => trim($a['branch_code']), $d['accounts']);
         abort_if(count($codes) !== count(array_unique($codes)), 422, 'Two business accounts have the same branch code.');
         $names = array_values(array_filter(array_map(fn ($a) => strtolower(trim((string) ($a['login']['username'] ?? ''))), $d['accounts'])));
         abort_if(count($names) !== count(array_unique($names)), 422, 'Two business accounts have the same login username.');
-
+ 
         $ids = $d['valid_ids'];
         foreach ($ids as $v) $this->checkTin($v);
         $accounts = $d['accounts'];
-        unset($d['accounts'], $d['valid_ids']);
+        $socials = $d['socials'] ?? null;
+        unset($d['accounts'], $d['valid_ids'], $d['socials']);
         $row = $this->cleanClient($d);
-
+ 
         $by = $request->user()?->id;
-        $num = DB::transaction(function () use ($row, $accounts, $by, $ids) {
+        $num = DB::transaction(function () use ($row, $accounts, $by, $ids, $socials) {
             $num = $this->nextClientNum();
             DB::table('m_client')->insert($this->onlyColumns('m_client', $row + ['client_num' => $num, 'created_at' => now(), 'updated_at' => now()]));
             foreach ($accounts as $a) {
@@ -361,22 +368,68 @@ class ClientController extends Controller
                     'institution' => strtoupper(trim($v['institution'])), 'id_num' => trim($v['id_num']),
                 ]);
             }
+            $this->saveClientSocials($num, $socials);
             return $num;
         });
-        return response()->json(['client' => $this->client($num), 'accounts' => $this->accountsOf($num), 'valid_ids' => $this->validIds($num), 'message' => "Client {$num} added."], 201);
+        return response()->json(['client' => $this->client($num), 'accounts' => $this->accountsOf($num), 'valid_ids' => $this->validIds($num), 'socials' => $this->clientSocials($num), 'message' => "Client {$num} added."], 201);
     }
-
+    private function socialRules(): array
+    {
+        return [
+            'socials'                  => ['nullable', 'array', 'max:30'],
+            'socials.*.social_list_id' => ['required', 'integer'],
+            'socials.*.value'          => ['nullable', 'string', 'max:255'],
+        ];
+    }
     /* PUT /api/clients/{num} */
+    private function saveClientSocials(string $num, ?array $socials): void
+    {
+        if ($socials === null || !$this->hasClientSocial()) return;
+        $valid = DB::table('m_social_list')->pluck('id')->map(fn ($x) => (int) $x)->all();
+        DB::table('m_social_party')->where('client_num', $num)->delete();
+        $now = now();
+        $seen = [];
+        foreach ($socials as $s) {
+            $id = (int) ($s['social_list_id'] ?? 0);
+            $v = trim((string) ($s['value'] ?? ''));
+            if (!$id || $v === '' || !in_array($id, $valid, true) || isset($seen["{$id}|{$v}"])) continue;
+            $seen["{$id}|{$v}"] = true;
+            DB::table('m_social_party')->insert([
+                'vendor_id' => null, 'client_num' => $num, 'social_list_id' => $id, 'value' => mb_substr($v, 0, 255),
+                'created_at' => $now, 'updated_at' => $now,
+            ]);
+        }
+    }
     public function updateClient(Request $request, string $num)
     {
         $this->client($num);
         $this->blankBadDates($request);
-        $d = $this->cleanClient($request->validate($this->clientRules(), $this->clientMessages()));
+        $d = $request->validate($this->clientRules() + $this->socialRules(), $this->clientMessages());
+        $socials = array_key_exists('socials', $d) ? ($d['socials'] ?? []) : null;   // not sent → keep as is
+        unset($d['socials']);
+        $d = $this->cleanClient($d);
         abort_unless(DB::table('m_client_account')->where('client_num', $num)->exists(), 422, 'Add at least one business account.');
-        DB::table('m_client')->where('client_num', $num)->update($this->onlyColumns('m_client', $d + ['updated_at' => now()]));
-        return response()->json(['client' => $this->client($num), 'message' => 'Client saved.']);
+        DB::transaction(function () use ($num, $d, $socials) {
+            DB::table('m_client')->where('client_num', $num)->update($this->onlyColumns('m_client', $d + ['updated_at' => now()]));
+            $this->saveClientSocials($num, $socials);
+        });
+        return response()->json(['client' => $this->client($num), 'socials' => $this->clientSocials($num), 'message' => 'Client saved.']);
     }
 
+    private function clientSocials(string $num): array
+    {
+        if (!$this->hasClientSocial()) return [];
+        return DB::table('m_social_party as P')->join('m_social_list as L', 'L.id', '=', 'P.social_list_id')
+            ->where('P.client_num', $num)->orderBy('L.id')->orderBy('P.id')
+            ->get(['P.social_list_id', 'L.name', 'P.value'])
+            ->map(fn ($r) => ['social_list_id' => (int) $r->social_list_id, 'name' => $r->name, 'value' => $r->value])
+            ->all();
+    }
+    private function hasClientSocial(): bool
+    {
+        static $has = null;
+        return $has ??= Schema::hasTable('m_social_list') && Schema::hasColumn('m_social_party', 'client_num');
+    }
     /** empty, "0000-00-00" or not a real date → null, so the dates can be left empty */
     private function blankBadDates(Request $request): void
     {
