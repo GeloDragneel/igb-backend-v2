@@ -2819,15 +2819,15 @@ class ReportController extends SalesController
     // 2307 rows: [pid, atc, doc, base, tax]
     private function esWithheld(string $kind, array $ids, callable $period)
     {
-        $pick = function ($q, string $table, string $pid, string $tax, string $atc, string $month, string $doc) use ($period) {
+        $pick = function ($q, string $table, string $pid, string $tax, string $atc, string $month, string $doc, string $date = 'transaction_date') use ($period) {
             if (!Schema::hasColumn($table, $tax)) return collect();
             return $period($q->where($tax, '>', 0), $month)
-                ->selectRaw("`{$pid}` AS pid, `{$atc}` AS atc, {$doc} AS doc, COALESCE(sub_total,0) AS base, `{$tax}` AS tax")
+                ->selectRaw("`{$pid}` AS pid, `{$atc}` AS atc, {$doc} AS doc, `{$date}` AS dt, COALESCE(sub_total,0) AS base, `{$tax}` AS tax")
                 ->get();
         };
-
+ 
         $sales = fn () => DB::table('t_sales_invoice_master')->whereIn('added_by', $ids)->where('invoice_status_id', '<>', 5)->where('trans_type', 'posted');
-
+ 
         return match ($kind) {
             'IT' => $pick($sales(), 't_sales_invoice_master', 'customer_id', '2307_it', 'atc_it_id', '2307_it_declared_month', 'document_no'),
             'VT' => $pick($sales(), 't_sales_invoice_master', 'customer_id', '2307_vt', 'atc_vt_id', '2307_vt_declared_month', 'document_no'),
@@ -2836,7 +2836,7 @@ class ReportController extends SalesController
                 't_purchase_expense_master', 'vendor_id', '2307_it', 'atc_it_id', '2307_it_declared_month', 'document_no'
             )->concat($pick(
                 DB::table('t_grn_master')->whereIn('receive_by', $ids)->where('grn_status_id', '<>', 5),
-                't_grn_master', 'vendor_id', '2307_it', 'atc_it_id', '2307_it_declared_month', 'ref_data'
+                't_grn_master', 'vendor_id', '2307_it', 'atc_it_id', '2307_it_declared_month', 'ref_data', 'grn_date'
             )),
         };
     }
@@ -2875,6 +2875,13 @@ class ReportController extends SalesController
         $X = fn ($v) => $this->esDatText($v);                        // names: upper case, Ñ → N, no commas / quotes
         $A = fn ($v) => $this->esDatAddress($v);                     // addresses: same + characters RELIEF doesn't take dropped
         $T = fn ($v) => substr(preg_replace('/\D/', '', (string) $v), 0, 9);   // TIN: 9 digits
+        // Transaction Date column (screen / PDF / Excel only – never in the DAT): "Jul 03 2026" or "Jul 03 – Jul 28 2026"
+        $D = function ($a, $b = null): string {
+            $a = $a ? substr((string) $a, 0, 10) : '';
+            $b = $b ? substr((string) $b, 0, 10) : $a;
+            if ($a === '') return '';
+            return $b === $a ? Carbon::parse($a)->format('M d Y') : Carbon::parse($a)->format('M d') . ' – ' . Carbon::parse($b)->format('M d Y');
+        };
         // RELIEF header has TWO address fields: Address 1 = street + barangay, Address 2 = city / province / zip
         $addr1 = $A(trim("{$c['street']} {$c['barangay']}"));
         $addr2 = $A(trim("{$c['city']} {$c['province']} {$c['zip']}"));
@@ -2894,7 +2901,7 @@ class ReportController extends SalesController
                 $grn = $noNonVat(DB::table('t_grn_detail as x'), 't_grn_detail')
                     ->whereIn('x.receive_by', $ids)->where('x.grn_status_id', '<>', 5)
                     ->whereBetween('x.declared_month', [$from, $to])
-                    ->selectRaw('x.declared_month AS mon, x.grn_no AS ref, x.vendor_id AS pid, COALESCE(x.total,0) AS php, COALESCE(x.net_of_vat,0) AS net, COALESCE(x.input_vat,0) AS vat, COALESCE(x.vat_exempt,0) AS exempt, COALESCE(x.zero_rated,0) AS zero')
+                    ->selectRaw('x.declared_month AS mon, x.grn_no AS ref, x.grn_date AS dt, x.vendor_id AS pid, COALESCE(x.total,0) AS php, COALESCE(x.net_of_vat,0) AS net, COALESCE(x.input_vat,0) AS vat, COALESCE(x.vat_exempt,0) AS exempt, COALESCE(x.zero_rated,0) AS zero')
                     ->get();
                 $ap = $noNonVat(DB::table('t_purchase_expense_detail as x'), 't_purchase_expense_detail')
                     ->join('t_purchase_expense_master as m', 'm.invoice_no', '=', 'x.invoice_no')
@@ -2902,15 +2909,16 @@ class ReportController extends SalesController
                     ->whereBetween('m.declared_month', [$from, $to])
                     // Purchases + Expenses records only (same as VAT Summary); Non VAT left out (old dat.php: NonVAT = 0)
                     ->whereRaw('LOWER(m.trans_type) IN (?, ?)', ['purchases', 'expenses'])
-                    ->selectRaw('m.declared_month AS mon, m.invoice_no AS ref, m.vendor_id AS pid, COALESCE(x.amount,0) AS php, COALESCE(x.net_of_vat,0) AS net, COALESCE(x.input_vat,0) AS vat, COALESCE(x.vat_exempt,0) AS exempt, COALESCE(x.zero_rated,0) AS zero')
+                    ->selectRaw('m.declared_month AS mon, m.invoice_no AS ref, m.transaction_date AS dt, m.vendor_id AS pid, COALESCE(x.amount,0) AS php, COALESCE(x.net_of_vat,0) AS net, COALESCE(x.input_vat,0) AS vat, COALESCE(x.vat_exempt,0) AS exempt, COALESCE(x.zero_rated,0) AS zero')
                     ->get();
-
+ 
                 $lines = $grn->concat($ap);
                 $party = $this->esParties($lines->pluck('pid'));
                 $blank = ['tin' => '', 'name' => '', 'address' => '', 'city' => '', 'tin_raw' => '', 'name_raw' => ''];
  
                 $columns = [
-                    ['key' => 'ref', 'label' => 'Reference'], ['key' => 'tin', 'label' => 'TIN'], ['key' => 'name', 'label' => 'Registered Name'],
+                    ['key' => 'ref', 'label' => 'Reference'], ['key' => 'date', 'label' => 'Transaction Date'],
+                    ['key' => 'tin', 'label' => 'TIN'], ['key' => 'name', 'label' => 'Registered Name'],
                     ['key' => 'address', 'label' => 'Street and Barangay'], ['key' => 'city', 'label' => 'City'],
                     ['key' => 'php', 'label' => 'PHP Amount', 'money' => true], ['key' => 'net', 'label' => 'Net of VAT', 'money' => true],
                     ['key' => 'vat', 'label' => 'Input VAT', 'money' => true], ['key' => 'exempt', 'label' => 'VAT Exempt', 'money' => true],
@@ -2918,7 +2926,7 @@ class ReportController extends SalesController
                 ];
                 foreach ($lines as $r) {
                     $v = $party[$r->pid] ?? $blank;
-                    $rows[] = ['ref' => $r->ref, 'tin' => $v['tin'], 'name' => $v['name'], 'address' => $v['address'], 'city' => $v['city'],
+                    $rows[] = ['ref' => $r->ref, 'date' => $D($r->dt), 'date_from' => substr((string) $r->dt, 0, 10), 'date_to' => substr((string) $r->dt, 0, 10), 'tin' => $v['tin'], 'name' => $v['name'], 'address' => $v['address'], 'city' => $v['city'],
                         'php' => round($r->php, 2), 'net' => round($r->net, 2), 'vat' => round($r->vat, 2), 'exempt' => round($r->exempt, 2), 'zero' => round($r->zero, 2),
                         '_tin_raw' => $v['tin_raw'], '_name_raw' => $v['name_raw']];
                 }
@@ -2950,12 +2958,13 @@ class ReportController extends SalesController
                     ->whereIn('x.added_by', $ids)->where('x.invoice_status_id', '<>', 5)->where('x.trans_type', 'posted')
                     ->whereBetween('x.declared_month', [$from, $to])
                     ->selectRaw("COALESCE(NULLIF(x.customer_id, 0), sm.customer_id, 0) AS pid, x.invoice_no AS inv,
+                        COALESCE(sm.transaction_date, x.transaction_date) AS dt,
                         COALESCE(x.amount,0)*{$ex} AS php, COALESCE(x.net_of_vat,0)*{$ex} AS net,
                         COALESCE(x.input_vat,0)*{$ex} AS vat, COALESCE(x.vat_exempt,0)*{$ex} AS exempt,
                         COALESCE(x.zero_rated,0)*{$ex} AS zero");
                 $sum = DB::query()->fromSub($lines, 'l')
                     ->groupBy('l.pid')
-                    ->selectRaw("l.pid AS pid, COUNT(DISTINCT l.inv) AS ninv,
+                    ->selectRaw("l.pid AS pid, COUNT(DISTINCT l.inv) AS ninv, MIN(l.dt) AS dt1, MAX(l.dt) AS dt2,
                         SUBSTRING_INDEX(GROUP_CONCAT(DISTINCT l.inv ORDER BY l.inv SEPARATOR ', '), ', ', 5) AS invs,
                         SUM(l.php) AS php, SUM(l.net) AS net, SUM(l.vat) AS vat, SUM(l.exempt) AS exempt, SUM(l.zero) AS zero")
                     ->get();
@@ -2963,6 +2972,7 @@ class ReportController extends SalesController
                 $blank = ['tin' => '', 'name' => '', 'address' => '', 'city' => '', 'tin_raw' => '', 'name_raw' => ''];
  
                 $columns = [
+                    ['key' => 'date', 'label' => 'Transaction Date'],
                     ['key' => 'tin', 'label' => 'TIN'], ['key' => 'name', 'label' => 'Registered Name'],
                     ['key' => 'address', 'label' => 'Street and Barangay'], ['key' => 'city', 'label' => 'City'],
                     ['key' => 'php', 'label' => 'PHP Amount', 'money' => true], ['key' => 'net', 'label' => 'Net of VAT', 'money' => true],
@@ -2975,7 +2985,7 @@ class ReportController extends SalesController
                         // still no customer (none on the invoice, or a deleted one): say which invoices, so they can be fixed
                         $v['name'] = '(NO CUSTOMER) ' . $r->invs . ($r->ninv > 5 ? ' … ' . $r->ninv . ' invoices' : '');
                     }
-                    $rows[] = ['ref' => $r->invs, 'tin' => $v['tin'], 'name' => $v['name'], 'address' => $v['address'], 'city' => $v['city'],
+                    $rows[] = ['ref' => $r->invs, 'date' => $D($r->dt1, $r->dt2), 'date_from' => substr((string) $r->dt1, 0, 10), 'date_to' => substr((string) $r->dt2, 0, 10), 'tin' => $v['tin'], 'name' => $v['name'], 'address' => $v['address'], 'city' => $v['city'],
                         'php' => round($r->php, 2), 'net' => round($r->net, 2), 'vat' => round($r->vat, 2), 'exempt' => round($r->exempt, 2), 'zero' => round($r->zero, 2),
                         '_tin_raw' => $v['tin_raw'], '_name_raw' => $v['name_raw']];
                 }
@@ -3008,6 +3018,7 @@ class ReportController extends SalesController
                 $columns = array_values(array_filter([
                     ['key' => 'tin', 'label' => 'TIN'],
                     $is1604 ? null : ['key' => 'doc', 'label' => 'Document No'],
+                    ['key' => 'date', 'label' => 'Transaction Date'],
                     ['key' => 'branch', 'label' => 'Branch Code'], ['key' => 'name', 'label' => 'Registered Name'],
                     ['key' => 'atc', 'label' => 'ATC'], ['key' => 'base', 'label' => 'Amount', 'money' => true],
                     ['key' => 'rate', 'label' => 'Tax Rate', 'pct' => true], ['key' => 'tax', 'label' => 'Tax Withheld', 'money' => true],
@@ -3015,7 +3026,7 @@ class ReportController extends SalesController
                 foreach ($list as $r) {
                     $v = $party[$r->pid] ?? $blank;
                     $a = $atc[$r->atc] ?? null;
-                    $rows[] = ['tin' => $v['tin'], 'doc' => $r->doc, 'branch' => $v['branch'], 'name' => $v['name'],
+                    $rows[] = ['tin' => $v['tin'], 'doc' => $r->doc, 'date' => $D($r->dt ?? null), 'branch' => $v['branch'], 'name' => $v['name'],
                         'atc' => $a->name ?? '', 'base' => round($r->base, 2), 'rate' => round($this->esPct($a->rate ?? 0), 2), 'tax' => round($r->tax, 2),
                         '_tin_raw' => $v['tin_raw'], '_name_raw' => $v['name_raw']];
                 }
