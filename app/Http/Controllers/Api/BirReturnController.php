@@ -1406,4 +1406,208 @@ class BirReturnController extends ReportController
 
         return response()->json(['from' => $from, 'to' => $to] + $out);
     }
+        /**
+     * GET /api/bir/payables/detail?kind=sales|buy|ar|ap|vat|ewt|income|comp&from=2026-01&to=2026-12
+     * Home tile popup:
+     *   months   per month: what the books say + which BIR returns cover that month (filed / paid / reconciled)
+     *   returns  the returns filed for the period (form, period, amount, paid, balance, status, reconciled)
+     *   rows     the transactions behind the tile (latest sales / purchases, or the open AR / AP invoices)
+     */
+    public function payablesDetail(Request $request)
+    {
+        $d = $request->validate([
+            'kind' => ['required', 'in:sales,buy,ar,ap,vat,ewt,income,comp'],
+            'from' => ['required', 'date_format:Y-m'],
+            'to'   => ['required', 'date_format:Y-m'],
+        ]);
+        [$from, $to] = $d['from'] <= $d['to'] ? [$d['from'], $d['to']] : [$d['to'], $d['from']];
+        $kind = $d['kind'];
+        $by = $this->booksOf($request);
+        [$ids] = $this->journalScope($request, 'all');
+        $voidId = (int) (DB::table('m_invoice_status')->whereRaw("UPPER(name) LIKE 'VOID%'")->value('id') ?: 5);
+ 
+        // which return forms belong to the tile (sales / purchases are checked against the VAT return)
+        $forms = [
+            'vat' => ['2550M', '2550Q'], 'sales' => ['2550M', '2550Q'], 'buy' => ['2550M', '2550Q'],
+            'ewt' => ['0619E', '1601EQ'], 'income' => ['1701Q', '1701', '1702Q', '1702RT', '1702EX'], 'comp' => ['1601C'],
+            'ar' => [], 'ap' => [],
+        ][$kind];
+ 
+        /* ---------- returns filed for the period ---------- */
+        $returns = [];
+        if ($forms && Schema::hasTable(self::FILING)) {
+            $hasPeriod = Schema::hasColumn(self::FILING, 'period_from') && Schema::hasColumn(self::FILING, 'period_to');
+            $meta = [];
+            foreach (DB::table(self::FILING)->where('added_by', $by)->get() as $r) {
+                $parts = explode('-', basename((string) $r->filename, '.xml'));
+                $form = (string) ($r->form ?? ($parts[1] ?? ''));
+                if (!$this->pdKindOf($form, $forms)) continue;
+                if ($hasPeriod && $r->period_from && $r->period_to) {
+                    [$pf, $pt] = [substr((string) $r->period_from, 0, 7), substr((string) $r->period_to, 0, 7)];
+                } else {
+                    [$pf, $pt] = $this->periodRange($parts[2] ?? '');
+                }
+                if ($pt < $from || $pf > $to) continue;                               // touches the period
+                $meta[$r->filename] = ['form' => strtoupper(preg_replace('/v\d{4}$/i', '', $form)), 'from' => $pf, 'to' => $pt,
+                    'period' => $this->periodLabel($parts[2] ?? '')];
+            }
+            foreach ($this->filings($by, array_keys($meta)) as $name => $f) {        // skips deleted / voided filings
+                $m = $meta[$name];
+                // books for the same months as the return (VAT / EWT only – the others are not in the books)
+                $books = null;
+                if ($ids && in_array($kind, ['vat', 'sales', 'buy'], true)) $books = round($this->outputVat($ids, $m['from'], $m['to']) - $this->inputVat($ids, $m['from'], $m['to']), 2);
+                if ($ids && $kind === 'ewt') $books = round($this->ewt2307($ids, $m['from'], $m['to']), 2);
+                $returns[] = $m + [
+                    'filename'   => $name,
+                    'filed_date' => $f['filed_date'] ? substr((string) $f['filed_date'], 0, 10) : null,
+                    'amount'     => $f['amount'],
+                    'paid'       => $f['paid'],
+                    'balance'    => $f['balance'],
+                    'status'     => $f['status'],                                      // paid | partial | unpaid
+                    'books'      => $books,
+                    'difference' => $books === null ? null : round($f['amount'] - $books, 2),
+                    // saved check from filing (return vs books); when not saved: same amount = reconciled
+                    'reconciled' => $f['reconciled'] ?? ($books === null ? null : abs($f['amount'] - $books) < 0.01),
+                ];
+            }
+            usort($returns, fn ($a, $b) => [$a['from'], $a['form']] <=> [$b['from'], $b['form']]);
+        }
+ 
+        /* ---------- books per month ---------- */
+        $months = [];
+        if (!in_array($kind, ['ar', 'ap'], true)) {
+            $salesBy = $buyBy = collect();
+            if ($ids && $kind === 'sales') {
+                $salesBy = DB::table('t_sales_invoice_master')->whereIn('added_by', $ids)->whereBetween('declared_month', [$from, $to])
+                    ->where('invoice_status_id', '<>', $voidId)->where(fn ($w) => $w->whereNull('trans_type')->orWhere('trans_type', 'posted'))
+                    ->selectRaw('declared_month AS m, SUM(grand_total) AS t, COUNT(*) AS n')->groupBy('m')->get()->keyBy('m');
+            }
+            if ($ids && $kind === 'buy') {
+                $q = DB::table('t_purchase_expense_master')->whereIn('added_by', $ids)->whereBetween('declared_month', [$from, $to])
+                    ->where('invoice_status_id', '<>', $voidId);
+                if (Schema::hasColumn('t_purchase_expense_master', 'record_status')) $q->where(fn ($w) => $w->whereNull('record_status')->orWhere('record_status', 'posted'));
+                $buyBy = $q->selectRaw("declared_month AS m, SUM(grand_total) AS t, COUNT(*) AS n,
+                        SUM(CASE WHEN LOWER(trans_type) = 'purchases' THEN grand_total ELSE 0 END) AS p,
+                        SUM(CASE WHEN LOWER(trans_type) = 'expenses' THEN grand_total ELSE 0 END) AS e")
+                    ->groupBy('m')->get()->keyBy('m');
+            }
+            foreach ($this->monthsOf($from, $to) as $ym) {
+                $row = ['month' => $ym, 'label' => Carbon::createFromFormat('Y-m-d', "{$ym}-01")->format('M Y'), 'books' => null, 'count' => null];
+                if ($kind === 'sales') { $row['books'] = round((float) ($salesBy[$ym]->t ?? 0), 2); $row['count'] = (int) ($salesBy[$ym]->n ?? 0); }
+                if ($kind === 'buy') {
+                    $row['books'] = round((float) ($buyBy[$ym]->t ?? 0), 2); $row['count'] = (int) ($buyBy[$ym]->n ?? 0);
+                    $row['purchases'] = round((float) ($buyBy[$ym]->p ?? 0), 2); $row['expenses'] = round((float) ($buyBy[$ym]->e ?? 0), 2);
+                }
+                if ($ids && $kind === 'vat') {
+                    $o = $this->outputVat($ids, $ym, $ym); $i = $this->inputVat($ids, $ym, $ym);
+                    $row += ['output' => round($o, 2), 'input' => round($i, 2)];
+                    $row['books'] = round($o - $i, 2);
+                }
+                if ($ids && $kind === 'ewt') $row['books'] = round($this->ewt2307($ids, $ym, $ym), 2);
+                // the returns that cover this month
+                $cover = array_values(array_filter($returns, fn ($r) => $r['from'] <= $ym && $r['to'] >= $ym));
+                $row['returns'] = array_map(fn ($r) => ['form' => $r['form'], 'period' => $r['period'], 'status' => $r['status'], 'reconciled' => $r['reconciled']], $cover);
+                $row['filed'] = (bool) $cover;
+                $row['paid'] = $cover && !array_filter($cover, fn ($r) => $r['status'] !== 'paid');
+                $row['reconciled'] = !$cover ? null : (array_filter($cover, fn ($r) => $r['reconciled'] === false) ? false
+                    : (array_filter($cover, fn ($r) => $r['reconciled'] === true) ? true : null));
+                $months[] = $row;
+            }
+        }
+ 
+        /* ---------- the transactions behind the tile ---------- */
+        $rows = [];
+        if ($kind === 'sales' && $ids) {
+            $rows = DB::table('t_sales_invoice_master as M')->leftJoin('m_vendor_customer as C', 'C.id', '=', 'M.customer_id')
+                ->leftJoin('m_invoice_status as S', 'S.id', '=', 'M.invoice_status_id')
+                ->whereIn('M.added_by', $ids)->whereBetween('M.declared_month', [$from, $to])->where('M.invoice_status_id', '<>', $voidId)
+                ->where(fn ($w) => $w->whereNull('M.trans_type')->orWhere('M.trans_type', 'posted'))
+                ->orderByDesc('M.transaction_date')->orderByDesc('M.id')->limit(20)
+                ->get(['M.invoice_no', 'M.document_no', 'M.transaction_date as date', 'M.grand_total as amount',
+                    DB::raw("COALESCE(C.name, 'WALK IN') AS party"), DB::raw("COALESCE(S.name, '') AS status")])
+                ->map(fn ($r) => (array) $r + ['link' => '/task/sales/' . rawurlencode($r->invoice_no)])->all();
+        }
+        if ($kind === 'buy' && $ids) {
+            $q = DB::table('t_purchase_expense_master as M')->leftJoin('m_vendor_customer as C', 'C.id', '=', 'M.vendor_id')
+                ->leftJoin('m_invoice_status as S', 'S.id', '=', 'M.invoice_status_id')
+                ->whereIn('M.added_by', $ids)->whereBetween('M.declared_month', [$from, $to])->where('M.invoice_status_id', '<>', $voidId);
+            if (Schema::hasColumn('t_purchase_expense_master', 'record_status')) $q->where(fn ($w) => $w->whereNull('M.record_status')->orWhere('M.record_status', 'posted'));
+            $rows = $q->orderByDesc('M.transaction_date')->orderByDesc('M.id')->limit(20)
+                ->get(['M.invoice_no', 'M.document_no', 'M.transaction_date as date', 'M.grand_total as amount', 'M.trans_type as type',
+                    DB::raw("COALESCE(C.name, '—') AS party"), DB::raw("COALESCE(S.name, '') AS status")])
+                ->map(fn ($r) => (array) $r + ['link' => (strtolower((string) $r->type) === 'expenses' ? '/task/expenses/' : '/task/purchases/') . rawurlencode($r->invoice_no)])->all();
+        }
+        if ($kind === 'ar' || $kind === 'ap') $rows = $this->pdOpenRows($request, $kind === 'ar', $to, $voidId);
+ 
+        foreach ($rows as &$r) {
+            $r['date'] = isset($r['date']) ? substr((string) $r['date'], 0, 10) : null;
+            $r['amount'] = round((float) ($r['amount'] ?? 0), 2);
+        }
+        unset($r);
+ 
+        $sum = fn ($k) => round(array_sum(array_map(fn ($x) => (float) ($x[$k] ?? 0), $returns)), 2);
+        return response()->json([
+            'kind' => $kind, 'from' => $from, 'to' => $to,
+            'months' => $months, 'returns' => $returns, 'rows' => $rows,
+            'summary' => [
+                'returns'        => count($returns),
+                'filed'          => $sum('amount'),
+                'paid'           => $sum('paid'),
+                'balance'        => $sum('balance'),
+                'reconciled'     => count(array_filter($returns, fn ($r) => $r['reconciled'] === true)),
+                'not_reconciled' => count(array_filter($returns, fn ($r) => $r['reconciled'] === false)),
+                'months_not_filed' => count(array_filter($months, fn ($m) => !$m['filed'])),
+            ],
+        ]);
+    }
+ 
+    /** a return form (e.g. "2550Qv2024", "1701Q") is one of the codes (longest code first, so 1701Q isn't taken as 1701) */
+    private function pdKindOf(string $form, array $codes): bool
+    {
+        $f = strtoupper(preg_replace('/[^0-9A-Za-z]/', '', $form));
+        usort($codes, fn ($a, $b) => strlen($b) <=> strlen($a));
+        foreach ($codes as $c) {
+            if (str_starts_with($f, $c)) {
+                $rest = substr($f, strlen($c));
+                if ($rest === '' || $rest[0] === 'V') return true;                   // "1701" must not match "1701Q"
+            }
+        }
+        return false;
+    }
+ 
+    /** the open AR / AP invoices (same rules as payables(): AR/AP account, posted, not void, no receipt / payment voucher) */
+    private function pdOpenRows(Request $request, bool $ar, string $to, int $voidId): array
+    {
+        [$brIds] = $this->journalScope($request, 'current');
+        $mt = $ar ? 't_sales_invoice_master' : 't_purchase_expense_master';
+        if (!$brIds || !Schema::hasTable($mt)) return [];
+        $asOf = min(Carbon::createFromFormat('Y-m-d', "{$to}-01")->endOfMonth()->toDateString(), now('Asia/Manila')->endOfMonth()->toDateString());
+        $byIds = array_values(array_unique(array_filter(array_merge($brIds, [(int) $this->addedByFor($request)]))));
+        $codes = ChartsOfAccount::whereIn('added_by', $byIds)->get(['account_code', 'account_name'])
+            ->filter(fn ($a) => preg_match($ar ? '/accounts?\s*receivable/i' : '/accounts?\s*payable/i', (string) $a->account_name))
+            ->pluck('account_code')->map(fn ($c) => (string) $c)->unique()->values()->all();
+ 
+        $party = $ar ? 'customer_id' : 'vendor_id';
+        $q = DB::table("{$mt} as M")->leftJoin('m_vendor_customer as C', 'C.id', '=', "M.{$party}")
+            ->whereIn('M.added_by', $brIds)
+            ->where(fn ($w) => $w->whereNull('M.invoice_status_id')->orWhere('M.invoice_status_id', '<>', $voidId))
+            ->whereIn('M.account_code', $codes ?: [$ar ? '12200' : '21100'])
+            ->where('M.transaction_date', '<=', $asOf)
+            ->whereRaw('ABS(COALESCE(M.grand_total, 0)) >= 0.005');
+        if ($ar) $q->where('M.trans_type', 'posted');
+        elseif (Schema::hasColumn($mt, 'record_status')) $q->where('M.record_status', 'posted');
+        $vt = $ar ? 't_rvoucher_detail' : 't_pvoucher_detail';
+        $link = $ar ? 'invoice_no' : 'ap_invoice_no';
+        if (Schema::hasTable($vt)) $q->whereNotExists(fn ($v) => $v->from($vt)->whereColumn("{$vt}.{$link}", 'M.invoice_no'));
+ 
+        $today = Carbon::parse($asOf);
+        return $q->orderBy('M.transaction_date')->limit(50)
+            ->get(['M.invoice_no', 'M.document_no', 'M.transaction_date as date', 'M.grand_total as amount', $ar ? DB::raw("'' AS type") : 'M.trans_type as type',
+                DB::raw("COALESCE(C.name, '" . ($ar ? 'WALK IN' : '—') . "') AS party")])
+            ->map(function ($r) use ($ar, $today) {
+                $days = $r->date ? Carbon::parse(substr((string) $r->date, 0, 10))->diffInDays($today, false) : null;
+                $path = $ar ? '/task/sales/' : (strtolower((string) $r->type) === 'expenses' ? '/task/expenses/' : '/task/purchases/');
+                return (array) $r + ['days' => $days === null ? null : (int) $days, 'status' => 'UNPAID', 'link' => $path . rawurlencode($r->invoice_no)];
+            })->all();
+    }
 }
