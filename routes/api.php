@@ -45,6 +45,7 @@ use App\Http\Controllers\Api\CalendarController;
 use App\Http\Controllers\Api\InventoryReportController;
 use App\Http\Controllers\Api\SendRequestController;
 use App\Http\Controllers\Api\ClientLetterController;
+use App\Http\Controllers\Api\PosController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -831,6 +832,20 @@ Route::middleware('auth:sanctum')->group(function () {
     
     Route::get('/clients/{num}/letter/{kind}', [ClientLetterController::class, 'letter'])->where('kind', 'engagement|disengagement');
     Route::get('/clients/{num}/outstanding', [ClientLetterController::class, 'outstanding']);
+
+    Route::prefix('pos')->group(function () {
+        Route::get('bootstrap', [PosController::class, 'bootstrap']);
+        Route::get('items', [PosController::class, 'items']);
+        Route::post('settings', [PosController::class, 'saveSettings']);
+        Route::post('shift/open', [PosController::class, 'openShift']);
+        Route::post('shift/close', [PosController::class, 'closeShift']);
+        Route::get('shift/{id}/summary', [PosController::class, 'shiftSummary'])->whereNumber('id');
+        Route::post('checkout', [PosController::class, 'checkout']);
+        Route::get('sales', [PosController::class, 'sales']);
+        Route::get('sales/{id}', [PosController::class, 'sale'])->whereNumber('id');
+        Route::post('sales/{id}/void', [PosController::class, 'voidSale'])->whereNumber('id');
+    });
+
     require __DIR__ . '/api_messenger.php';
 });
 
