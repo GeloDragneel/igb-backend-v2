@@ -43,7 +43,8 @@ use App\Http\Controllers\Api\AccountPasswordController;
 use App\Http\Controllers\Api\SocialAuthController;
 use App\Http\Controllers\Api\CalendarController;
 use App\Http\Controllers\Api\InventoryReportController;
-
+use App\Http\Controllers\Api\SendRequestController;
+use App\Http\Controllers\Api\ClientLetterController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -818,6 +819,18 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/reports/inventory/{report}/excel', [InventoryReportController::class, 'invExcel'])->whereIn('report', ['costing', 'profitability', 'cogs', 'adjustment']);
     Route::get('/reports/inventory/{report}', [InventoryReportController::class, 'invReport'])->whereIn('report', ['costing', 'profitability', 'cogs', 'adjustment']);
 
+    Route::get('/send-requests', [SendRequestController::class, 'index']);
+    Route::get('/send-requests/contacts', [SendRequestController::class, 'contacts']);
+    Route::post('/send-requests', [SendRequestController::class, 'store']);
+    Route::put('/send-requests/{id}', [SendRequestController::class, 'update'])->whereNumber('id');
+    Route::get('/send-requests/{id}/pdf', [SendRequestController::class, 'pdf'])->whereNumber('id');
+    Route::post('/send-requests/{id}/confirm', [SendRequestController::class, 'confirm'])->whereNumber('id');
+    Route::post('/send-requests/{id}/decline', [SendRequestController::class, 'decline'])->whereNumber('id');
+    Route::post('/send-requests/{id}/revise', [SendRequestController::class, 'revise'])->whereNumber('id');
+    Route::post('/send-requests/{id}/link', [SendRequestController::class, 'link'])->whereNumber('id');
+    
+    Route::get('/clients/{num}/letter/{kind}', [ClientLetterController::class, 'letter'])->where('kind', 'engagement|disengagement');
+    Route::get('/clients/{num}/outstanding', [ClientLetterController::class, 'outstanding']);
     require __DIR__ . '/api_messenger.php';
 });
 

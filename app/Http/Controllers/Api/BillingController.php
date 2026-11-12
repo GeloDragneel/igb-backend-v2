@@ -17,13 +17,13 @@ use Illuminate\Support\Facades\Schema;
 class BillingController extends Controller
 {
     const PAID = 1, UNPAID = 2, PARTIAL = 3, VOID = 5, CANCELLED = 9;
-    const SUPERVISOR_TYPES = [4];          // old doGetSupervisorList: UserTypeID IN (4)
+    const SUPERVISOR_TYPES = [4]; // old doGetSupervisorList: UserTypeID IN (4)
 
     // balance groups (old LoadCalculateBills): service type ids → payment collection type
     const GROUPS = [
-        'pf'      => ['label' => 'PF & Other Charges',  'ser_types' => [4, 5, 6, 7], 'col_type' => 1],
-        'returns' => ['label' => 'Returns',             'ser_types' => [3],          'col_type' => 2],
-        'eo'      => ['label' => 'Non-recurring / EO',  'ser_types' => [2],          'col_type' => 4],
+        'pf' => ['label' => 'PF & Other Charges',  'ser_types' => [4, 5, 6, 7], 'col_type' => 1],
+        'returns' => ['label' => 'Returns', 'ser_types' => [3], 'col_type' => 2],
+        'eo' => ['label' => 'Non-recurring / EO',  'ser_types' => [2], 'col_type' => 4],
     ];
 
     /* ---------------- helpers ---------------- */
@@ -1775,7 +1775,7 @@ class BillingController extends Controller
         return response()->json(['rows' => $rows, 'total' => round($rows->sum('total_amount'), 2)]);
     }
 
-    /* POST /api/billing/deposit   { date, ids[] }   (old ajax/submit_deposit.php) */
+    /* POST /api/billing/deposit   { date, ids[] } (old ajax/submit_deposit.php) */
     public function deposit(Request $request)
     {
         $d = $request->validate([
