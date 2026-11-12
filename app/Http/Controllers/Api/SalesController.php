@@ -1020,20 +1020,17 @@ class SalesController extends Controller
     public function setStatus(Request $request, int $id)
     {
         $d = $request->validate(['status' => ['required', 'in:VOID,CANCELLED']]);
-        $addedBy = $this->addedByFor($request);
 
-        $inv = SalesInvoiceMaster::where('id', $id)
-            ->where('added_by', $this->addedByFor($request))
-            ->first(['id', 'added_by', 'attachment', 'is_scanned']);
-            
+        $inv = SalesInvoiceMaster::where('id', $id)->where('added_by', $this->addedByFor($request))->first();
         if (!$inv) return response()->json(['message' => 'Invoice not found.'], 404);
 
         $statusId = $this->statusId('m_invoice_status', $d['status'] === 'VOID' ? ['VOID'] : ['CANCEL']);
         if (!$statusId) return response()->json(['message' => "Add a '{$d['status']}' row to m_invoice_status first."], 422);
 
         DB::transaction(function () use ($inv, $statusId) {
-            DB::table('t_sales_invoice_master')->where('id', $inv->id)->update(['invoice_status_id' => $statusId, 'updated_at' => now()]);
-            DB::table('t_sales_invoice_detail')->where('invoice_no', $inv->invoice_no)->update(['invoice_status_id' => $statusId, 'updated_at' => now()]);
+            $inv->forceFill(['invoice_status_id' => $statusId])->save();      // → SalesInvoiceMasterObserver (VOID → collections deleted)
+            DB::table('t_sales_invoice_detail')->where('invoice_no', $inv->invoice_no)
+                ->update(['invoice_status_id' => $statusId, 'updated_at' => now()]);
         });
 
         return response()->json(['ok' => true]);
