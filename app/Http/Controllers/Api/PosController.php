@@ -12,10 +12,10 @@ use Illuminate\Support\Facades\Schema;
 /**
  * Task → POS (full screen, own browser tab)
  *
- * A sale =  Sales Invoice (t_sales_invoice_master / _detail, PAID, debit = A/R)
- *         + Collection per payment method (t_rvoucher_master / _detail, Cash / GCash / Card account)
- *         + POS receipt (t_pos_sale) inside the cashier's shift (t_pos_shift)
- * Stock = beginning + Receive Inventory + adjustments − sales lines (same as Other Reports → Inventory).
+ * A sale is saved ONLY in t_pos_sale (post_status = PENDING) inside the cashier's shift (t_pos_shift).
+ *   Nothing goes to Sales (t_sales_invoice_*) or Collection (t_rvoucher_*) yet; the lines keep the
+ *   accounting figures (VAT / net / account) so they can be posted later.
+ * Stock = beginning + Receive Inventory + adjustments − sales lines − PENDING POS sales.
  * Only items whose Item Class is "Stock Item".
  * Void = invoice VOID (the DB trigger removes its collections; stock comes back).
  *
@@ -38,6 +38,8 @@ class PosController extends SalesController
 {
     const VOID = 5;
     const METHODS = ['cash' => 'Cash', 'gcash' => 'GCash', 'card' => 'Card'];
+    const EMP_TYPES = ['charge' => 'Employee Charge', 'allowance' => 'Employee Allowance'];   // employee as customer
+    const ALL_METHODS = self::METHODS + self::EMP_TYPES;
 
     private static array $cols = [];
 
@@ -154,9 +156,39 @@ class PosController extends SalesController
             'settings' => $this->settings($by, $this->caidFor($request)),
             'accounts' => $this->chart($by),
             'customers' => $customers,
+            'employees' => $this->employees($this->caidFor($request)),
             'shift' => $shift ? $this->shiftOut($shift) : null,
             'cashier' => $this->cashier($request)[1],
         ]);
+    }
+
+    /** active Regular employees of every branch of this client (HR: m_employee.company_caid ∈ the client's business accounts, same client_num) */
+    private function employees(?int $caid, ?int $id = null)
+    {
+        if (!$caid || !Schema::hasTable('m_employee') || !$this->firstCol('m_employee', ['company_caid'])) return collect();
+        $num = DB::table('m_client_account')->where('id', $caid)->value('client_num');
+        $branches = $num
+            ? DB::table('m_client_account')->where('client_num', $num)->pluck('trade_name', 'id')
+            : collect([$caid => DB::table('m_client_account')->where('id', $caid)->value('trade_name')]);
+        // only active + Regular (m_employment_status.name = "Regular")
+        $regular = Schema::hasTable('m_employment_status')
+            ? DB::table('m_employment_status')->whereRaw("UPPER(TRIM(name)) = 'REGULAR'")->pluck('id')->map(fn ($x) => (int) $x)->all()
+            : [];
+
+        return DB::table('m_employee')->whereIn('company_caid', $branches->keys()->all())
+            ->when($id, fn ($q) => $q->where('id', $id))
+            ->where('is_active', 1)
+            ->when($this->firstCol('m_employee', ['employment_stat_id']), fn ($q) => $q->whereIn('employment_stat_id', $regular ?: [0]))
+            ->orderBy('last_name')->orderBy('first_name')
+            ->get(['id', 'last_name', 'first_name', 'middle_name', 'company_caid'])
+            ->map(fn ($e) => [
+                'id' => (int) $e->id,
+                'name' => trim(preg_replace('/\s+/', ' ', trim((string) $e->last_name) . ', ' . trim((string) $e->first_name)
+                    . (trim((string) $e->middle_name) !== '' ? ' ' . mb_substr(trim((string) $e->middle_name), 0, 1) . '.' : '')), ', '),
+                'branch' => (string) ($branches[$e->company_caid] ?? ''),
+                'same_branch' => (int) $e->company_caid === (int) $caid,
+            ])
+            ->sortBy(fn ($e) => ($e['same_branch'] ? '0' : '1') . $e['name'])->values();
     }
 
     /* =====================================================================
@@ -246,6 +278,19 @@ class PosController extends SalesController
             $sq->where(fn ($w) => $w->whereNull('L.trans_type')->orWhereNotIn('L.trans_type', ['invalid', 'adjustment']));
         }
         $add($sq->groupBy('L.item_id')->selectRaw('L.item_id, SUM(L.quantity) AS n')->pluck('n', 'item_id'), -1);
+
+        // POS sales not posted to Sales yet
+        if (Schema::hasTable('t_pos_sale')) {
+            $pending = [];
+            DB::table('t_pos_sale')->where('added_by', $by)->where('status', 'PAID')
+                ->where(fn ($w) => $w->where('post_status', 'PENDING')->orWhereNull('post_status'))->whereNull('invoice_no')
+                ->orderBy('id')->chunk(500, function ($rows) use (&$pending) {
+                    foreach ($rows as $r) foreach (json_decode($r->lines, true) ?: [] as $l) {
+                        $pending[(int) $l['item_id']] = ($pending[(int) $l['item_id']] ?? 0) + (float) $l['qty'];
+                    }
+                });
+            $add($pending, -1);
+        }
         return $q;
     }
 
@@ -295,7 +340,7 @@ class PosController extends SalesController
     {
         $sales = DB::table('t_pos_sale')->where('shift_id', $s->id)->get();
         $paid = $sales->where('status', 'PAID');
-        $byMethod = array_fill_keys(array_keys(self::METHODS), 0.0);
+        $byMethod = array_fill_keys(array_keys(self::ALL_METHODS), 0.0);
         foreach ($paid as $x) {
             foreach (json_decode($x->payments, true) ?: [] as $p) {
                 $byMethod[$p['method']] = ($byMethod[$p['method']] ?? 0) + (float) $p['amount'];
@@ -346,28 +391,30 @@ class PosController extends SalesController
         $d = $request->validate([
             'shift_id' => ['required', 'integer'],
             'customer_id' => ['nullable', 'integer'],
+            'employee_id' => ['nullable', 'integer'],
+            'employee_type' => ['nullable', 'required_with:employee_id', 'in:charge,allowance'],
             'lines' => ['required', 'array', 'min:1', 'max:300'],
             'lines.*.item_id' => ['required', 'integer'],
             'lines.*.qty' => ['required', 'numeric', 'gt:0'],
             'lines.*.price' => ['required', 'numeric', 'min:0'],
             'lines.*.discount' => ['nullable', 'numeric', 'min:0'],
-            'payments' => ['required', 'array', 'min:1', 'max:6'],
+            'payments' => ['required_without:employee_id', 'array', 'max:6'],
             'payments.*.method' => ['required', 'in:' . implode(',', array_keys(self::METHODS))],
             'payments.*.amount' => ['required', 'numeric', 'gt:0'],
             'payments.*.reference' => ['nullable', 'string', 'max:60'],
-        ], ['lines.required' => 'The cart is empty.', 'payments.required' => 'Add a payment.']);
+        ], ['lines.required' => 'The cart is empty.', 'payments.required_without' => 'Add a payment.', 'employee_type.required_with' => 'Choose Charge or Allowance.']);
+
+        // employee as customer: Charge (deducted from the employee later) or Allowance (company benefit) → no cash
+        $emp = null;
+        if (!empty($d['employee_id'])) {
+            $emp = $this->employees($caid, (int) $d['employee_id'])->first();
+            abort_if(!$emp, 422, 'Employee not found for this client.');
+            $d['customer_id'] = null;
+        }
 
         $shift = DB::table('t_pos_shift')->where('added_by', $by)->where('id', $d['shift_id'])->where('status', 'OPEN')->first();
         abort_if(!$shift, 422, 'Open a shift first.');
         $set = $this->settings($by, $caid);
-        abort_if(!$set['ar_account'] || !$set['cash_account'], 422, 'Set the A/R and Cash accounts in POS Settings first.');
-        foreach ($d['payments'] as $p) {
-            abort_if(!$set[$p['method'] . '_account'], 422, 'Set the ' . self::METHODS[$p['method']] . ' account in POS Settings first.');
-        }
-
-        $today = now()->toDateString();
-        $month = now()->format('Y-m');
-        abort_if($caid && DeclaredMonthSettings::where('ca_id', $caid)->where('declared_month', $month)->exists(), 422, 'Declared Month is disabled');
 
         // items (Stock Items of this client)
         $sales = $this->firstCol('m_items', ['gl_sales_account', 'gl_sales_acount']);
@@ -409,7 +456,10 @@ class PosController extends SalesController
                 'non_vat' => $non, 'zero_rated' => $zero, 'account_code' => $it->sales_acct ?? null,
             ];
             $receipt[] = ['item_id' => (int) $it->id, 'code' => $it->item_code, 'name' => $it->description, 'qty' => $q,
-                'price' => round($price, 2), 'discount' => round($ds, 2), 'amount' => round($amount, 2), 'vat_type' => $type];
+                'price' => round($price, 2), 'discount' => round($ds, 2), 'amount' => round($amount, 2), 'vat_type' => $type,
+                // for posting to Sales later
+                'unit_type_id' => $it->unit_type_id ?? null, 'account_code' => $it->sales_acct ?? null, 'gross' => $g,
+                'input_vat' => $v, 'net_of_vat' => $n, 'vat_exempt' => $ex, 'non_vat' => $non, 'zero_rated' => $zero];
         }
         $net = round($net, 2);
 
@@ -424,10 +474,12 @@ class PosController extends SalesController
         }
 
         // ---------- payments: non-cash first, cash covers the rest, change from cash only ----------
+        if ($emp) $d['payments'] = [['method' => $d['employee_type'], 'amount' => $net, 'reference' => '']];
         $pays = collect($d['payments'])->map(fn ($p) => ['method' => $p['method'], 'tendered' => round((float) $p['amount'], 2), 'reference' => trim((string) ($p['reference'] ?? ''))]);
         $tendered = round($pays->sum('tendered'), 2);
         abort_if($tendered + 0.001 < $net, 422, 'Payment is short by ' . number_format($net - $tendered, 2) . '.');
         $nonCash = round($pays->where('method', '!=', 'cash')->sum('tendered'), 2);
+        abort_if(!$emp && $pays->whereIn('method', array_keys(self::EMP_TYPES))->count(), 422, 'Charge / Allowance is for employees only.');
         abort_if($nonCash - $net > 0.001, 422, 'GCash / Card is more than the total. Only cash can have change.');
         $change = round($tendered - $net, 2);
         $left = $net;
@@ -439,64 +491,23 @@ class PosController extends SalesController
         }
 
         [$uid, $cashierName] = $this->cashier($request);
-        $paidId = $this->statusIdOf('PAID');
 
-        return DB::transaction(function () use ($by, $caid, $d, $set, $rows, $receipt, $gross, $disc, $net, $vat, $applied, $tendered, $change, $shift, $uid, $cashierName, $paidId, $today, $month) {
+        return DB::transaction(function () use ($by, $d, $emp, $receipt, $gross, $disc, $net, $vat, $applied, $tendered, $change, $shift, $uid, $cashierName) {
             $receiptNo = $this->nextNo('t_pos_sale', 'receipt_no', 'POS');
-            $account = $caid ? ClientAccount::find($caid) : null;
+            $paysOut = array_map(fn ($p) => ['method' => $p['method'], 'label' => self::ALL_METHODS[$p['method']], 'amount' => $p['amount'],
+                'tendered' => $p['tendered'], 'reference' => $p['reference']], $applied);
 
-            // ---------- Sales Invoice (PAID, debit A/R) ----------
-            do { $invoiceNo = 'INV-' . date('ymd-his') . random_int(10000, 99999); } while (SalesInvoiceMaster::where('invoice_no', $invoiceNo)->exists());
-            $inv = new SalesInvoiceMaster();
-            $inv->invoice_no = $invoiceNo;
-            $inv->seq_no = (int) SalesInvoiceMaster::where('added_by', $by)->lockForUpdate()->max('seq_no') + 1;
-            $inv->assigned_daid = ($account->assigned_daid ?? 0) ?: null;
-            $inv->assigned_auid = ($account->assigned_auid ?? 0) ?: null;
-            $inv->forceFill([
-                'customer_id' => $d['customer_id'] ?? null, 'added_by' => $by,
-                'transaction_date' => $today, 'declared_month' => $month,
-                'account_code' => $set['ar_account'], 'document_no' => $receiptNo,
-                'currency' => 'PHP', 'ex_rate' => 1,
-                'sub_total' => $this->r4($gross), 'total' => $this->r4($net), 'grand_total' => $this->r4($net),
-                'discount_amount' => $this->r4($disc), '2307_vt' => 0, '2307_it' => 0,
-                'remarks' => "POS {$receiptNo}", 'invoice_status_id' => $paidId, 'trans_type' => 'posted',
-            ])->save();
-            $inv->details()->createMany(array_map(fn ($l) => $l + [
-                'currency' => 'PHP', 'ex_rate' => 1, 'added_by' => $by, 'declared_month' => $month,
-                'invoice_status_id' => $paidId, 'transaction_date' => $today, 'document_no' => $receiptNo,
-                'customer_id' => $inv->customer_id, 'assigned_daid' => $inv->assigned_daid, 'assigned_auid' => $inv->assigned_auid,
-                'trans_type' => 'posted',
-            ], $rows));
-
-            // ---------- Collection per payment (Dr Cash / GCash / Card · Cr A/R) ----------
-            $paysOut = [];
-            foreach ($applied as $p) {
-                $rvNo = $this->nextNo('t_rvoucher_master', 'rvoucher_no', 'POS-RV');
-                $bank = $set[$p['method'] . '_account'];
-                DB::table('t_rvoucher_master')->insert($this->onlyCols('t_rvoucher_master', [
-                    'rvoucher_no' => $rvNo, 'rv_date' => $today, 'declared_month' => $month, 'customer_id' => $inv->customer_id,
-                    'invoice_no' => $invoiceNo, 'document_no' => $p['reference'] ?: $receiptNo,
-                    'sub_total' => $p['amount'], 'total' => $p['amount'], 'bank' => $bank,
-                    '2307_it' => 0, '2307_vt' => 0, 'added_by' => $by,
-                    'remarks' => 'POS ' . self::METHODS[$p['method']] . ($p['reference'] ? " Ref {$p['reference']}" : ''),
-                    'created_at' => now(), 'updated_at' => now(),
-                ]));
-                DB::table('t_rvoucher_detail')->insert($this->onlyCols('t_rvoucher_detail', [
-                    'rvoucher_no' => $rvNo, 'invoice_no' => $invoiceNo, 'account_code' => $set['ar_account'],
-                    'sub_total' => $p['amount'], '2307_it' => 0, '2307_vt' => 0, 'added_by' => $by,
-                    'rv_date' => $today, 'declared_month' => $month, 'created_at' => now(), 'updated_at' => now(),
-                ]));
-                $paysOut[] = ['method' => $p['method'], 'label' => self::METHODS[$p['method']], 'amount' => $p['amount'],
-                    'tendered' => $p['tendered'], 'reference' => $p['reference'], 'rvoucher_no' => $rvNo];
-            }
-
-            // ---------- POS receipt ----------
+            // ---------- POS sale only (PENDING: not in Sales / Collection yet) ----------
             $id = DB::table('t_pos_sale')->insertGetId([
-                'added_by' => $by, 'shift_id' => $shift->id, 'receipt_no' => $receiptNo, 'invoice_no' => $invoiceNo,
-                'customer_id' => $d['customer_id'] ?? null, 'items' => (int) round(array_sum(array_column($receipt, 'qty'))),
+                'added_by' => $by, 'shift_id' => $shift->id, 'receipt_no' => $receiptNo, 'invoice_no' => null,
+                'customer_id' => $d['customer_id'] ?? null,
+                'employee_id' => $emp['id'] ?? null, 'employee_name' => $emp['name'] ?? null,
+                'sale_type' => $emp ? strtoupper($d['employee_type']) : 'REGULAR',
+                'items' => (int) round(array_sum(array_column($receipt, 'qty'))),
                 'sub_total' => round($gross, 2), 'discount' => round($disc, 2), 'total' => $net, 'vat' => round($vat, 2),
                 'tendered' => $tendered, 'change_due' => $change, 'payments' => json_encode($paysOut), 'lines' => json_encode($receipt),
-                'status' => 'PAID', 'cashier_id' => $uid, 'cashier_name' => $cashierName, 'created_at' => now(), 'updated_at' => now(),
+                'status' => 'PAID', 'post_status' => 'PENDING',
+                'cashier_id' => $uid, 'cashier_name' => $cashierName, 'created_at' => now(), 'updated_at' => now(),
             ]);
             return response()->json(['sale' => $this->saleOut(DB::table('t_pos_sale')->find($id)), 'message' => 'Paid.']);
         });
@@ -510,12 +521,15 @@ class PosController extends SalesController
         $cust = $s->customer_id ? DB::table('m_vendor_customer')->where('id', $s->customer_id)->first(['name', 'tin', 'address']) : null;
         return [
             'id' => (int) $s->id, 'receipt_no' => $s->receipt_no, 'invoice_no' => $s->invoice_no, 'shift_id' => $s->shift_id ? (int) $s->shift_id : null,
-            'customer' => $cust->name ?? 'Walk-in', 'customer_tin' => $cust->tin ?? null, 'customer_address' => $cust->address ?? null,
+            'customer' => !empty($s->employee_id) ? ($s->employee_name ?: 'Employee') : ($cust->name ?? 'Walk-in'),
+            'customer_tin' => $cust->tin ?? null, 'customer_address' => $cust->address ?? null,
+            'employee_id' => !empty($s->employee_id) ? (int) $s->employee_id : null,
+            'sale_type' => $s->sale_type ?? 'REGULAR',      // REGULAR · CHARGE · ALLOWANCE
             'items' => (int) $s->items, 'sub_total' => round((float) $s->sub_total, 2), 'discount' => round((float) $s->discount, 2),
             'total' => round((float) $s->total, 2), 'vat' => round((float) $s->vat, 2),
             'tendered' => round((float) $s->tendered, 2), 'change' => round((float) $s->change_due, 2),
             'payments' => json_decode($s->payments, true) ?: [], 'lines' => json_decode($s->lines, true) ?: [],
-            'status' => $s->status, 'void_reason' => $s->void_reason, 'cashier' => $s->cashier_name, 'date' => (string) $s->created_at,
+            'status' => $s->status, 'post_status' => $s->post_status ?? null, 'void_reason' => $s->void_reason, 'cashier' => $s->cashier_name, 'date' => (string) $s->created_at,
         ];
     }
 
@@ -539,7 +553,7 @@ class PosController extends SalesController
         return response()->json($this->saleOut($s));
     }
 
-    /* POST /api/pos/sales/{id}/void  { reason }   invoice → VOID (collections removed by the DB trigger), stock returns */
+    /* POST /api/pos/sales/{id}/void  { reason }   pending sale → VOID (stock returns); a posted one also voids its invoice */
     public function voidSale(Request $request, int $id)
     {
         $by = $this->by($request);
@@ -548,7 +562,7 @@ class PosController extends SalesController
         abort_if(!$s, 404, 'Sale not found.');
         abort_if($s->status === 'VOID', 422, 'Already void.');
         $caid = $this->caidFor($request);
-        $inv = SalesInvoiceMaster::where('added_by', $by)->where('invoice_no', $s->invoice_no)->first();
+        $inv = $s->invoice_no ? SalesInvoiceMaster::where('added_by', $by)->where('invoice_no', $s->invoice_no)->first() : null;   // pending → no invoice yet
         abort_if($inv && $caid && DeclaredMonthSettings::where('ca_id', $caid)->where('declared_month', $inv->declared_month)->exists(), 422, 'Declared Month is disabled');
         $voidId = $this->statusIdOf('VOID') ?: self::VOID;
 
