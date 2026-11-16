@@ -1157,7 +1157,7 @@ class ReportController extends SalesController
             'filter_type'  => ['required', 'in:DR,DM,DE'],
             'from'         => ['required', 'string', 'max:10'],
             'to'           => ['nullable', 'string', 'max:10'],
-            'account_code' => ['nullable', 'string', 'max:20'],
+            'account_code' => ['nullable', 'string', 'max:5000'],   // one code or many: 1101,1102,5101
             'branch'       => ['nullable', 'string', 'max:20'],
         ]);
 
@@ -1168,10 +1168,11 @@ class ReportController extends SalesController
         $rows = $this->ledgerEntries($ids, $d['filter_type'], $d['from'], $d['to'] ?? $d['from'], ['closing' => true]);
         $beginning = $this->glBeginning($ids, $d['filter_type'], $d['from']);
 
-        if (!empty($d['account_code']) && $d['account_code'] !== '0') {
-            $code = (string) $d['account_code'];
-            $rows = array_values(array_filter($rows, fn ($r) => $r['account_code'] === $code));
-            $beginning = array_intersect_key($beginning, [$code => true]);
+        $codes = $this->accountCodesParam($d['account_code'] ?? '');
+        if ($codes) {
+            $keep = array_fill_keys($codes, true);
+            $rows = array_values(array_filter($rows, fn ($r) => isset($keep[(string) $r['account_code']])));
+            $beginning = array_intersect_key($beginning, $keep);
         }
         // running balance per account: beginning + debit − credit, line by line (rows are sorted by account, date)
         $run = [];
@@ -1259,10 +1260,15 @@ class ReportController extends SalesController
         }
         return $out;
     }
+    private function accountCodesParam($value): array
+    {
+        $codes = array_map('trim', explode(',', (string) $value));
+        return array_values(array_unique(array_filter($codes, fn ($c) => $c !== '' && $c !== '0')));
+    }
     public function summaryLedger(Request $request){
         $d = $request->validate([
             'year'         => ['required', 'digits:4'],
-            'account_code' => ['nullable', 'string', 'max:20'],
+            'account_code' => ['nullable', 'string', 'max:5000'],   // one code or many: 1101,1102,5101
             'branch'       => ['nullable', 'string', 'max:20'],
         ]);
         $year = $d['year'];
@@ -1273,8 +1279,10 @@ class ReportController extends SalesController
         // old: DeclaredMonth LIKE 'YYYY-%'  (no collections in the old summary)
         $rows = $this->ledgerEntries($ids, 'DM', "{$year}-01", "{$year}-12", ['collections' => false]);
 
-        if (!empty($d['account_code']) && $d['account_code'] !== '0') {
-            $rows = array_values(array_filter($rows, fn ($r) => $r['account_code'] === (string) $d['account_code']));
+        $codes = $this->accountCodesParam($d['account_code'] ?? '');
+        if ($codes) {
+            $keep = array_fill_keys($codes, true);
+            $rows = array_values(array_filter($rows, fn ($r) => isset($keep[(string) $r['account_code']])));
         }
 
         // one line per account: Debit - Credit per month
