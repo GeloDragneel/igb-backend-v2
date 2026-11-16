@@ -46,6 +46,7 @@ use App\Http\Controllers\Api\InventoryReportController;
 use App\Http\Controllers\Api\SendRequestController;
 use App\Http\Controllers\Api\ClientLetterController;
 use App\Http\Controllers\Api\PosController;
+use App\Http\Controllers\Api\EmployeePerformanceController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -845,6 +846,10 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('sales/{id}', [PosController::class, 'sale'])->whereNumber('id');
         Route::post('sales/{id}/void', [PosController::class, 'voidSale'])->whereNumber('id');
     });
+
+    Route::get('/monitoring/performance/lookups', [EmployeePerformanceController::class, 'lookups']);
+    Route::get('/monitoring/performance', [EmployeePerformanceController::class, 'index']);
+    Route::get('/monitoring/performance/{id}', [EmployeePerformanceController::class, 'show'])->whereNumber('id');
 
     require __DIR__ . '/api_messenger.php';
 });
