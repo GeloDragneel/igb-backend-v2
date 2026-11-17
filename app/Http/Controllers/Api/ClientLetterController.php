@@ -19,8 +19,17 @@ use Illuminate\Support\Facades\Schema;
  * GET /api/clients/{num}/letter/{kind}?account_id=&date=YYYY-MM-DD&letter_date=YYYY-MM-DD&balance=7500
  *   account_id   business account (trade name / address) – default: the client's first account
  *   date         effective date – default: the client's Date of engagement / disengagement
- *   letter_date  date on top – default: today
+ *   letter_date  date on top – default: today (engagement: the Date of engagement)
  *   balance      disengagement only – outstanding balance (₱); not sent → unpaid PF + EO from Billing
+ *
+ * Engagement = Audit engagement letter, template by Business Ownership type:
+ *   sole → AUDIT-SOLE-PROPRIETORSHIP · stock → AUDIT-STOCK-CORPORATION · nonstock → AUDIT-NONSTOCK-CORPORATION · coop → AUDIT-COOPERATIVE
+ *   extra (all optional – left as a blank line to fill by hand when empty):
+ *   type         sole|stock|nonstock|coop   (default: from the client's Business Ownership)
+ *   attention    Attention: … (default: the owner's name)
+ *   year_end     financial statements for the year ended … (YYYY-MM-DD)
+ *   framework    applicable financial reporting framework
+ *   fee          audit fee (₱) · vat: exclusive|inclusive|nonvat · terms: billing terms · target_date: target completion
  *
  * GET /api/clients/{num}/outstanding?account_id=   unpaid PF & Other Charges + Non-recurring / EO (Billing)
  *   Route::get('/clients/{num}/outstanding', [ClientLetterController::class, 'outstanding']);
@@ -38,6 +47,15 @@ class ClientLetterController extends Controller
         'engagement' => 'ENGAGEMENT-LETTER.docx',
         'disengagement' => 'DISENGAGEMENT-LETTER.docx',
     ];
+
+    // Date of engagement → audit engagement letter per business ownership type
+    const AUDIT_TEMPLATES = [
+        'sole' => 'AUDIT-SOLE-PROPRIETORSHIP.docx',
+        'stock' => 'AUDIT-STOCK-CORPORATION.docx',
+        'nonstock' => 'AUDIT-NONSTOCK-CORPORATION.docx',
+        'coop' => 'AUDIT-COOPERATIVE.docx',
+    ];
+    const BLANK = '____________________';
 
     public function letter(Request $request, string $num, string $kind)
     {
@@ -57,6 +75,8 @@ class ClientLetterController extends Controller
 
     private function makeLetter(Request $request, string $num, string $kind)
     {
+        if ($kind === 'engagement') return $this->auditLetter($request, $num);
+
         $d = $request->validate([
             'account_id' => ['nullable', 'integer'],
             'date' => ['nullable', 'date'],
@@ -100,6 +120,84 @@ class ClientLetterController extends Controller
             'Content-Disposition' => 'inline; filename="' . $file . '"',
             'Cache-Control' => 'no-store',
         ]);
+    }
+
+    /** Date of engagement → Audit engagement letter (template by business ownership type) */
+    private function auditLetter(Request $request, string $num)
+    {
+        $d = $request->validate([
+            'account_id' => ['nullable', 'integer'],
+            'type' => ['nullable', 'in:sole,stock,nonstock,coop'],
+            'date' => ['nullable', 'date'],
+            'letter_date' => ['nullable', 'date'],
+            'attention' => ['nullable', 'string', 'max:150'],
+            'year_end' => ['nullable', 'date'],
+            'framework' => ['nullable', 'string', 'max:200'],
+            'fee' => ['nullable', 'numeric', 'min:0', 'max:999999999'],
+            'vat' => ['nullable', 'in:exclusive,inclusive,nonvat'],
+            'terms' => ['nullable', 'string', 'max:255'],
+            'target_date' => ['nullable', 'date'],
+        ]);
+
+        $c = DB::table('m_client')->where('client_num', $num)->first();
+        abort_if(!$c, 404, 'Client not found.');
+        $acc = DB::table('m_client_account')->where('client_num', $num)
+            ->when(!empty($d['account_id']), fn ($q) => $q->where('id', $d['account_id']))
+            ->orderBy('branch_code')->orderBy('id')->first();
+
+        $type = $d['type'] ?? $this->ownershipType($c);
+        $tplName = self::AUDIT_TEMPLATES[$type];
+        $template = resource_path('templates/' . $tplName);
+        abort_unless(is_file($template), 500, 'Missing template: resources/templates/' . $tplName);
+
+        // letter date: picked → Date of engagement → today
+        $letterDate = $d['letter_date'] ?? ($d['date'] ?? ($c->date_of_engagement ?? null)) ?? now()->toDateString();
+        $long = fn ($v) => $v ? date('F j, Y', strtotime($v)) : self::BLANK;
+        $text = fn ($v) => trim((string) ($v ?? '')) !== '' ? trim((string) $v) : self::BLANK;
+
+        $trade = trim((string) ($acc->trade_name ?? '')) ?: $this->owner($c);
+        $values = [
+            '{LETTER_DATE}' => $long($letterDate),
+            '{CLIENT_NAME}' => mb_strtoupper($trade),
+            '{ADDRESS}' => $this->address($acc, $c) ?: self::BLANK,
+            '{ATTENTION}' => $text($d['attention'] ?? $this->owner($c)),
+            '{REPORTING_DATE}' => $long($d['year_end'] ?? null),
+            '{FRAMEWORK}' => $text($d['framework'] ?? null),
+            '{AMOUNT}' => isset($d['fee']) ? number_format((float) $d['fee'], 2) : self::BLANK,
+            '{VAT_TERM}' => ['exclusive' => '(VAT-exclusive)', 'inclusive' => '(VAT-inclusive)', 'nonvat' => '(non-VAT)'][$d['vat'] ?? 'exclusive'],
+            '{TERMS}' => $text($d['terms'] ?? null),
+            '{TARGET_DATE}' => $long($d['target_date'] ?? null),
+        ];
+
+        $docx = $this->fill($template, $values);
+        $pdf = $this->toPdf($docx);
+        $bytes = file_get_contents($pdf);
+        @unlink($pdf);
+
+        $file = 'AUDIT-ENGAGEMENT-LETTER-' . preg_replace('/[^A-Za-z0-9_-]+/', '_', $trade) . '.pdf';
+        return response($bytes, 200, [
+            'Content-Type' => 'application/pdf',
+            'Content-Disposition' => 'inline; filename="' . $file . '"',
+            'Cache-Control' => 'no-store',
+            'X-Letter-Type' => $type,
+            'Access-Control-Expose-Headers' => 'X-Letter-Type',
+        ]);
+    }
+
+    /** business ownership type (+ detail) name → sole · stock · nonstock · coop */
+    private function ownershipType(object $c): string
+    {
+        $names = [];
+        foreach ([['m_business_ownership_type', $c->business_ownership_type_id ?? null], ['m_business_ownership_type_detail', $c->business_ownership_type_detail_id ?? null]] as [$t, $id]) {
+            if (!$id || !Schema::hasTable($t)) continue;
+            $row = (array) DB::table($t)->where('id', $id)->first();
+            foreach (['name', 'description', 'type'] as $k) if (!empty($row[$k])) $names[] = $row[$k];
+        }
+        $s = strtolower(implode(' ', $names));
+        if (str_contains($s, 'coop')) return 'coop';
+        if (preg_match('/non[\s-]?stock|foundation|association|non[\s-]?profit/', $s)) return 'nonstock';
+        if (str_contains($s, 'corp') || (int) ($c->business_ownership_type_id ?? 0) === 3) return 'stock';
+        return 'sole';
     }
 
     /* GET /api/clients/{num}/outstanding?account_id=   (no account → every account of the client) */
