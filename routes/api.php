@@ -47,6 +47,7 @@ use App\Http\Controllers\Api\SendRequestController;
 use App\Http\Controllers\Api\ClientLetterController;
 use App\Http\Controllers\Api\PosController;
 use App\Http\Controllers\Api\EmployeePerformanceController;
+use App\Http\Controllers\Api\JobOrderController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -850,6 +851,19 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/monitoring/performance/lookups', [EmployeePerformanceController::class, 'lookups']);
     Route::get('/monitoring/performance', [EmployeePerformanceController::class, 'index']);
     Route::get('/monitoring/performance/{id}', [EmployeePerformanceController::class, 'show'])->whereNumber('id');
+
+    Route::get('/job-orders/lookups', [JobOrderController::class, 'lookups']);
+    Route::get('/job-orders', [JobOrderController::class, 'index']);
+    Route::get('/job-orders/{id}', [JobOrderController::class, 'show'])->whereNumber('id');
+    Route::post('/job-orders', [JobOrderController::class, 'store']);
+    Route::put('/job-orders/{id}', [JobOrderController::class, 'update'])->whereNumber('id');
+    Route::post('/job-orders/{id}/status', [JobOrderController::class, 'status'])->whereNumber('id');
+    Route::post('/job-orders/{id}/activities/{aid}/toggle', [JobOrderController::class, 'toggle'])->whereNumber('id')->whereNumber('aid');
+    Route::delete('/job-orders/{id}', [JobOrderController::class, 'destroy'])->whereNumber('id');
+    Route::get('/jo-activities', [JobOrderController::class, 'activities']);
+    Route::post('/jo-activities', [JobOrderController::class, 'saveActivity']);
+    Route::put('/jo-activities/{id}', [JobOrderController::class, 'saveActivity'])->whereNumber('id');
+    Route::delete('/jo-activities/{id}', [JobOrderController::class, 'deleteActivity'])->whereNumber('id');
 
     require __DIR__ . '/api_messenger.php';
 });
