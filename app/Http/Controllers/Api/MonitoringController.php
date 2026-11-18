@@ -931,7 +931,6 @@ class MonitoringController extends Controller
             'auditor_id' => ['nullable', 'integer'],
             'audit_status' => ['nullable', 'in:pending,audited,reverted'],
         ]);
-        $ast = $this->auditStatusSql($d['audit_status'] ?? null);
         $auditor = $this->auditorFilter($request, $d['auditor_id'] ?? 0);
 
         $start = new DateTime($d['month'] . '-01');
@@ -959,30 +958,60 @@ class MonitoringController extends Controller
         $aud = $auditor !== null ? 'AND A.auditor_id = ?' : '';
         $name = $this->employeeName('B');
         $name2 = $this->employeeName('C');
-        $part = fn (string $table) => "
+        $range = [$start->format('Y-m-d 00:00:00'), $end->format('Y-m-d 23:59:59')];
+        $ast = $d['audit_status'] ?? '';
+
+        // Audited / Reverted = audits done (t_audit_history, by the day of the audit)
+        $histSt = $ast === 'audited' ? '2' : ($ast === 'reverted' ? '3' : '2, 3');
+        $hist = fn (string $table) => "
             SELECT D.added_by AS uid, DATE(A.created_at) AS day, COUNT(A.id) AS cnt,
                    GROUP_CONCAT(DISTINCT {$name}) AS da, GROUP_CONCAT(DISTINCT {$name2}) AS au
             FROM t_audit_history A
             INNER JOIN {$table} D ON D.invoice_no = A.reference_no
             LEFT JOIN m_employee B ON B.id = D.assigned_daid
             LEFT JOIN m_employee C ON C.id = D.assigned_auid
-            WHERE D.added_by IN ({$in}) AND A.created_at BETWEEN ? AND ? {$aud}{$ast}
+            WHERE D.added_by IN ({$in}) AND A.created_at BETWEEN ? AND ? {$aud} AND COALESCE(A.audit_status_id, 0) IN ({$histSt})
             GROUP BY D.added_by, DATE(A.created_at)";
-        $b = [...$userIds, $start->format('Y-m-d 00:00:00'), $end->format('Y-m-d 23:59:59'), ...($auditor !== null ? [$auditor] : [])];
-        $rows = DB::select($part('t_sales_invoice_master') . ' UNION ALL ' . $part('t_purchase_expense_master'), [...$b, ...$b]);
+        $hb = [...$userIds, ...$range, ...($auditor !== null ? [$auditor] : [])];
 
-        // counts for the Audit status tabs (same month / clients / auditor, every status)
-        $cnt = fn (string $table) => "
+        // Pending = invoices not audited yet (audit status 0 / 1, not VOID) – they have no audit history, so by the day they were entered
+        $paud = $auditor !== null ? 'AND D.assigned_auid = ?' : '';
+        $pend = fn (string $table) => "
+            SELECT D.added_by AS uid, DATE(D.created_at) AS day, COUNT(D.id) AS cnt,
+                   GROUP_CONCAT(DISTINCT {$name}) AS da, GROUP_CONCAT(DISTINCT {$name2}) AS au
+            FROM {$table} D
+            LEFT JOIN m_employee B ON B.id = D.assigned_daid
+            LEFT JOIN m_employee C ON C.id = D.assigned_auid
+            WHERE D.added_by IN ({$in}) AND D.created_at BETWEEN ? AND ? {$paud}
+              AND COALESCE(D.audit_status_id, 0) IN (0, 1) AND COALESCE(D.invoice_status_id, 0) <> " . self::VOID . "
+            GROUP BY D.added_by, DATE(D.created_at)";
+        $pb = $hb;
+
+        $sql = [];
+        $bind = [];
+        if ($ast !== 'pending') { array_push($sql, $hist('t_sales_invoice_master'), $hist('t_purchase_expense_master')); array_push($bind, ...$hb, ...$hb); }
+        if ($ast === '' || $ast === 'pending') { array_push($sql, $pend('t_sales_invoice_master'), $pend('t_purchase_expense_master')); array_push($bind, ...$pb, ...$pb); }
+        $rows = DB::select(implode(' UNION ALL ', $sql), $bind);
+
+        // counts for the Audit status tabs (same month / clients / auditor)
+        $counts = $zero;
+        $hc = fn (string $table) => "
             SELECT COALESCE(A.audit_status_id, 0) AS st, COUNT(A.id) AS cnt
             FROM t_audit_history A
             INNER JOIN {$table} D ON D.invoice_no = A.reference_no
-            WHERE D.added_by IN ({$in}) AND A.created_at BETWEEN ? AND ? {$aud}
+            WHERE D.added_by IN ({$in}) AND A.created_at BETWEEN ? AND ? {$aud} AND COALESCE(A.audit_status_id, 0) IN (2, 3)
             GROUP BY COALESCE(A.audit_status_id, 0)";
-        $counts = $zero;
-        foreach (DB::select($cnt('t_sales_invoice_master') . ' UNION ALL ' . $cnt('t_purchase_expense_master'), [...$b, ...$b]) as $r) {
-            $counts['all'] += (int) $r->cnt;
-            foreach (self::AUDIT_FILTER as $k => $ids) if (in_array((int) $r->st, $ids, true)) $counts[$k] += (int) $r->cnt;
+        foreach (DB::select($hc('t_sales_invoice_master') . ' UNION ALL ' . $hc('t_purchase_expense_master'), [...$hb, ...$hb]) as $r) {
+            $counts[(int) $r->st === 3 ? 'reverted' : 'audited'] += (int) $r->cnt;
         }
+        $pc = fn (string $table) => "
+            SELECT COUNT(D.id) AS cnt FROM {$table} D
+            WHERE D.added_by IN ({$in}) AND D.created_at BETWEEN ? AND ? {$paud}
+              AND COALESCE(D.audit_status_id, 0) IN (0, 1) AND COALESCE(D.invoice_status_id, 0) <> " . self::VOID;
+        foreach (DB::select($pc('t_sales_invoice_master') . ' UNION ALL ' . $pc('t_purchase_expense_master'), [...$pb, ...$pb]) as $r) {
+            $counts['pending'] += (int) $r->cnt;
+        }
+        $counts['all'] = $counts['pending'] + $counts['audited'] + $counts['reverted'];
 
         $byUser = [];   // uid → { days: {date: n}, da: [], au: [] }
         foreach ($rows as $r) {
@@ -1024,7 +1053,6 @@ class MonitoringController extends Controller
             'auditor_id' => ['nullable', 'integer'],
             'audit_status' => ['nullable', 'in:pending,audited,reverted'],
         ]);
-        $ast = $this->auditStatusSql($d['audit_status'] ?? null);
         $auditor = $this->auditorFilter($request, $d['auditor_id'] ?? 0);
 
         // trade names of the client → their login ids
@@ -1040,19 +1068,42 @@ class MonitoringController extends Controller
         $in = implode(',', array_fill(0, count($userIds), '?'));
         $aud = $auditor !== null ? 'AND A.auditor_id = ?' : '';
         $b = [...$userIds, $d['date'], ...($auditor !== null ? [$auditor] : [])];
+        $st = $d['audit_status'] ?? '';
 
-        $rows = DB::select("
-            SELECT B.added_by AS uid, LOWER(TRIM(B.trans_type)) AS type, A.audit_status_id AS st, COUNT(A.id) AS cnt
-            FROM t_audit_history A
-            INNER JOIN t_purchase_expense_master B ON B.invoice_no = A.reference_no
-            WHERE B.added_by IN ({$in}) AND DATE(A.created_at) = ? {$aud}{$ast}
-            GROUP BY B.added_by, LOWER(TRIM(B.trans_type)), A.audit_status_id
-            UNION ALL
-            SELECT B.added_by AS uid, 'sales' AS type, A.audit_status_id AS st, COUNT(A.id) AS cnt
-            FROM t_audit_history A
-            INNER JOIN t_sales_invoice_master B ON B.invoice_no = A.reference_no
-            WHERE B.added_by IN ({$in}) AND DATE(A.created_at) = ? {$aud}{$ast}
-            GROUP BY B.added_by, A.audit_status_id", [...$b, ...$b]);
+        // Audited / Reverted: audits done that day (t_audit_history)
+        $histSt = $st === 'audited' ? '2' : ($st === 'reverted' ? '3' : '2, 3');
+        $sql = [];
+        $bind = [];
+        if ($st !== 'pending') {
+            $sql[] = "SELECT B.added_by AS uid, LOWER(TRIM(B.trans_type)) AS type, A.audit_status_id AS st, COUNT(A.id) AS cnt
+                FROM t_audit_history A
+                INNER JOIN t_purchase_expense_master B ON B.invoice_no = A.reference_no
+                WHERE B.added_by IN ({$in}) AND DATE(A.created_at) = ? {$aud} AND COALESCE(A.audit_status_id, 0) IN ({$histSt})
+                GROUP BY B.added_by, LOWER(TRIM(B.trans_type)), A.audit_status_id";
+            $sql[] = "SELECT B.added_by AS uid, 'sales' AS type, A.audit_status_id AS st, COUNT(A.id) AS cnt
+                FROM t_audit_history A
+                INNER JOIN t_sales_invoice_master B ON B.invoice_no = A.reference_no
+                WHERE B.added_by IN ({$in}) AND DATE(A.created_at) = ? {$aud} AND COALESCE(A.audit_status_id, 0) IN ({$histSt})
+                GROUP BY B.added_by, A.audit_status_id";
+            array_push($bind, ...$b, ...$b);
+        }
+        // Pending: invoices entered that day, not audited yet (status 0 / 1, not VOID)
+        if ($st === '' || $st === 'pending') {
+            $paud = $auditor !== null ? 'AND B.assigned_auid = ?' : '';
+            $void = self::VOID;
+            $sql[] = "SELECT B.added_by AS uid, LOWER(TRIM(B.trans_type)) AS type, 0 AS st, COUNT(B.id) AS cnt
+                FROM t_purchase_expense_master B
+                WHERE B.added_by IN ({$in}) AND DATE(B.created_at) = ? {$paud}
+                  AND COALESCE(B.audit_status_id, 0) IN (0, 1) AND COALESCE(B.invoice_status_id, 0) <> {$void}
+                GROUP BY B.added_by, LOWER(TRIM(B.trans_type))";
+            $sql[] = "SELECT B.added_by AS uid, 'sales' AS type, 0 AS st, COUNT(B.id) AS cnt
+                FROM t_sales_invoice_master B
+                WHERE B.added_by IN ({$in}) AND DATE(B.created_at) = ? {$paud}
+                  AND COALESCE(B.audit_status_id, 0) IN (0, 1) AND COALESCE(B.invoice_status_id, 0) <> {$void}
+                GROUP BY B.added_by";
+            array_push($bind, ...$b, ...$b);
+        }
+        $rows = DB::select(implode(' UNION ALL ', $sql), $bind);
 
         $raw = [];   // uid → type → status → count
         foreach ($rows as $r) {
