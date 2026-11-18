@@ -850,6 +850,15 @@ class MonitoringController extends Controller
     const AUDIT_LABELS = [0 => 'Pending', 1 => 'Confirmed', 2 => 'Audited', 3 => 'Reverted'];
     const AUDIT_SEE_ALL = [10, 4];   // designations that see every auditor's audits (old page: only 10)
 
+    /** Audit status filter (audit / detail): pending = 0 / 1 · audited = 2 · reverted = 3 */
+    const AUDIT_FILTER = ['pending' => [0, 1], 'audited' => [2], 'reverted' => [3]];
+
+    private function auditStatusSql(?string $v, string $a = 'A'): string
+    {
+        $ids = self::AUDIT_FILTER[$v ?? ''] ?? null;
+        return $ids ? " AND COALESCE({$a}.audit_status_id, 0) IN (" . implode(',', $ids) . ')' : '';
+    }
+
     protected function employeeName(string $a = 'E'): string
     {
         return "TRIM(CONCAT_WS(' ', {$a}.last_name, {$a}.first_name, {$a}.middle_name))";
@@ -920,7 +929,9 @@ class MonitoringController extends Controller
             'month'      => ['required', 'date_format:Y-m'],
             'status_id'  => ['nullable', 'integer'],
             'auditor_id' => ['nullable', 'integer'],
+            'audit_status' => ['nullable', 'in:pending,audited,reverted'],
         ]);
+        $ast = $this->auditStatusSql($d['audit_status'] ?? null);
         $auditor = $this->auditorFilter($request, $d['auditor_id'] ?? 0);
 
         $start = new DateTime($d['month'] . '-01');
@@ -941,7 +952,8 @@ class MonitoringController extends Controller
 
         $clients = $this->auditClients((int) ($d['status_id'] ?? 0) ?: null);
         $userIds = collect($clients)->pluck('user_ids')->flatten()->unique()->values()->all();
-        if (!$userIds) return response()->json(['month' => $d['month'], 'days' => $days, 'rows' => [], 'info' => $info]);
+        $zero = ['all' => 0, 'pending' => 0, 'audited' => 0, 'reverted' => 0];
+        if (!$userIds) return response()->json(['month' => $d['month'], 'days' => $days, 'rows' => [], 'info' => $info, 'audit_counts' => $zero]);
 
         $in = implode(',', array_fill(0, count($userIds), '?'));
         $aud = $auditor !== null ? 'AND A.auditor_id = ?' : '';
@@ -954,10 +966,23 @@ class MonitoringController extends Controller
             INNER JOIN {$table} D ON D.invoice_no = A.reference_no
             LEFT JOIN m_employee B ON B.id = D.assigned_daid
             LEFT JOIN m_employee C ON C.id = D.assigned_auid
-            WHERE D.added_by IN ({$in}) AND A.created_at BETWEEN ? AND ? {$aud}
+            WHERE D.added_by IN ({$in}) AND A.created_at BETWEEN ? AND ? {$aud}{$ast}
             GROUP BY D.added_by, DATE(A.created_at)";
         $b = [...$userIds, $start->format('Y-m-d 00:00:00'), $end->format('Y-m-d 23:59:59'), ...($auditor !== null ? [$auditor] : [])];
         $rows = DB::select($part('t_sales_invoice_master') . ' UNION ALL ' . $part('t_purchase_expense_master'), [...$b, ...$b]);
+
+        // counts for the Audit status tabs (same month / clients / auditor, every status)
+        $cnt = fn (string $table) => "
+            SELECT COALESCE(A.audit_status_id, 0) AS st, COUNT(A.id) AS cnt
+            FROM t_audit_history A
+            INNER JOIN {$table} D ON D.invoice_no = A.reference_no
+            WHERE D.added_by IN ({$in}) AND A.created_at BETWEEN ? AND ? {$aud}
+            GROUP BY COALESCE(A.audit_status_id, 0)";
+        $counts = $zero;
+        foreach (DB::select($cnt('t_sales_invoice_master') . ' UNION ALL ' . $cnt('t_purchase_expense_master'), [...$b, ...$b]) as $r) {
+            $counts['all'] += (int) $r->cnt;
+            foreach (self::AUDIT_FILTER as $k => $ids) if (in_array((int) $r->st, $ids, true)) $counts[$k] += (int) $r->cnt;
+        }
 
         $byUser = [];   // uid → { days: {date: n}, da: [], au: [] }
         foreach ($rows as $r) {
@@ -987,7 +1012,7 @@ class MonitoringController extends Controller
             ];
         }
 
-        return response()->json(['month' => $d['month'], 'days' => $days, 'rows' => $out, 'info' => $info]);
+        return response()->json(['month' => $d['month'], 'days' => $days, 'rows' => $out, 'info' => $info, 'audit_counts' => $counts]);
     }
 
     /* GET /monitoring/audit/detail?date=YYYY-MM-DD&client_num=&auditor_id=   (old doGetScanMonitoring_Detail) */
@@ -997,7 +1022,9 @@ class MonitoringController extends Controller
             'date'       => ['required', 'date_format:Y-m-d'],
             'client_num' => ['required', 'string'],
             'auditor_id' => ['nullable', 'integer'],
+            'audit_status' => ['nullable', 'in:pending,audited,reverted'],
         ]);
+        $ast = $this->auditStatusSql($d['audit_status'] ?? null);
         $auditor = $this->auditorFilter($request, $d['auditor_id'] ?? 0);
 
         // trade names of the client → their login ids
@@ -1018,13 +1045,13 @@ class MonitoringController extends Controller
             SELECT B.added_by AS uid, LOWER(TRIM(B.trans_type)) AS type, A.audit_status_id AS st, COUNT(A.id) AS cnt
             FROM t_audit_history A
             INNER JOIN t_purchase_expense_master B ON B.invoice_no = A.reference_no
-            WHERE B.added_by IN ({$in}) AND DATE(A.created_at) = ? {$aud}
+            WHERE B.added_by IN ({$in}) AND DATE(A.created_at) = ? {$aud}{$ast}
             GROUP BY B.added_by, LOWER(TRIM(B.trans_type)), A.audit_status_id
             UNION ALL
             SELECT B.added_by AS uid, 'sales' AS type, A.audit_status_id AS st, COUNT(A.id) AS cnt
             FROM t_audit_history A
             INNER JOIN t_sales_invoice_master B ON B.invoice_no = A.reference_no
-            WHERE B.added_by IN ({$in}) AND DATE(A.created_at) = ? {$aud}
+            WHERE B.added_by IN ({$in}) AND DATE(A.created_at) = ? {$aud}{$ast}
             GROUP BY B.added_by, A.audit_status_id", [...$b, ...$b]);
 
         $raw = [];   // uid → type → status → count

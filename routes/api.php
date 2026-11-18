@@ -49,6 +49,7 @@ use App\Http\Controllers\Api\PosController;
 use App\Http\Controllers\Api\EmployeePerformanceController;
 use App\Http\Controllers\Api\JobOrderController;
 use App\Http\Controllers\Api\EmployeeStatusController;
+use App\Http\Controllers\Api\WorkReminderController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -867,6 +868,10 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::delete('/jo-activities/{id}', [JobOrderController::class, 'deleteActivity'])->whereNumber('id');
 
     Route::get('/admin/user-access/employment-status', [EmployeeStatusController::class, 'index']);
+    
+    Route::get('/work-reminder', [WorkReminderController::class, 'index']);
+    Route::post('/work-reminder/confirm', [WorkReminderController::class, 'confirm']);
+
     require __DIR__ . '/api_messenger.php';
 });
 
