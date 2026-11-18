@@ -48,6 +48,7 @@ use App\Http\Controllers\Api\ClientLetterController;
 use App\Http\Controllers\Api\PosController;
 use App\Http\Controllers\Api\EmployeePerformanceController;
 use App\Http\Controllers\Api\JobOrderController;
+use App\Http\Controllers\Api\EmployeeStatusController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -865,6 +866,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::put('/jo-activities/{id}', [JobOrderController::class, 'saveActivity'])->whereNumber('id');
     Route::delete('/jo-activities/{id}', [JobOrderController::class, 'deleteActivity'])->whereNumber('id');
 
+    Route::get('/admin/user-access/employment-status', [EmployeeStatusController::class, 'index']);
     require __DIR__ . '/api_messenger.php';
 });
 
