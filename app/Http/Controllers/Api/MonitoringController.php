@@ -1057,18 +1057,21 @@ class MonitoringController extends Controller
 
         // trade names of the client → their login ids
         $map = [];
+        $who = [];   // login id → { trade, caid } (invoice list)
         foreach (DB::table('m_client_account as B')->join('m_user_client as U', 'U.caid', '=', 'B.id')
                      ->where('B.client_num', $d['client_num'])->orderBy('B.branch_code')
-                     ->get([DB::raw("CONCAT_WS(' : ', B.branch_code, B.trade_name) AS trade"), 'U.id']) as $r) {
+                     ->get([DB::raw("CONCAT_WS(' : ', B.branch_code, B.trade_name) AS trade"), 'U.id', 'B.id as caid']) as $r) {
             $map[$r->trade][] = (int) $r->id;
+            $who[(int) $r->id] = ['trade' => $r->trade, 'caid' => (int) $r->caid];
         }
-        if (!$map) return response()->json(['rows' => []]);
+        if (!$map) return response()->json(['rows' => [], 'invoices' => []]);
 
         $userIds = collect($map)->flatten()->unique()->values()->all();
         $in = implode(',', array_fill(0, count($userIds), '?'));
         $aud = $auditor !== null ? 'AND A.auditor_id = ?' : '';
         $b = [...$userIds, $d['date'], ...($auditor !== null ? [$auditor] : [])];
         $st = $d['audit_status'] ?? '';
+        $ast = $st;   // ($st is reused in the loop below)
 
         // Audited / Reverted: audits done that day (t_audit_history)
         $histSt = $st === 'audited' ? '2' : ($st === 'reverted' ? '3' : '2, 3');
@@ -1126,7 +1129,48 @@ class MonitoringController extends Controller
             }
             $out[] = $row;
         }
-        return response()->json(['rows' => $out]);
+
+        // ---------- the invoices behind the counts (clickable in the popup) ----------
+        $isql = [];
+        $ibind = [];
+        $tables = [['t_sales_invoice_master', "'sales'"], ['t_purchase_expense_master', 'LOWER(TRIM(B.trans_type))']];
+        if ($ast !== 'pending') {
+            foreach ($tables as [$tb, $typ]) {
+                $isql[] = "SELECT B.added_by AS uid, B.invoice_no, B.document_no, B.declared_month, {$typ} AS type,
+                                  COALESCE(A.audit_status_id, 0) AS st, A.created_at AS at
+                    FROM t_audit_history A
+                    INNER JOIN {$tb} B ON B.invoice_no = A.reference_no
+                    WHERE B.added_by IN ({$in}) AND DATE(A.created_at) = ? {$aud} AND COALESCE(A.audit_status_id, 0) IN ({$histSt})";
+                array_push($ibind, ...$b);
+            }
+        }
+        if ($ast === '' || $ast === 'pending') {
+            $paud = $auditor !== null ? 'AND B.assigned_auid = ?' : '';
+            $void = self::VOID;
+            foreach ($tables as [$tb, $typ]) {
+                $isql[] = "SELECT B.added_by AS uid, B.invoice_no, B.document_no, B.declared_month, {$typ} AS type,
+                                  0 AS st, B.created_at AS at
+                    FROM {$tb} B
+                    WHERE B.added_by IN ({$in}) AND DATE(B.created_at) = ? {$paud}
+                      AND COALESCE(B.audit_status_id, 0) IN (0, 1) AND COALESCE(B.invoice_status_id, 0) <> {$void}";
+                array_push($ibind, ...$b);
+            }
+        }
+        $invoices = [];
+        foreach (DB::select(implode(' UNION ALL ', $isql) . ' ORDER BY at DESC', $ibind) as $r) {
+            $w = $who[(int) $r->uid] ?? ['trade' => '', 'caid' => null];
+            $invoices[] = [
+                'invoice_no'     => $r->invoice_no,
+                'document_no'    => $r->document_no,
+                'declared_month' => $r->declared_month,
+                'trade_name'     => $w['trade'],
+                'caid'           => $w['caid'],
+                'type'           => $r->type === 'sales' ? 'sales' : ($r->type === 'expenses' ? 'expenses' : 'purchases'),
+                'status'         => self::AUDIT_LABELS[(int) $r->st] ?? 'Pending',
+            ];
+        }
+
+        return response()->json(['rows' => $out, 'invoices' => $invoices]);
     }
 
     /* =====================================================================
