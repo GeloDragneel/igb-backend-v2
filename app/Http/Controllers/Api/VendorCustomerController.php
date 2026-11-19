@@ -85,8 +85,8 @@ class VendorCustomerController extends SalesController
         return [
             'name'         => $d['name'],
             'tin'          => $d['tin'] ?? null,
-            'branch_code'  => $d['branch_code'],
-            'branch_type'  => (int) $d['branch_type_id'],
+            'branch_code'  => trim((string) ($d['branch_code'] ?? '')),          // customer: may be blank
+            'branch_type'  => (int) ($d['branch_type_id'] ?? 0),
             'tax_type'     => !empty($d['tax_type_id']) ? (int) $d['tax_type_id'] : null,
             'address'      => $d['address'] ?? null,
             'city_country' => $d['city_country'] ?? null,
@@ -164,13 +164,17 @@ class VendorCustomerController extends SalesController
         ]);
     }
 
-    private function contactRules(): array
+    /** Vendor: no special characters in the name, Branch Code + Branch Type required · Customer: both optional */
+    private function contactRules(string $userType): array
     {
+        $vendor = $userType === 'Vendor';
         return [
-            'name'           => ['required', 'string', 'max:150', 'regex:/^[a-zA-Z0-9\s.,\-&\']+$/'],
+            'name'           => $vendor
+                ? ['required', 'string', 'max:150', 'regex:/^[a-zA-Z0-9\s.,\-&\']+$/']
+                : ['required', 'string', 'max:150'],
             'tin'            => ['nullable', 'string', 'max:20'],
-            'branch_code'    => ['required', 'string', 'max:10'],
-            'branch_type_id' => ['required', 'integer', 'min:1'],
+            'branch_code'    => [$vendor ? 'required' : 'nullable', 'string', 'max:10'],
+            'branch_type_id' => $vendor ? ['required', 'integer', 'min:1'] : ['nullable', 'integer', 'min:0'],
             'tax_type_id'    => ['nullable', 'integer'],
             'address'        => ['nullable', 'string', 'max:255'],
             'city_country'   => ['nullable', 'string', 'max:255'],
@@ -185,7 +189,7 @@ class VendorCustomerController extends SalesController
     {
         return [
             'name.required'           => 'Name is required.',
-            'name.regex'              => 'Name contains invalid special characters.',
+            'name.regex'              => "Vendor name has special characters that aren't allowed (only letters, numbers, spaces and . , - & ').",
             'branch_code.required'    => 'Branch Code is required.',
             'branch_type_id.required' => 'Branch Type is required.',
             'branch_type_id.min'      => 'Branch Type is required.',
@@ -198,7 +202,7 @@ class VendorCustomerController extends SalesController
         $addedBy = $this->addedByFor($request);
         if (!$addedBy) return response()->json(['message' => 'No client account selected.'], 422);
 
-        $d = $request->validate($this->contactRules(), $this->contactMessages());
+        $d = $request->validate($this->contactRules($this->userType($type)), $this->contactMessages());
         $socials = $d['socials'] ?? null;
         unset($d['socials']);
 
@@ -224,7 +228,7 @@ class VendorCustomerController extends SalesController
             ->first();
         if (!$c) return response()->json(['message' => 'Record not found.'], 404);
 
-        $d = $request->validate($this->contactRules(), $this->contactMessages());
+        $d = $request->validate($this->contactRules($this->userType($type)), $this->contactMessages());
         $socials = array_key_exists('socials', $d) ? ($d['socials'] ?? []) : null;
         unset($d['socials']);
         $c->forceFill($this->contactRow($d))->save();   // Branch Type → branch_type, Tax Registration → tax_type
