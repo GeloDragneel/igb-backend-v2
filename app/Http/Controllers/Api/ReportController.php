@@ -5888,6 +5888,65 @@ class ReportController extends SalesController
         ];
     }
 
+    /* ---------- Income Tax Payable (excess) per row — same rules as the Income Statement ---------- */
+
+    /** tax brackets (m_tax_brackets, or the built-in list) */
+    private function isBrackets(): array
+    {
+        static $b = null;
+        return $b ??= Schema::hasTable('m_tax_brackets')
+            ? DB::table('m_tax_brackets')->orderBy('bracket_min')->get()->map(fn ($x) => [
+                'min' => (float) $x->bracket_min, 'max' => ($x->bracket_max === null || (float) $x->bracket_max <= (float) $x->bracket_min) ? null : (float) $x->bracket_max,
+                'base' => (float) $x->base_tax, 'rate' => (float) $x->rate,
+            ])->values()->all()
+            : self::ITS_BRACKETS;
+    }
+
+    /** client_num → corporate? (business ownership type 3 / a type named "corp…": 20% flat) */
+    private function isCorporateMap(array $clientNums): array
+    {
+        if (!$clientNums || !Schema::hasTable('m_client')) return [];
+        $types = [];
+        if (Schema::hasTable('m_business_ownership_type')) {
+            foreach (DB::table('m_business_ownership_type')->get() as $t) {
+                $row = (array) $t;
+                $types[(int) $t->id] = (int) $t->id === 3 || collect(['name', 'description', 'type'])->contains(fn ($k) => !empty($row[$k]) && stripos($row[$k], 'corp') !== false);
+            }
+        }
+        $out = [];
+        foreach (DB::table('m_client')->whereIn('client_num', $clientNums)->get(['client_num', 'business_ownership_type_id']) as $c) {
+            $id = (int) $c->business_ownership_type_id;
+            $out[$c->client_num] = $id === 3 || !empty($types[$id]);
+        }
+        return $out;
+    }
+
+    /** login id → creditable withholding 2307 (IT) on sales declared in the period */
+    private function is2307(array $users, string $from, string $to): array
+    {
+        if (!$users) return [];
+        return SalesInvoiceMaster::whereIn('added_by', $users)->where('invoice_status_id', '<>', 5)->where('trans_type', 'posted')
+            ->where('2307_it', '>', 0)->whereBetween('2307_it_declared_month', [$from, $to])
+            ->groupBy('added_by')->selectRaw('added_by, SUM(`2307_it`) AS amt')->pluck('amt', 'added_by')
+            ->map(fn ($v) => (float) $v)->all();
+    }
+
+    /** income tax due on the taxable income − 2307 credits (corporate 20% · else the graduated brackets) */
+    private function isPayable(float $taxable, bool $corporate, float $credits): float
+    {
+        $amount = 0.0;
+        if ($corporate) {
+            $amount = $taxable * 0.2;
+        } else {
+            $list = $this->isBrackets();
+            $hit = null;
+            foreach ($list as $b) if ($taxable >= $b['min'] && ($b['max'] === null || $taxable < $b['max'])) { $hit = $b; break; }
+            if (!$hit && $list && $taxable >= end($list)['min']) $hit = end($list);
+            if ($hit) $amount = ($taxable - $hit['min']) * $hit['rate'] + $hit['base'];
+        }
+        return $this->vsMoney($amount - $credits);
+    }
+
     public function incomeClientsSummary(Request $request)
     {
         $d = $request->validate([
@@ -5926,10 +5985,15 @@ class ReportController extends SalesController
         $users = [];
         foreach ($clients as $c) foreach ($this->vsIds($c->user_ids) as $u) $users[$u] = true;
         $by = $this->isAmounts(array_keys($users), $d['from'], $d['to'], $daId, false);
+        $corp = $this->isCorporateMap(array_map(fn ($c) => $c->client_num, $clients));
+        $cw = $this->is2307(array_keys($users), $d['from'], $d['to']);
 
         $out = [];
         foreach ($clients as $c) {
             $uids = $this->vsIds($c->user_ids);
+            $row = $this->isRow($by, $uids);
+            $row['tax_payable'] = $this->isPayable((float) $row['income_subject'], !empty($corp[$c->client_num]),
+                array_sum(array_map(fn ($u) => $cw[$u] ?? 0, $uids)));
             $out[] = [
                 'client_id'  => (int) $c->client_id,
                 'client_num' => $c->client_num,
@@ -5937,7 +6001,7 @@ class ReportController extends SalesController
                 'user_ids'   => implode(',', $uids),
                 'count_acc'  => (int) $c->count_acc,
                 'status'     => (string) $c->status,
-            ] + $this->isRow($by, $uids);
+            ] + $row;
         }
         return response()->json(['rows' => $out]);
     }
@@ -5963,14 +6027,20 @@ class ReportController extends SalesController
             WHERE A.client_num = ? ' . ($active ? "AND A.{$active} = 1" : '') . '
             ORDER BY B.branch_code, B.trade_name', [$d['client_num']]);
         $by = $this->isAmounts(array_map(fn ($a) => (int) $a->uid, $accounts), $d['from'], $d['to'], 0, true);
-        return response()->json(['rows' => array_map(fn ($a) => [
-            'client_id'   => (int) $a->client_id,
-            'client_num'  => $a->client_num,
-            'client_name' => $a->client_name,
-            'user_ids'    => (string) $a->uid,
-            'count_acc'   => 1,
-            'status'      => (string) $a->status,
-        ] + $this->isRow($by, [(int) $a->uid]), $accounts)]);
+        $corp = !empty($this->isCorporateMap([$d['client_num']])[$d['client_num']]);
+        $cw = $this->is2307(array_map(fn ($a) => (int) $a->uid, $accounts), $d['from'], $d['to']);
+        return response()->json(['rows' => array_map(function ($a) use ($by, $corp, $cw) {
+            $row = $this->isRow($by, [(int) $a->uid]);
+            $row['tax_payable'] = $this->isPayable((float) $row['income_subject'], $corp, $cw[(int) $a->uid] ?? 0);
+            return [
+                'client_id'   => (int) $a->client_id,
+                'client_num'  => $a->client_num,
+                'client_name' => $a->client_name,
+                'user_ids'    => (string) $a->uid,
+                'count_acc'   => 1,
+                'status'      => (string) $a->status,
+            ] + $row;
+        }, $accounts)]);
     }
 
     /* ---------------- Income Statement popup ---------------- */
