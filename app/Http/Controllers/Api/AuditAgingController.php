@@ -72,10 +72,12 @@ class AuditAgingController extends MonitoringController
             $where = "COALESCE(A.audit_status_id, 0) IN (0, 1) AND {$notVoid}";
         } else {
             $st = $kind === 'audited' ? 2 : 3;
+            // the day it was audited / reverted: the latest audit history of that status,
+            // else the day the invoice was last saved (the audit button sets audit_status_id + updated_at)
             $from = "FROM {$t} A INNER JOIN m_user_client U ON U.id = A.added_by
-                     INNER JOIN (SELECT reference_no, MAX(created_at) AS at FROM t_audit_history
-                                 WHERE audit_status_id = {$st} GROUP BY reference_no) H ON H.reference_no = A.invoice_no";
-            $date = 'H.at';
+                     LEFT JOIN (SELECT reference_no, MAX(created_at) AS at FROM t_audit_history
+                                WHERE audit_status_id = {$st} GROUP BY reference_no) H ON H.reference_no = A.invoice_no";
+            $date = 'COALESCE(H.at, A.updated_at)';
             $where = "A.audit_status_id = {$st} AND {$notVoid}";
         }
         if ($range) $where .= " AND {$date} >= '{$range[0]}' AND {$date} < '{$range[1]}'";
@@ -211,8 +213,9 @@ class AuditAgingController extends MonitoringController
             $days = "DATEDIFF(CURDATE(), DATE({$date}))";
             if ($bucket) $where .= " AND {$this->bucketSql($date)} = '{$bucket}'";
             $type = $this->typeSql($t);
+            $ar = in_array('audit_remarks', $this->cols($t), true) ? 'A.audit_remarks' : 'NULL';
             $parts[] = "SELECT U.caid, A.invoice_no, A.document_no, A.declared_month, {$type} AS type,
-                               COALESCE(A.audit_status_id, 0) AS st, A.grand_total AS amount,
+                               COALESCE(A.audit_status_id, 0) AS st, A.grand_total AS amount, {$ar} AS a_remarks,
                                DATE({$date}) AS since, {$days} AS days
                         {$from} WHERE {$where}";
         }
@@ -256,8 +259,9 @@ class AuditAgingController extends MonitoringController
                 'amount'         => (float) $r->amount,
                 'since'          => $r->since,
                 'days'           => (int) $r->days,
-                'remarks'        => $remarks[$r->invoice_no]['text'] ?? '',
-                'remarks_at'     => $remarks[$r->invoice_no]['at'] ?? '',   // when it was audited / reverted with those remarks
+                // no audit history → the remarks saved on the invoice, dated the day it was audited / reverted
+                'remarks'        => ($remarks[$r->invoice_no]['text'] ?? '') !== '' ? $remarks[$r->invoice_no]['text'] : trim((string) ($r->a_remarks ?? '')),
+                'remarks_at'     => $remarks[$r->invoice_no]['at'] ?? ($r->since ? date('M d Y', strtotime($r->since)) : ''),   // when it was audited / reverted with those remarks
                 'remarks_by'     => $remarks[$r->invoice_no]['by'] ?? '',   // who audited / reverted it
             ];
         }, $rows)]);
