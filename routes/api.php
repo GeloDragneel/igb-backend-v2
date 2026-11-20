@@ -50,6 +50,7 @@ use App\Http\Controllers\Api\EmployeePerformanceController;
 use App\Http\Controllers\Api\JobOrderController;
 use App\Http\Controllers\Api\EmployeeStatusController;
 use App\Http\Controllers\Api\WorkReminderController;
+use App\Http\Controllers\Api\AuditAgingController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -524,6 +525,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/client-accounts/{id}/logo', [ClientController::class, 'accountLogo'])->whereNumber('id');
     Route::post('/client-accounts/{id}/logo', [ClientController::class, 'uploadAccountLogo'])->whereNumber('id');
     Route::delete('/client-accounts/{id}/logo', [ClientController::class, 'deleteAccountLogo'])->whereNumber('id');
+    Route::put('/client-accounts/{id}/doubtful', [ClientController::class, 'updateDoubtful']);
 
     // ---------- Monitoring → Reconciliation Monitoring (year grid) ----------
     Route::get('/monitoring/reconciliation', [MonitoringController::class, 'monitoring']);
@@ -871,6 +873,9 @@ Route::middleware('auth:sanctum')->group(function () {
     
     Route::get('/work-reminder', [WorkReminderController::class, 'index']);
     Route::post('/work-reminder/confirm', [WorkReminderController::class, 'confirm']);
+
+    Route::get('/monitoring/audit/aging', [AuditAgingController::class, 'aging']);
+    Route::get('/monitoring/audit/aging/list', [AuditAgingController::class, 'agingList']);
 
     require __DIR__ . '/api_messenger.php';
 });

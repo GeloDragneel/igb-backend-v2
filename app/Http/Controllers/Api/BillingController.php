@@ -348,7 +348,7 @@ class BillingController extends Controller
 
         return response()->json([
             'rows' => $rows->take($limit)->map(function ($s) use ($logCounts) {
-                foreach (['service_fee', 'qty', 'less', 'surcharge', 'total_service_fee', 'inherited_vat', 'inherited_wh', 'inherited_discount_amount', 'less_other_percentage', 'net', 'paid'] as $k) {
+                foreach (['service_fee', 'qty', 'less', 'surcharge', 'total_service_fee', 'document_fee', 'inherited_vat', 'inherited_wh', 'inherited_discount_amount', 'less_other_percentage', 'net', 'paid'] as $k) {
                     $s->$k = round((float) ($s->$k ?? 0), 2);
                 }
                 $dead = in_array((int) $s->invoice_status_id, [self::VOID, self::CANCELLED], true);
@@ -585,6 +585,7 @@ class BillingController extends Controller
             'qty' => ['required', 'numeric', 'gt:0'],
             'less' => ['nullable', 'numeric', 'min:0'],
             'surcharge' => ['nullable', 'numeric', 'min:0'],          // percent
+            'document_fee' => ['nullable', 'numeric', 'min:0'],       // EO only (added to the total)
             'remarks' => ['nullable', 'string', 'max:1000'],
             'username' => ['nullable', 'string'],
             'password' => ['nullable', 'string'],
@@ -608,6 +609,10 @@ class BillingController extends Controller
         }
 
         $gross = round((float) $d['service_fee'] * (float) $d['qty'], 2);
+        // EO SOA (trans_type_id 2): Document fee (shown under the total, not added to it) – sent → use it · not sent → keep the saved one · other SOAs → 0
+        $docFee = (int) ($t->trans_type_id ?? 0) === 2
+            ? round((float) (array_key_exists('document_fee', $d) ? ($d['document_fee'] ?? 0) : ($existing->document_fee ?? 0)), 2)
+            : 0.0;
         $total = round($gross - (float) ($d['less'] ?? 0) + $gross * ((float) ($d['surcharge'] ?? 0) / 100), 2);
 
         // keep VAT / withholding / discount in step with the new total
@@ -619,7 +624,7 @@ class BillingController extends Controller
             'eo_num' => $t->eo_num1 ?? $t->eo_num ?? $t->eo_number ?? null,
             'ser_list_id' => $d['ser_list_id'], 'ser_fee_id' => $d['ser_fee_id'] ?? null, 'prep_target_date' => $d['prep_target_date'],
             'service_fee' => round((float) $d['service_fee'], 2), 'qty' => $d['qty'], 'less' => round((float) ($d['less'] ?? 0), 2),
-            'surcharge' => round((float) ($d['surcharge'] ?? 0), 2), 'total_service_fee' => $total,
+            'surcharge' => round((float) ($d['surcharge'] ?? 0), 2), 'total_service_fee' => $total, 'document_fee' => $docFee,
             'inherited_vat' => $vat, 'inherited_wh' => $wh, 'inherited_discount_amount' => $disc, 'updated_at' => now(),
         ];
 
@@ -1394,6 +1399,7 @@ class BillingController extends Controller
             'lines.*.prep_target_date' => ['required', 'date'],
             'lines.*.service_fee' => ['required', 'numeric', 'gt:0'],
             'lines.*.qty' => ['required', 'numeric', 'gt:0'],
+            'lines.*.document_fee' => ['nullable', 'numeric', 'min:0'],        // EO only
         ], [
             'ca_id.required' => 'Trade Name is required', 'ca_id.min' => 'Trade Name is required',
             'trans_type_id.required' => 'Transaction type is required', 'service_period.required' => 'Service Period is required',
@@ -1414,6 +1420,8 @@ class BillingController extends Controller
         $account = DB::table('m_client_account')->where('id', $d['ca_id'])->first();
         if (!$account) return response()->json(['message' => 'Client account not found.'], 404);
 
+        // EO (type 2): Document fee per service – saved on its own, NOT added to the total · other types: none
+        $docFee = fn ($l) => $type === 2 ? round((float) ($l['document_fee'] ?? 0), 2) : 0.0;
         $total = array_sum(array_map(fn ($l) => round((float) $l['service_fee'] * (float) $l['qty'], 2), $d['lines']));
         if ($total <= 0) return response()->json(['message' => 'Total is required'], 422);
 
@@ -1429,7 +1437,7 @@ class BillingController extends Controller
         $eoVersion = (int) ($d['eo_version'] ?? now()->format('Y'));
 
         try {
-            $result = DB::transaction(function () use ($d, $account, $type, $period, $eoVersion, $me, $addedBy, $inv, $names, $today, $declared) {
+            $result = DB::transaction(function () use ($d, $account, $type, $period, $eoVersion, $me, $addedBy, $inv, $names, $today, $declared, $docFee) {
                 $caid = (int) $account->id;
                 $created = false; $added = 0; $invoices = 0; $noCustomer = false;
 
@@ -1459,6 +1467,7 @@ class BillingController extends Controller
                         'ser_fee_id' => ($l['ser_fee_id'] ?? 0) ?: null, 'ser_list_id' => $l['ser_list_id'], 'service' => $names[$l['ser_list_id']] ?? '',
                         'service_fee' => round((float) $l['service_fee'], 2), 'qty' => $l['qty'], 'less' => 0, 'surcharge' => 0,
                         'total_service_fee' => $lineTotal, 'prep_target_date' => $l['prep_target_date'],
+                        'document_fee' => $docFee($l),
                         'inherited_vat' => 0, 'inherited_wh' => 0, 'inherited_discount_amount' => 0,
                         'invoice_status_id' => self::UNPAID, 'created_at' => now(), 'updated_at' => now(),
                     ]));

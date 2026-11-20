@@ -1363,6 +1363,24 @@ class ClientController extends Controller
 
         return response()->json(['message' => 'Assigned DA / Auditor saved.', 'da_id' => $newDa, 'auditor_id' => $newAu]);
     }
+
+    /* PUT /api/client-accounts/{id}/doubtful   { is_doubt_eo?: bool, is_doubt_pf?: bool }  (Masterlist → Client accounts → Doubtful EO / PF) */
+    public function updateDoubtful(Request $request, int $id)
+    {
+        $d = $request->validate(['is_doubt_eo' => ['sometimes', 'boolean'], 'is_doubt_pf' => ['sometimes', 'boolean']]);
+        $this->account($id);
+        $set = [];
+        foreach (['is_doubt_eo', 'is_doubt_pf'] as $k) {
+            if (array_key_exists($k, $d)) {
+                abort_unless(Schema::hasColumn('m_client_account', $k), 422, "Run the migration first ({$k} is missing).");
+                $set[$k] = $d[$k] ? 1 : 0;
+            }
+        }
+        abort_if(!$set, 422, 'Nothing to save.');
+        DB::table('m_client_account')->where('id', $id)->update($set);
+        $row = DB::table('m_client_account')->where('id', $id)->first(['is_doubt_eo', 'is_doubt_pf']);
+        return response()->json(['message' => 'Doubtful saved.', 'is_doubt_eo' => (int) $row->is_doubt_eo, 'is_doubt_pf' => (int) $row->is_doubt_pf]);
+    }
     public function accountLogo(int $id)
     {
         $a = $this->account($id);

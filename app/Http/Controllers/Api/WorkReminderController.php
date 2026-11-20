@@ -24,8 +24,8 @@ use Illuminate\Support\Facades\Schema;
  */
 class WorkReminderController extends MonitoringController
 {
-    // designation names (m_user_type) that see every client – change to match your list
-    const EXEMPT = ['AUDIT SUPERVISOR', 'IT', 'IT OFFICER', 'CEO', 'CHIEF EXECUTIVE OFFICER'];
+    // m_user_type ids that see every client: 1 IT DEVELOPMENT HEAD · 2 CEO · 10 AUDIT SUPERVISOR · 15 IT OFFICER
+    const EXEMPT = [1, 2, 10, 15];
     const INVOICES = ['t_sales_invoice_master', 't_purchase_expense_master'];
     const BUCKETS = ['d30', 'd60', 'd90', 'd90p'];
 
@@ -40,11 +40,7 @@ class WorkReminderController extends MonitoringController
     {
         $e = DB::table('m_employee')->where('id', $emp)->first(['designation_id']);
         if (!$e) return null;
-        $name = '';
-        if (Schema::hasTable('m_user_type') && ($col = $this->pick('m_user_type', ['user_type', 'name', 'type_name', 'description']))) {
-            $name = strtoupper(trim((string) DB::table('m_user_type')->where('id', $e->designation_id)->value($col)));
-        }
-        if (in_array($name, self::EXEMPT, true)) return 'all';
+        if (in_array((int) $e->designation_id, self::EXEMPT, true)) return 'all';
         if ((int) $e->designation_id === self::AUDITOR) return 'auditor';
         if ((int) $e->designation_id === self::DATA_ANALYST) return 'da';
         return null;

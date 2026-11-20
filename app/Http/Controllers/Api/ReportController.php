@@ -858,6 +858,7 @@ class ReportController extends SalesController
         $withClosing     = $opt['closing'] ?? false; // Closing Entry (CE-…) only for the General Ledger
         $gjMode          = $opt['gj'] ?? 'all';         // all = normal + adjusting · normal · adjusting (journal entry types)
         $want            = fn (string $src) => !$only || in_array($src, $only, true);
+        $lite            = $opt['lite'] ?? false;      // totals only (beginning balance): no customer / vendor names
 
         $byDate = function ($q, string $dateCol) use ($type, $from, $to) {
             if ($type === 'DR') $q->whereBetween($dateCol, [$from, $to]);
@@ -877,11 +878,22 @@ class ReportController extends SalesController
         $acct = fn ($by, $code) => (string) ($accounts[$by . '|' . $code] ?? '');
 
         $partyCache = [];
-        $partyName = function ($id) use (&$partyCache) {
+        $nameOf = fn ($v) => (string) ($v->name ?? $v->vendor_name ?? $v->registered_name ?? $v->trade_name ?? '');
+        // load the customers / vendors of a list in a few queries (was one query per name → very slow)
+        $preload = function ($list, string $col) use (&$partyCache, $nameOf, $lite) {
+            if ($lite) return;
+            $need = collect($list)->pluck($col)->filter()->unique()
+                ->reject(fn ($id) => array_key_exists($id, $partyCache))->values()->all();
+            foreach (array_chunk($need, 1000) as $chunk) {
+                foreach (VendorCustomer::whereIn('id', $chunk)->get() as $v) $partyCache[$v->id] = $nameOf($v);
+            }
+            foreach ($need as $id) $partyCache[$id] ??= '';
+        };
+        $partyName = function ($id) use (&$partyCache, $nameOf) {
             if (!$id) return '';
             if (!array_key_exists($id, $partyCache)) {
                 $v = VendorCustomer::find($id);
-                $partyCache[$id] = $v ? (string) ($v->name ?? $v->vendor_name ?? $v->registered_name ?? $v->trade_name ?? '') : '';
+                $partyCache[$id] = $v ? $nameOf($v) : '';
             }
             return $partyCache[$id];
         };
@@ -894,8 +906,8 @@ class ReportController extends SalesController
         $rows = [];
 
         $base = function ($src, $date, string $transType, $reference, $refData, string $jrnl, $vendorId, string $itemCode = '')
-            use ($partyName, $shown) {
-            $name = $partyName($vendorId);
+            use ($partyName, $shown, $lite) {
+            $name = $lite ? '' : $partyName($vendorId);
             return [
                 'id'             => $src->id,
                 'trans_type'     => $transType,
@@ -936,6 +948,7 @@ class ReportController extends SalesController
                 ->where(fn ($q) => $byDate($q, 'transaction_date'))
                 ->get(['id', 'added_by', 'account_code', 'transaction_date', 'customer_id', 'invoice_no', 'document_no',
                        'grand_total', '2307_it', '2307_vt', 'declared_month', 'created_at']);
+            $preload($invMasters, 'customer_id');
 
             foreach ($invMasters as $m) {
                 $b = $base($m, $m->transaction_date, 'INV', $m->document_no, $m->invoice_no, 'SJ', $m->customer_id);
@@ -977,6 +990,7 @@ class ReportController extends SalesController
                 ->where(fn ($q) => $byDate($q, 'rv_date'))
                 ->get(['id', 'added_by', 'bank', 'rv_date', 'customer_id', 'invoice_no', 'document_no',
                        'sub_total', '2307_it', '2307_vt', 'declared_month', 'created_at']);
+            $preload($rvMasters, 'customer_id');
 
             foreach ($rvMasters as $m) {
                 $b = $base($m, $m->rv_date, 'RV', $m->document_no, $m->invoice_no, 'SJ', $m->customer_id);
@@ -992,6 +1006,7 @@ class ReportController extends SalesController
                        'sub_total', 'declared_month', 'created_at']);
             $rvDocNo = RVoucherMaster::whereIn('rvoucher_no', $rvLines->pluck('rvoucher_no')->filter()->unique())
                 ->pluck('document_no', 'rvoucher_no');
+            $preload($rvLines, 'customer_id');
 
             foreach ($rvLines as $l) {
                 $b = $base($l, $l->rv_date, 'RV', $rvDocNo[$l->rvoucher_no] ?? '', $l->invoice_no, 'SJ', $l->customer_id);
@@ -999,40 +1014,9 @@ class ReportController extends SalesController
             }
         }
 
-        /* ================= PURCHASE ORDER ================= */
-        if ($want('PO')) {
-            $poMasters = PurchaseOrderMaster::whereIn('added_by', $ids)
-                ->where(fn ($q) => $q->whereNull('po_status_id')->orWhere('po_status_id', '<>', 4))   // 4 = VOID
-                ->when($vendorId, fn ($q) => $q->where('vendor_id', $vendorId))
-                ->where(fn ($q) => $byDate($q, 'po_date'))
-                ->get(['id', 'added_by', 'account_code', 'po_date', 'vendor_id', 'po_number', 'document_no', 'grand_total',
-                       '2307_it', '2307_vt', 'trans_type', 'ex_rate', 'declared_month', 'created_at']);
-
-            foreach ($poMasters as $m) {
-                $b = $base($m, $m->po_date, 'PO', $m->document_no, $m->po_number, $jrnlOf($m->trans_type), $m->vendor_id);
-                $add($b, $m->account_code, $acct($m->added_by, $m->account_code), 0, (float) $m->grand_total);
-                if ((float) $m->{'2307_it'} > 0) $add($b, 21910, 'Withholding Tax - Income Tax', 0, (float) $m->{'2307_it'});
-                if ((float) $m->{'2307_vt'} > 0) $add($b, 21910, 'Withholding Tax - VAT', 0, (float) $m->{'2307_vt'});
-            }
-
-            $poByNo  = $poMasters->keyBy('po_number');
-            $poLines = PurchaseOrderDetail::whereIn('po_number', $poByNo->keys())
-                ->get(['id', 'po_number', 'account_code', 'item_id', 'input_vat', 'net_of_vat', 'vat_exempt', 'non_vat', 'zero_rated']);
-
-            foreach ($poLines as $l) {
-                $m    = $poByNo[$l->po_number];
-                $item = $items[$l->item_id] ?? null;
-                $b    = $base($m, $m->po_date, 'PO', $m->document_no, $m->po_number, $jrnlOf($m->trans_type), $m->vendor_id, (string) ($item->item_code ?? ''));
-                $b['id'] = $l->id;
-
-                if ((float) $l->input_vat > 0) {
-                    [$code, $name] = $itemAcct($item, 'input_vat_account', $m->added_by, 'No Account Code Settings');
-                    $add($b, $code, $name, (float) $l->input_vat, 0);
-                }
-                $cost = (float) $l->net_of_vat + (float) $l->vat_exempt + (float) $l->non_vat + (float) $l->zero_rated * (float) ($m->ex_rate ?: 1);
-                $add($b, $l->account_code, $acct($m->added_by, $l->account_code), $cost, 0);
-            }
-        }
+        /* PURCHASE ORDER (t_porder_master / t_porder_detail): not posted to the ledger.
+           A PO is only an order – the books get the entry from Receive Inventory (GRN) / AP invoice.
+           So no PO lines in the General Ledger, Trial Balance, Balance Sheet or any report built on ledgerEntries(). */
 
         /* ================= AP INVOICE (purchases + expenses) ================= */
         if ($want('AP')) {
@@ -1042,6 +1026,7 @@ class ReportController extends SalesController
                 ->where(fn ($q) => $byDate($q, 'transaction_date'))
                 ->get(['id', 'added_by', 'account_code', 'transaction_date', 'vendor_id', 'invoice_no', 'document_no',
                        'grand_total', '2307_it', '2307_vt', 'trans_type', 'declared_month', 'created_at']);
+            $preload($apMasters, 'vendor_id');
 
             foreach ($apMasters as $m) {
                 $b = $base($m, $m->transaction_date, 'AP', $m->document_no, $m->invoice_no, $jrnlOf($m->trans_type), $m->vendor_id);
@@ -1055,6 +1040,7 @@ class ReportController extends SalesController
                 ->get(['id', 'added_by', 'account_code', 'transaction_date', 'vendor_id', 'invoice_no', 'document_no',
                        'input_vat', 'item_id', 'net_of_vat', 'vat_exempt', 'non_vat', 'zero_rated', 'trans_type',
                        'declared_month', 'created_at']);
+            $preload($apLines, 'vendor_id');
 
             foreach ($apLines as $l) {
                 $item = $items[$l->item_id] ?? null;
@@ -1076,6 +1062,7 @@ class ReportController extends SalesController
                 ->where(fn ($q) => $byDate($q, 'grn_date'))
                 ->get(['id', 'receive_by', 'grn_date', 'vendor_id', 'grn_no', 'grand_total', '2307_it', '2307_vt',
                        'declared_month', 'created_at']);
+            $preload($grnMasters, 'vendor_id');
 
             foreach ($grnMasters as $m) {
                 $b = $base($m, $m->grn_date, 'GRN', $m->grn_no, $m->grn_no, 'PJ', $m->vendor_id);
@@ -1233,7 +1220,7 @@ class ReportController extends SalesController
         if ($type === 'DM') {
             $prevMonth = Carbon::createFromFormat('Y-m-d', "{$fromMonth}-01")->subMonth()->format('Y-m');
             $before = $startMonth <= $prevMonth
-                ? $this->ledgerEntries($ids, 'DM', $startMonth, $prevMonth, ['closing' => true])
+                ? $this->ledgerEntries($ids, 'DM', $startMonth, $prevMonth, ['closing' => true, 'lite' => true])
                 : [];
         } else {                                                    // DR / DE: by transaction date
             $fromDate = substr($from, 0, 10);
@@ -1241,7 +1228,7 @@ class ReportController extends SalesController
             $prevDate = Carbon::parse($fromDate)->subDay()->format('Y-m-d');
             $startDate = "{$startMonth}-01";
             $before = $startDate <= $prevDate
-                ? $this->ledgerEntries($ids, 'DR', $startDate, $prevDate, ['closing' => true])
+                ? $this->ledgerEntries($ids, 'DR', $startDate, $prevDate, ['closing' => true, 'lite' => true])
                 : [];
         }
         foreach ($before as $e) $add($e['account_code'], $e['debit'] ?? 0, $e['credit'] ?? 0);
@@ -1345,7 +1332,7 @@ class ReportController extends SalesController
 
         $rows = $this->ledgerEntries($ids, $d['filter_type'], $d['from'], $d['to'] ?? $d['from'], $party === 'customer'
             ? ['only' => ['INV'], 'customer_id' => (int) $d[$key]]                 // old: invoices only
-            : ['only' => ['PO', 'AP', 'GRN'], 'vendor_id' => (int) $d[$key]]);     // old: PO + AP + GRN
+            : ['only' => ['AP', 'GRN'], 'vendor_id' => (int) $d[$key]]);           // AP + GRN (Purchase Order is not in the ledger)
 
         $rows = array_map(function ($r) { unset($r['sort_date'], $r['declared_month']); return $r; }, $rows);
 
@@ -1362,7 +1349,7 @@ class ReportController extends SalesController
         // old trial balance: no collections, no cost of sales (normal + adjusting journal entries unless $opt['gj'] says otherwise)
         $entries = $this->ledgerEntries($ids, $type, $from, $to, ['collections' => false] + $opt);
 
-        $modules = ['INV' => 'Sales / Invoices', 'PO' => 'Purchase Order', 'GRN' => 'Receive Inventory', 'GJ' => 'General Journal'];
+        $modules = ['INV' => 'Sales / Invoices', 'GRN' => 'Receive Inventory', 'GJ' => 'General Journal'];
         $acc = [];
         $docBal = [];
         foreach ($entries as $e) {

@@ -268,6 +268,7 @@ class IMSDashboardController extends MonitoringController
 
         $acc = $this->rfAccounts(array_keys($owed));
         $branch = $this->branchNames(array_keys($owed));
+        $dbt = $this->doubtfulCas();
         $unpaid = [];
         foreach ($owed as $ca => $types) {
             $row = [
@@ -276,6 +277,7 @@ class IMSDashboardController extends MonitoringController
                 'trade_name' => $acc[$ca]['trade_name'] ?? '',
                 'branch' => $branch[$ca] ?? '',
                 'forwarding' => 0.0, 'current' => 0.0,
+                'doubt_eo' => isset($dbt['EO'][(int) $ca]), 'doubt_pf' => isset($dbt['PF'][(int) $ca]),
             ];
             foreach (array_keys(self::RF_TYPES) as $t) {
                 $f = $types[$t]['forwarding'] ?? 0;
@@ -319,6 +321,48 @@ class IMSDashboardController extends MonitoringController
     {
         return ClientAccount::query()->whereIn('id', collect($caIds)->unique()->values()->all() ?: [0])->get(['id', 'branch_code', 'trade_name'])
             ->mapWithKeys(fn ($a) => [$a->id => implode(' - ', array_filter([trim((string) $a->branch_code), trim((string) $a->trade_name)]))]);
+    }
+
+    /** accounts marked doubtful (Client → Masterlist → Doubtful): ['EO' => [ca_id => true], 'PF' => [ca_id => true]] */
+    private function doubtfulCas(): array
+    {
+        static $cache = null;
+        if ($cache !== null) return $cache;
+        $cache = ['EO' => [], 'PF' => []];
+        foreach (['EO' => 'is_doubt_eo', 'PF' => 'is_doubt_pf'] as $t => $col) {
+            if (!in_array($col, $this->cols('m_client_account'), true)) continue;
+            foreach (DB::table('m_client_account')->where($col, 1)->pluck('id') as $id) $cache[$t][(int) $id] = true;
+        }
+        return $cache;
+    }
+
+    /** ALL unpaid PF / EO bills of doubtful accounts (any period, no date filter), each on its own type's flag */
+    private function doubtfulRows(): array
+    {
+        static $cache = null;
+        if ($cache !== null) return $cache;
+        $dbt = $this->doubtfulCas();
+        $out = [];
+        $cols = ['id', 'ca_id', 'trans_number', 'service_period', 'ser_list_id', 'is_paid'];
+        foreach (['PF' => self::RF_TYPES['PF'], 'EO' => self::RF_TYPES['EO']] as $t => $serType) {
+            if (!$dbt[$t]) continue;
+            $list = array_map('intval', $this->rfListIds($serType));
+            $bills = DB::table('t_service')->select(array_values(array_unique([...$cols, ...self::RF_NET_COLS])))
+                ->whereIn('ser_list_id', $list ?: [0])
+                ->whereIn('ca_id', array_keys($dbt[$t]))
+                ->where(fn ($w) => $w->whereNull('invoice_status_id')->orWhere('invoice_status_id', '<>', self::VOID))
+                ->where(fn ($w) => $w->whereNull('is_paid')->orWhere('is_paid', '<>', 1))
+                ->where('total_service_fee', '>', 0)
+                ->get();
+            $paid = $this->rfPaid($bills->pluck('id'));
+            foreach ($bills as $s) {
+                $net = $this->rfNet($s);
+                $got = (float) ($paid[$s->id]->paid ?? 0);
+                $bal = $net - $got;
+                if ($bal > 0.004) $out[] = ['s' => $s, 'type' => $t, 'net' => $net, 'paid' => $got, 'balance' => $bal];
+            }
+        }
+        return $cache = $out;
     }
 
     /* ---------------- Billing KPIs: PF + EO only ---------------- */
@@ -384,42 +428,58 @@ class IMSDashboardController extends MonitoringController
             ->get();
 
         $type = fn ($s) => in_array((int) $s->ser_list_id, $eo, true) ? 'EO' : 'PF';
-        return $cache[$ck] = compact('bills', 'payments', 'arrears', 'type');
+        // Total billed / Outstanding leave out doubtful accounts (EO bills of accounts ticked EO, PF bills of accounts ticked PF)
+        $dbt = $this->doubtfulCas();
+        $billsClean = $bills->reject(fn ($s) => isset($dbt[$type($s)][(int) $s->ca_id]))->values();
+        return $cache[$ck] = compact('bills', 'billsClean', 'payments', 'arrears', 'type');
     }
 
     /** the 5 tiles: billed, collected, deposited, outstanding (billed − collected), arrears */
     private function billingSummary(array $per): array
     {
         $k = $this->billingKpi($per);
-        $billed = round($k['bills']->sum(fn ($s) => $this->rfNet($s)), 2);
+        $billed = round($k['billsClean']->sum(fn ($s) => $this->rfNet($s)), 2);   // doubtful accounts left out
         $collected = round($k['payments']->sum('amount'), 2);
         $deposited = $k['payments']->where('deposited', true);
         $paidBy = $k['payments']->groupBy('service_id')->map->sum('amount');
+        // outstanding = what is still unpaid on the (non-doubtful) bills of the period
+        $balOf = fn ($s) => (int) $s->is_paid === 1 ? 0 : max(0, $this->rfNet($s) - ($paidBy[$s->id] ?? 0));
         return [
             'billed'            => $billed,
-            'billed_count'      => $k['bills']->count(),
+            'billed_count'      => $k['billsClean']->count(),
             'collected'         => $collected,
             'collected_count'   => $k['payments']->count(),
             'deposited'         => round($deposited->sum('amount'), 2),
             'deposited_count'   => $deposited->count(),
-            'outstanding'       => round($billed - $collected, 2),
-            'outstanding_count' => $k['bills']->filter(fn ($s) => $this->rfNet($s) - ($paidBy[$s->id] ?? 0) > 0.004)->count(),
+            'outstanding'       => round($k['billsClean']->sum($balOf), 2),
+            'outstanding_count' => $k['billsClean']->filter(fn ($s) => $balOf($s) > 0.004)->count(),
             'arrears'           => round($k['arrears']->sum(fn ($s) => $this->rfNet($s)), 2),
             'arrears_count'     => $k['arrears']->count(),
             'arrears_clients'   => $k['arrears']->pluck('ca_id')->unique()->count(),
-        ];
+        ] + (function () {
+            // Doubtful tile: ALL unpaid bills of accounts marked doubtful EO / PF (no date filter)
+            $d = collect($this->doubtfulRows());
+            return [
+                'doubtful'         => round($d->sum('balance'), 2),
+                'doubtful_eo'      => round($d->where('type', 'EO')->sum('balance'), 2),
+                'doubtful_pf'      => round($d->where('type', 'PF')->sum('balance'), 2),
+                'doubtful_count'   => $d->count(),
+                'doubtful_clients' => $d->map(fn ($r) => (int) $r['s']->ca_id)->unique()->count(),
+            ];
+        })();
     }
 
     /* GET /dashboard/billing/detail?month=YYYY-MM&kpi=billed|collected|deposited|outstanding|arrears   the popup of a tile (CEO only) */
     public function dashboardBillingDetail(Request $request)
     {
         abort_unless($this->canBilling($request), 403, 'For management and billing only.');
-        $d = $request->validate(['kpi' => ['required', 'in:billed,collected,deposited,outstanding,arrears']]);
+        $d = $request->validate(['kpi' => ['required', 'in:billed,collected,deposited,outstanding,arrears,doubtful']]);
         $p = $this->billingPeriod($request);
         $k = $this->billingKpi($p);
         $type = $k['type'];
+        if ($d['kpi'] === 'doubtful') return $this->doubtfulDetail($p);
         $paidBy = $k['payments']->groupBy('service_id')->map->sum('amount');
-        $services = $d['kpi'] === 'arrears' ? $k['arrears'] : $k['bills'];
+        $services = $d['kpi'] === 'arrears' ? $k['arrears'] : $k['billsClean'];   // billed / outstanding: doubtful accounts left out
         $billOf = $k['bills']->keyBy('id');
 
         // Client name + "Branch code - Trade name"
@@ -476,6 +536,34 @@ class IMSDashboardController extends MonitoringController
         ])->sortBy(fn ($t) => $t['type'] === 'PF' ? 0 : 1)->values();   // PF first, then EO
 
         return response()->json(['kpi' => $d['kpi'], 'month' => $p['to'], 'label' => $p['label'], 'by_type' => $byType, 'rows' => $rows]);
+    }
+
+    /** popup of the Doubtful tile: ALL unpaid PF / EO bills of doubtful accounts (no date filter) */
+    private function doubtfulDetail(array $p)
+    {
+        $list = collect($this->doubtfulRows());
+        $caIds = $list->map(fn ($r) => (int) $r['s']->ca_id)->unique()->values()->all();
+        $acc = $this->rfAccounts($caIds);
+        $trade = $this->branchNames($caIds);
+        $names = DB::table('m_service_list')->whereIn('id', $list->map(fn ($r) => $r['s']->ser_list_id)->unique()->all() ?: [0])->pluck('name', 'id');
+        $dateCol = $this->pick('t_transaction', ['date_start', 'transaction_date', 'created_at']);
+        $billedOn = $dateCol ? DB::table('t_transaction')->whereIn('trans_number', $list->map(fn ($r) => $r['s']->trans_number)->unique()->all() ?: [''])
+            ->pluck($dateCol, 'trans_number') : collect();
+
+        $rows = $list->map(function ($r) use ($acc, $trade, $names, $billedOn) {
+            $s = $r['s'];
+            $billed = $billedOn[$s->trans_number] ?? null;
+            return [
+                'id' => $s->id, 'client_name' => $acc[$s->ca_id]['client_name'] ?? '', 'branch' => $trade[$s->ca_id] ?? '',
+                'type' => $r['type'], 'service' => (string) ($names[$s->ser_list_id] ?? ''), 'period' => $s->service_period,
+                'trans_number' => $s->trans_number, 'date_billed' => $billed ? substr((string) $billed, 0, 10) : '',
+                'amount' => round($r['net'], 2), 'collected' => round($r['paid'], 2), 'balance' => round($r['balance'], 2),
+            ];
+        })->sortBy([['client_name', 'asc'], ['period', 'asc']])->values();
+
+        $byType = $rows->groupBy('type')->map(fn ($g, $t) => ['type' => $t, 'count' => $g->count(), 'amount' => round($g->sum('balance'), 2)])
+            ->sortBy(fn ($t) => $t['type'] === 'PF' ? 0 : 1)->values();
+        return response()->json(['kpi' => 'doubtful', 'month' => $p['to'], 'label' => 'All periods', 'by_type' => $byType, 'rows' => $rows]);
     }
 
     /* GET /dashboard/clients?month=YYYY-MM   scans made by the client himself (employee_id 0 / null) by trans_type (CEO only) */
