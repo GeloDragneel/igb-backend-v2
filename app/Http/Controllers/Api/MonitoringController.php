@@ -847,7 +847,7 @@ class MonitoringController extends Controller
        audits per client per day of a month — t_audit_history joined to the sales / purchase-expense invoices
        ===================================================================== */
 
-    const AUDIT_LABELS = [0 => 'Pending', 1 => 'Confirmed', 2 => 'Audited', 3 => 'Reverted'];
+    const AUDIT_LABELS = [0 => 'Pending', 1 => 'Pending', 2 => 'Audited', 3 => 'Reverted'];   // m_audit_status: 1 PENDING · 2 AUDITED · 3 REVERTED
     const AUDIT_SEE_ALL = [10, 4];   // designations that see every auditor's audits (old page: only 10)
 
     /** Audit status filter (audit / detail): pending = 0 / 1 · audited = 2 · reverted = 3 */
@@ -1506,7 +1506,7 @@ class MonitoringController extends Controller
 
     /**
      * column key → [SQL expression, tables it needs]
-     * S = t_service · L = m_service_list · T = t_transaction · COL = m_payment_col_type · A = m_client_account · C = m_client
+     * S = t_service · L = m_service_list · T = t_transaction · COL = m_payment_col_type · PT = m_payment_type · A = m_client_account · C = m_client
      */
     private function collectionCols(): array
     {
@@ -1530,6 +1530,7 @@ class MonitoringController extends Controller
             'amount'    => ["FORMAT(COALESCE(P.amount, 0), 2)", []],
             'less'      => ["FORMAT({$less}, 2)", ['S']],
             'col_type'  => ["COALESCE(COL.name, '')", ['COL']],
+            'pay_type'  => ["COALESCE(PT.name, '')", ['PT']],
             'service'   => ["COALESCE(L.name, '')", ['S', 'L']],
             'details'   => [$details ? "COALESCE(NULLIF(TRIM(CONCAT_WS(' ', " . implode(', ', $details) . ")), ''), 'N/A')" : "'N/A'", []],
             'or_number' => [$or ? "COALESCE(NULLIF(P.{$or}, ''), 'N/A')" : "'N/A'", []],
@@ -1551,6 +1552,7 @@ class MonitoringController extends Controller
         if (isset($need['L'])) $q->leftJoin('m_service_list as L', 'L.id', '=', 'S.ser_list_id');
         if (isset($need['T'])) $q->leftJoin('t_transaction as T', 'T.trans_number', '=', 'P.trans_number');
         if (isset($need['COL'])) $q->leftJoin('m_payment_col_type as COL', 'COL.id', '=', 'P.payment_col_type_id');
+        if (isset($need['PT'])) $q->leftJoin('m_payment_type as PT', 'PT.id', '=', 'P.payment_type_id');
         if (isset($need['A'])) $q->leftJoin('m_client_account as A', 'A.id', '=', 'P.ca_id');
         if (isset($need['C'])) $q->leftJoin('m_client as C', 'C.client_num', '=', 'A.client_num');
     }
@@ -1646,7 +1648,7 @@ class MonitoringController extends Controller
         $rows = collect();
         if ($ids) {
             $q = DB::table('t_payment as P')->whereIn('P.id', $ids);
-            $this->collectionJoin($q, ['S', 'L', 'T', 'COL', 'A', 'C']);
+            $this->collectionJoin($q, ['S', 'L', 'T', 'COL', 'PT', 'A', 'C']);
             $select = ['P.id', 'P.payment_date', 'A.client_num', DB::raw('COALESCE(P.amount, 0) AS amount_num'),
                 DB::raw($this->collectionLessSql() . ' AS less_num'), DB::raw($this->collectionLessParts() . ' AS less_note')];
             foreach ($cols as $k => [$sql]) $select[] = DB::raw("{$sql} AS `{$k}`");
