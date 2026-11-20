@@ -357,7 +357,9 @@ class SalesController extends Controller
         $inv = DB::table('t_sales_invoice_master')->where('id', $id)->where('added_by', $addedBy)->first();
         if (!$inv) return response()->json(['message' => 'Invoice not found.'], 404);
 
-        DB::transaction(function () use ($inv, $d) {
+        $auditorId = $this->auditEmployeeId($request);
+
+        DB::transaction(function () use ($inv, $d, $auditorId) {
             DB::table('t_sales_invoice_master')->where('id', $inv->id)->update([
                 'audit_status_id' => $d['audit_status_id'],
                 'audit_remarks'   => $d['audit_remarks'] ?? null,
@@ -367,9 +369,31 @@ class SalesController extends Controller
                 'audit_status_id' => $d['audit_status_id'],
                 'updated_at'      => now(),
             ]);
+            // audit history: who audited / reverted it, when, with the remarks
+            DB::table('t_audit_history')->insert([
+                'reference_no'    => $inv->invoice_no,
+                'auditor_id'      => $auditorId,
+                'audit_status_id' => $d['audit_status_id'],
+                'remarks'         => $d['audit_remarks'] ?? null,
+                'created_at'      => now(),
+                'updated_at'      => now(),
+            ]);
         });
 
         return response()->json(['ok' => true]);
+    }
+
+    /** the employee doing the audit (m_employee.id): employee id on the login, else m_user_staff.comid → m_employee.com_id */
+    private function auditEmployeeId(Request $request): ?int
+    {
+        $u = $request->user();
+        if (!$u) return null;
+        foreach (['employee_id', 'emp_id', 'employeeid'] as $k) {
+            $id = (int) ($u->getAttribute($k) ?? 0);
+            if ($id > 0 && DB::table('m_employee')->where('id', $id)->exists()) return $id;
+        }
+        $com = (int) ($u->getAttribute('comid') ?? 0);
+        return $com > 0 ? ((int) DB::table('m_employee')->where('com_id', $com)->orderBy('id')->value('id') ?: null) : null;
     }
     /* =====================================================================
    GET /api/sales/invoice/{invoiceNo}/journal   (same as doGetJournalList)

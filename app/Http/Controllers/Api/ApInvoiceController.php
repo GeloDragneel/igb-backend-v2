@@ -456,14 +456,38 @@ abstract class ApInvoiceController extends SalesController
         $inv = $this->apFind($this->addedByFor($request), 'id', $id);
         if (!$inv) return response()->json(['message' => 'Invoice not found.'], 404);
 
-        DB::transaction(function () use ($inv, $d) {
+        $auditorId = $this->auditEmployeeId($request);
+
+        DB::transaction(function () use ($inv, $d, $auditorId) {
             DB::table(self::M)->where('id', $inv->id)->update($this->apOnly(self::M, [
                 'audit_status_id' => $d['audit_status_id'], 'audit_remarks' => $d['audit_remarks'] ?? null, 'updated_at' => now(),
             ]));
             $detail = $this->apOnly(self::D, ['audit_status_id' => $d['audit_status_id']]);
             if ($detail) DB::table(self::D)->where('invoice_no', $inv->invoice_no)->update($detail);
+            // audit history: who audited / reverted it, when, with the remarks
+            DB::table('t_audit_history')->insert([
+                'reference_no'    => $inv->invoice_no,
+                'auditor_id'      => $auditorId,
+                'audit_status_id' => $d['audit_status_id'],
+                'remarks'         => $d['audit_remarks'] ?? null,
+                'created_at'      => now(),
+                'updated_at'      => now(),
+            ]);
         });
         return response()->json(['ok' => true]);
+    }
+
+    /** the employee doing the audit (m_employee.id): employee id on the login, else m_user_staff.comid → m_employee.com_id */
+    private function auditEmployeeId(Request $request): ?int
+    {
+        $u = $request->user();
+        if (!$u) return null;
+        foreach (['employee_id', 'emp_id', 'employeeid'] as $k) {
+            $id = (int) ($u->getAttribute($k) ?? 0);
+            if ($id > 0 && DB::table('m_employee')->where('id', $id)->exists()) return $id;
+        }
+        $com = (int) ($u->getAttribute('comid') ?? 0);
+        return $com > 0 ? ((int) DB::table('m_employee')->where('com_id', $com)->orderBy('id')->value('id') ?: null) : null;
     }
 
     /* GET /api/{module}/invoice/{invoiceNo}/journal   (old doGetJournalList, flipped for purchases)
