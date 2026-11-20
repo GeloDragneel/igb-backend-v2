@@ -236,9 +236,9 @@ class AuditAgingController extends MonitoringController
             $type = $this->typeSql($t);
             $ar = in_array('audit_remarks', $this->cols($t), true) ? 'A.audit_remarks' : 'NULL';
             $outer = $bucket ? "{$this->bucketSql('Z.dt')} = '{$bucket}'" : '1 = 1';
-            foreach ($this->sources($t, $kind, $caids, $range) as [$from, $where, $date]) $parts[] = "SELECT Z.caid, Z.invoice_no, Z.document_no, Z.declared_month, Z.type, Z.st, Z.amount, Z.a_remarks,
+            foreach ($this->sources($t, $kind, $caids, $range) as [$from, $where, $date]) $parts[] = "SELECT Z.caid, Z.id, '{$t}' AS tbl, Z.invoice_no, Z.document_no, Z.declared_month, Z.type, Z.st, Z.amount, Z.a_remarks,
                                DATE(Z.dt) AS since, DATEDIFF(CURDATE(), DATE(Z.dt)) AS days
-                        FROM (SELECT U.caid, A.invoice_no, A.document_no, A.declared_month, {$type} AS type,
+                        FROM (SELECT U.caid, A.id, A.invoice_no, A.document_no, A.declared_month, {$type} AS type,
                                      COALESCE(A.audit_status_id, 0) AS st, A.grand_total AS amount, {$ar} AS a_remarks, {$date} AS dt
                               {$from} WHERE {$where}) Z
                         WHERE {$outer}";
@@ -260,7 +260,7 @@ class AuditAgingController extends MonitoringController
             foreach (array_chunk(array_values(array_unique(array_map(fn ($r) => (string) $r->invoice_no, $rows))), 1000) as $chunk) {
                 foreach (DB::table('t_audit_history as H')->leftJoin('m_employee as E', 'E.id', '=', 'H.auditor_id')
                              ->whereIn('H.reference_no', $chunk)->where('H.audit_status_id', $st)
-                             ->orderByDesc('H.id')->get(['H.reference_no', 'H.remarks', 'H.created_at', DB::raw("{$name} AS by_name")]) as $h) {
+                             ->orderByDesc('H.created_at')->orderByDesc('H.id')->get(['H.reference_no', 'H.remarks', 'H.created_at', DB::raw("{$name} AS by_name")]) as $h) {
                     $remarks[$h->reference_no] ??= [
                         'text' => trim((string) $h->remarks),
                         'at'   => $h->created_at ? date('M d Y', strtotime($h->created_at)) : '',
@@ -283,10 +283,9 @@ class AuditAgingController extends MonitoringController
                 'amount'         => (float) $r->amount,
                 'since'          => $r->since,
                 'days'           => (int) $r->days,
-                // no audit history → the remarks saved on the invoice, dated the day it was audited / reverted
-                'remarks'        => ($remarks[$r->invoice_no]['text'] ?? '') !== '' ? $remarks[$r->invoice_no]['text'] : trim((string) ($r->a_remarks ?? '')),
+                'remarks'        => $remarks[$r->invoice_no]['text'] ?? '',
                 'remarks_at'     => $remarks[$r->invoice_no]['at'] ?? ($r->since ? date('M d Y', strtotime($r->since)) : ''),   // when it was audited / reverted with those remarks
-                'remarks_by'     => $remarks[$r->invoice_no]['by'] ?? '',   // who audited / reverted it
+                'remarks_by'     => $remarks[$r->invoice_no]['by'] ?? '',   // who audited / reverted it (t_audit_history.auditor_id)
             ];
         }, $rows)]);
     }
