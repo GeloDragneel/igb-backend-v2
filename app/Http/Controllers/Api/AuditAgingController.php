@@ -63,23 +63,48 @@ class AuditAgingController extends MonitoringController
     }
 
     /** per invoice table: FROM … + WHERE + the date the age counts from (pending = entered · audited / reverted = last audit date) */
-    private function source(string $t, string $kind, ?array $caids, ?array $range): array
+    /**
+     * the invoices of one table for pending / audited / reverted → pieces of [FROM, WHERE, date]
+     *   pending            : date = entered (created_at)
+     *   audited / reverted : date = the latest audit history of that status, else updated_at (the Audit button)
+     * With a period the period is applied FIRST (indexes), so only that month / day is read:
+     *   piece 1 – audit history of that status made in the period, and none of that status after it
+     *   piece 2 – no audit history of that status at all, saved (updated_at) in the period
+     */
+    private function sources(string $t, string $kind, ?array $caids, ?array $range): array
     {
         $notVoid = 'COALESCE(A.invoice_status_id, 0) <> ' . self::VOID . $this->inScope($caids);
+        $in = fn (string $col) => $range ? " AND {$col} >= '{$range[0]}' AND {$col} < '{$range[1]}'" : '';
+        $user = 'INNER JOIN m_user_client U ON U.id = A.added_by';
+
         if ($kind === 'pending') {
-            $from = "FROM {$t} A INNER JOIN m_user_client U ON U.id = A.added_by";
-            $date = 'A.created_at';
-            $where = "COALESCE(A.audit_status_id, 0) IN (0, 1) AND {$notVoid}";
-        } else {
-            $st = $kind === 'audited' ? 2 : 3;
-            // the day it was audited / reverted: the latest audit history of that status (one index lookup per invoice),
-            // else the day the invoice was last saved (the audit button sets audit_status_id + updated_at)
-            $from = "FROM {$t} A INNER JOIN m_user_client U ON U.id = A.added_by";
-            $date = "COALESCE((SELECT MAX(H.created_at) FROM t_audit_history H
-                               WHERE H.reference_no = A.invoice_no AND H.audit_status_id = {$st}), A.updated_at)";
-            $where = "A.audit_status_id = {$st} AND {$notVoid}";
+            return [["FROM {$t} A {$user}",
+                "(A.audit_status_id IN (0, 1) OR A.audit_status_id IS NULL) AND {$notVoid}" . $in('A.created_at'), 'A.created_at']];
         }
-        return [$from, $where, $date, $range];
+
+        $st = $kind === 'audited' ? 2 : 3;
+        if (!$range) {
+            // all years: one lookup per invoice
+            return [["FROM {$t} A {$user}", "A.audit_status_id = {$st} AND {$notVoid}",
+                "COALESCE((SELECT MAX(H.created_at) FROM t_audit_history H
+                           WHERE H.reference_no = A.invoice_no AND H.audit_status_id = {$st}), A.updated_at)"]];
+        }
+
+        [$s, $e] = $range;
+        $hist = "FROM (SELECT H.reference_no AS ref, MAX(H.created_at) AS dt
+                       FROM t_audit_history H
+                       WHERE H.audit_status_id = {$st} AND H.created_at >= '{$s}' AND H.created_at < '{$e}'
+                         AND NOT EXISTS (SELECT 1 FROM t_audit_history H2
+                                         WHERE H2.reference_no = H.reference_no AND H2.audit_status_id = {$st} AND H2.created_at >= '{$e}')
+                       GROUP BY H.reference_no) K
+                 INNER JOIN {$t} A ON A.invoice_no = K.ref {$user}";
+        return [
+            [$hist, "A.audit_status_id = {$st} AND {$notVoid}", 'K.dt'],
+            ["FROM {$t} A {$user}",
+                "A.audit_status_id = {$st} AND {$notVoid}" . $in('A.updated_at') . "
+                 AND NOT EXISTS (SELECT 1 FROM t_audit_history H WHERE H.reference_no = A.invoice_no AND H.audit_status_id = {$st})",
+                'A.updated_at'],
+        ];
     }
 
     private function tables(): array
@@ -92,11 +117,12 @@ class AuditAgingController extends MonitoringController
     {
         $parts = [];
         foreach ($this->tables() as $t) {
-            [$from, $where, $date] = $this->source($t, $kind, $caids, $range);
             $ty = $this->typeSql($t);
-            $parts[] = "SELECT Z.caid, {$this->bucketSql('Z.dt')} AS b, Z.ty, COUNT(*) AS n
-                        FROM (SELECT U.caid, {$ty} AS ty, {$date} AS dt {$from} WHERE {$where}) Z
-                        WHERE {$this->rangeSql('Z.dt', $range)} GROUP BY Z.caid, b, Z.ty";
+            foreach ($this->sources($t, $kind, $caids, $range) as [$from, $where, $date]) {
+                $parts[] = "SELECT Z.caid, {$this->bucketSql('Z.dt')} AS b, Z.ty, COUNT(*) AS n
+                            FROM (SELECT U.caid, {$ty} AS ty, {$date} AS dt {$from} WHERE {$where}) Z
+                            GROUP BY Z.caid, b, Z.ty";
+            }
         }
         if (!$parts) return [];
         return DB::select('SELECT caid, b, ty, SUM(n) AS n FROM (' . implode(' UNION ALL ', $parts) . ') X GROUP BY caid, b, ty');
@@ -139,6 +165,12 @@ class AuditAgingController extends MonitoringController
         $m = (int) $request->query('month', 0);
         if ($m < 1 || $m > 12) return ["{$y}-01-01", ($y + 1) . '-01-01'];
         $from = sprintf('%04d-%02d-01', $y, $m);
+        // ?day= → that one day of the month (Daily view)
+        $day = (int) $request->query('day', 0);
+        if ($day >= 1 && $day <= (int) date('t', strtotime($from))) {
+            $d = sprintf('%04d-%02d-%02d', $y, $m, $day);
+            return [$d, date('Y-m-d', strtotime("{$d} +1 day"))];
+        }
         return [$from, date('Y-m-d', strtotime("{$from} +1 month"))];
     }
 
@@ -201,11 +233,10 @@ class AuditAgingController extends MonitoringController
 
         $parts = [];
         foreach ($this->tables() as $t) {
-            [$from, $where, $date] = $this->source($t, $kind, $caids, $range);
             $type = $this->typeSql($t);
             $ar = in_array('audit_remarks', $this->cols($t), true) ? 'A.audit_remarks' : 'NULL';
-            $outer = $this->rangeSql('Z.dt', $range) . ($bucket ? " AND {$this->bucketSql('Z.dt')} = '{$bucket}'" : '');
-            $parts[] = "SELECT Z.caid, Z.invoice_no, Z.document_no, Z.declared_month, Z.type, Z.st, Z.amount, Z.a_remarks,
+            $outer = $bucket ? "{$this->bucketSql('Z.dt')} = '{$bucket}'" : '1 = 1';
+            foreach ($this->sources($t, $kind, $caids, $range) as [$from, $where, $date]) $parts[] = "SELECT Z.caid, Z.invoice_no, Z.document_no, Z.declared_month, Z.type, Z.st, Z.amount, Z.a_remarks,
                                DATE(Z.dt) AS since, DATEDIFF(CURDATE(), DATE(Z.dt)) AS days
                         FROM (SELECT U.caid, A.invoice_no, A.document_no, A.declared_month, {$type} AS type,
                                      COALESCE(A.audit_status_id, 0) AS st, A.grand_total AS amount, {$ar} AS a_remarks, {$date} AS dt
