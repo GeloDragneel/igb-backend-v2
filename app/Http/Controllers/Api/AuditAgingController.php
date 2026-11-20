@@ -63,7 +63,7 @@ class AuditAgingController extends MonitoringController
     }
 
     /** per invoice table: FROM … + WHERE + the date the age counts from (pending = entered · audited / reverted = last audit date) */
-    private function source(string $t, string $kind, ?array $caids, ?int $year): array
+    private function source(string $t, string $kind, ?array $caids, ?array $range): array
     {
         $notVoid = 'COALESCE(A.invoice_status_id, 0) <> ' . self::VOID . $this->inScope($caids);
         if ($kind === 'pending') {
@@ -78,7 +78,7 @@ class AuditAgingController extends MonitoringController
             $date = 'H.at';
             $where = "A.audit_status_id = {$st} AND {$notVoid}";
         }
-        if ($year) $where .= " AND {$date} >= '{$year}-01-01' AND {$date} < '" . ($year + 1) . "-01-01'";
+        if ($range) $where .= " AND {$date} >= '{$range[0]}' AND {$date} < '{$range[1]}'";
         return [$from, $where, $date];
     }
 
@@ -88,16 +88,23 @@ class AuditAgingController extends MonitoringController
     }
 
     /** $kind: pending | audited | reverted → rows of (caid, b, n) */
-    private function counts(?array $caids, string $kind, ?int $year): array
+    private function counts(?array $caids, string $kind, ?array $range): array
     {
         $parts = [];
         foreach ($this->tables() as $t) {
-            [$from, $where, $date] = $this->source($t, $kind, $caids, $year);
+            [$from, $where, $date] = $this->source($t, $kind, $caids, $range);
             $b = $this->bucketSql($date);
-            $parts[] = "SELECT U.caid, {$b} AS b, COUNT(*) AS n {$from} WHERE {$where} GROUP BY U.caid, b";
+            $ty = $this->typeSql($t);
+            $parts[] = "SELECT U.caid, {$b} AS b, {$ty} AS ty, COUNT(*) AS n {$from} WHERE {$where} GROUP BY U.caid, b, ty";
         }
         if (!$parts) return [];
-        return DB::select('SELECT caid, b, SUM(n) AS n FROM (' . implode(' UNION ALL ', $parts) . ') X GROUP BY caid, b');
+        return DB::select('SELECT caid, b, ty, SUM(n) AS n FROM (' . implode(' UNION ALL ', $parts) . ') X GROUP BY caid, b, ty');
+    }
+
+    /** sales | purchases | expenses of an invoice table */
+    private function typeSql(string $t): string
+    {
+        return $t === 't_sales_invoice_master' ? "'sales'" : 'LOWER(TRIM(A.trans_type))';
     }
 
     /** auditor → own clients · supervisor → all, or one auditor (?auditor_id=) · [role, caids, pick] */
@@ -117,6 +124,31 @@ class AuditAgingController extends MonitoringController
         return $y >= 2000 && $y <= 2100 ? $y : null;
     }
 
+    /** ?year=&month= → [from, to) · month only counts with a year · nothing → all dates */
+    private function rangeOf(Request $request): ?array
+    {
+        $y = $this->yearOf($request);
+        if (!$y) return null;
+        $m = (int) $request->query('month', 0);
+        if ($m < 1 || $m > 12) return ["{$y}-01-01", ($y + 1) . '-01-01'];
+        $from = sprintf('%04d-%02d-01', $y, $m);
+        return [$from, date('Y-m-d', strtotime("{$from} +1 month"))];
+    }
+
+    /** the tab counts of the year: $kind → [1..12 => n] */
+    private function monthCounts(?array $caids, string $kind, int $year): array
+    {
+        $parts = [];
+        foreach ($this->tables() as $t) {
+            [$from, $where, $date] = $this->source($t, $kind, $caids, ["{$year}-01-01", ($year + 1) . '-01-01']);
+            $parts[] = "SELECT MONTH({$date}) AS m, COUNT(*) AS n {$from} WHERE {$where} GROUP BY m";
+        }
+        $out = array_fill(1, 12, 0);
+        if (!$parts) return $out;
+        foreach (DB::select('SELECT m, SUM(n) AS n FROM (' . implode(' UNION ALL ', $parts) . ') X GROUP BY m') as $r) $out[(int) $r->m] = (int) $r->n;
+        return $out;
+    }
+
     /** rows of (caid, b, n) → { totals, clients[] } */
     private function aged(array $rows, array $names): array
     {
@@ -124,8 +156,9 @@ class AuditAgingController extends MonitoringController
         $per = [];
         foreach ($rows as $r) {
             $c = (int) $r->caid;
-            $per[$c] ??= ['caid' => $c] + array_fill_keys(self::BUCKETS, 0) + ['total' => 0];
+            $per[$c] ??= ['caid' => $c] + array_fill_keys(self::BUCKETS, 0) + ['sales' => 0, 'purchases' => 0, 'expenses' => 0, 'total' => 0];
             $per[$c][$r->b] += (int) $r->n;
+            if (isset($per[$c][$r->ty]) && in_array($r->ty, ['sales', 'purchases', 'expenses'], true)) $per[$c][$r->ty] += (int) $r->n;
             $per[$c]['total'] += (int) $r->n;
             $tot[$r->b] += (int) $r->n;
             $tot['total'] += (int) $r->n;
@@ -135,14 +168,15 @@ class AuditAgingController extends MonitoringController
         return ['totals' => $tot, 'clients' => $clients];
     }
 
-    /* ---------------- GET /monitoring/audit/aging?year=2026&auditor_id=0 ---------------- */
+    /* ---------------- GET /monitoring/audit/aging?year=2026&month=11&auditor_id=0   (month empty = whole year) ---------------- */
     public function aging(Request $request)
     {
         [$role, $caids, $pick] = $this->scopeFor($request);
         $year = $this->yearOf($request);
+        $range = $this->rangeOf($request);
 
         $sets = [];
-        foreach (['pending', 'audited', 'reverted'] as $k) $sets[$k] = $this->counts($caids, $k, $year);
+        foreach (['pending', 'audited', 'reverted'] as $k) $sets[$k] = $this->counts($caids, $k, $range);
 
         $ids = [];
         foreach ($sets as $rows) foreach ($rows as $r) $ids[(int) $r->caid] = true;
@@ -153,15 +187,16 @@ class AuditAgingController extends MonitoringController
 
         $out = ['scope' => $role === 'auditor' ? 'mine' : ($pick ? 'auditor' : 'all'), 'clients' => $caids === null ? null : count($caids), 'year' => $year];
         foreach ($sets as $k => $rows) $out[$k] = $this->aged($rows, $names);
+        $out['month'] = (int) $request->query('month', 0) ?: null;
         return response()->json($out);
     }
 
-    /* ---------------- GET /monitoring/audit/aging/list?kind=pending&bucket=d30&caid=12&year=2026 ----------------
+    /* ---------------- GET /monitoring/audit/aging/list?kind=pending&bucket=d30&caid=12&year=2026&month=11 ----------------
        the invoices behind a number (sales / purchases / expenses), oldest first, max 2000 */
     public function agingList(Request $request)
     {
         [, $caids] = $this->scopeFor($request);
-        $year   = $this->yearOf($request);
+        $range  = $this->rangeOf($request);
         $kind   = in_array($request->query('kind'), ['pending', 'audited', 'reverted'], true) ? $request->query('kind') : 'pending';
         $bucket = in_array($request->query('bucket'), self::BUCKETS, true) ? $request->query('bucket') : null;
         $caid   = (int) $request->query('caid', 0);
@@ -172,10 +207,10 @@ class AuditAgingController extends MonitoringController
 
         $parts = [];
         foreach ($this->tables() as $t) {
-            [$from, $where, $date] = $this->source($t, $kind, $caids, $year);
+            [$from, $where, $date] = $this->source($t, $kind, $caids, $range);
             $days = "DATEDIFF(CURDATE(), DATE({$date}))";
             if ($bucket) $where .= " AND {$this->bucketSql($date)} = '{$bucket}'";
-            $type = $t === 't_sales_invoice_master' ? "'sales'" : 'LOWER(TRIM(A.trans_type))';
+            $type = $this->typeSql($t);
             $parts[] = "SELECT U.caid, A.invoice_no, A.document_no, A.declared_month, {$type} AS type,
                                COALESCE(A.audit_status_id, 0) AS st, A.grand_total AS amount,
                                DATE({$date}) AS since, {$days} AS days
