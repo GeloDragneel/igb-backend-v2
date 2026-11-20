@@ -485,7 +485,7 @@ class IMSDashboardController extends MonitoringController
         // Client name + "Branch code - Trade name"
         $acc = $this->rfAccounts($services->pluck('ca_id')->unique()->values()->all());
         $trade = $this->branchNames($services->pluck('ca_id'));
-        $who = fn ($caId) => ['client_name' => $acc[$caId]['client_name'] ?? '', 'branch' => $trade[$caId] ?? ''];
+        $who = fn ($caId) => ['ca_id' => (int) $caId, 'client_name' => $acc[$caId]['client_name'] ?? '', 'branch' => $trade[$caId] ?? ''];
         $names = DB::table('m_service_list')->whereIn('id', $services->pluck('ser_list_id')->unique()->all() ?: [0])->pluck('name', 'id');
 
         if (in_array($d['kpi'], ['collected', 'deposited'], true)) {
@@ -556,7 +556,7 @@ class IMSDashboardController extends MonitoringController
             $s = $r['s'];
             $billed = $billedOn[$s->trans_number] ?? null;
             return [
-                'id' => $s->id, 'client_name' => $acc[$s->ca_id]['client_name'] ?? '', 'branch' => $trade[$s->ca_id] ?? '',
+                'id' => $s->id, 'ca_id' => (int) $s->ca_id, 'client_name' => $acc[$s->ca_id]['client_name'] ?? '', 'branch' => $trade[$s->ca_id] ?? '',
                 'type' => $r['type'], 'service' => (string) ($names[$s->ser_list_id] ?? ''), 'period' => $s->service_period,
                 'trans_number' => $s->trans_number, 'date_billed' => $billed ? substr((string) $billed, 0, 10) : '',
                 'amount' => round($r['net'], 2), 'collected' => round($r['paid'], 2), 'balance' => round($r['balance'], 2),
