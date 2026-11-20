@@ -225,7 +225,25 @@ class AuditAgingController extends MonitoringController
         $names = DB::table('m_client_account')->whereIn('id', array_unique(array_map(fn ($r) => (int) $r->caid, $rows)) ?: [0])
             ->get(['id', 'branch_code', 'trade_name'])->keyBy('id');
 
-        return response()->json(['more' => $more, 'rows' => array_map(function ($r) use ($names) {
+        // audited / reverted: the latest audit history of that status → remarks, date, who did it
+        $remarks = [];
+        if ($kind !== 'pending' && $rows) {
+            $st = $kind === 'audited' ? 2 : 3;
+            $name = $this->employeeName('E');
+            foreach (array_chunk(array_values(array_unique(array_map(fn ($r) => (string) $r->invoice_no, $rows))), 1000) as $chunk) {
+                foreach (DB::table('t_audit_history as H')->leftJoin('m_employee as E', 'E.id', '=', 'H.auditor_id')
+                             ->whereIn('H.reference_no', $chunk)->where('H.audit_status_id', $st)
+                             ->orderByDesc('H.id')->get(['H.reference_no', 'H.remarks', 'H.created_at', DB::raw("{$name} AS by_name")]) as $h) {
+                    $remarks[$h->reference_no] ??= [
+                        'text' => trim((string) $h->remarks),
+                        'at'   => $h->created_at ? date('M d Y', strtotime($h->created_at)) : '',
+                        'by'   => trim((string) $h->by_name),
+                    ];
+                }
+            }
+        }
+
+        return response()->json(['more' => $more, 'rows' => array_map(function ($r) use ($names, $remarks) {
             $a = $names[(int) $r->caid] ?? null;
             return [
                 'caid'           => (int) $r->caid,
@@ -238,6 +256,9 @@ class AuditAgingController extends MonitoringController
                 'amount'         => (float) $r->amount,
                 'since'          => $r->since,
                 'days'           => (int) $r->days,
+                'remarks'        => $remarks[$r->invoice_no]['text'] ?? '',
+                'remarks_at'     => $remarks[$r->invoice_no]['at'] ?? '',   // when it was audited / reverted with those remarks
+                'remarks_by'     => $remarks[$r->invoice_no]['by'] ?? '',   // who audited / reverted it
             ];
         }, $rows)]);
     }
