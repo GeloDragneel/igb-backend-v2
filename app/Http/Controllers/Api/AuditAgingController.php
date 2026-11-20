@@ -72,16 +72,14 @@ class AuditAgingController extends MonitoringController
             $where = "COALESCE(A.audit_status_id, 0) IN (0, 1) AND {$notVoid}";
         } else {
             $st = $kind === 'audited' ? 2 : 3;
-            // the day it was audited / reverted: the latest audit history of that status,
+            // the day it was audited / reverted: the latest audit history of that status (one index lookup per invoice),
             // else the day the invoice was last saved (the audit button sets audit_status_id + updated_at)
-            $from = "FROM {$t} A INNER JOIN m_user_client U ON U.id = A.added_by
-                     LEFT JOIN (SELECT reference_no, MAX(created_at) AS at FROM t_audit_history
-                                WHERE audit_status_id = {$st} GROUP BY reference_no) H ON H.reference_no = A.invoice_no";
-            $date = 'COALESCE(H.at, A.updated_at)';
+            $from = "FROM {$t} A INNER JOIN m_user_client U ON U.id = A.added_by";
+            $date = "COALESCE((SELECT MAX(H.created_at) FROM t_audit_history H
+                               WHERE H.reference_no = A.invoice_no AND H.audit_status_id = {$st}), A.updated_at)";
             $where = "A.audit_status_id = {$st} AND {$notVoid}";
         }
-        if ($range) $where .= " AND {$date} >= '{$range[0]}' AND {$date} < '{$range[1]}'";
-        return [$from, $where, $date];
+        return [$from, $where, $date, $range];
     }
 
     private function tables(): array
@@ -95,9 +93,10 @@ class AuditAgingController extends MonitoringController
         $parts = [];
         foreach ($this->tables() as $t) {
             [$from, $where, $date] = $this->source($t, $kind, $caids, $range);
-            $b = $this->bucketSql($date);
             $ty = $this->typeSql($t);
-            $parts[] = "SELECT U.caid, {$b} AS b, {$ty} AS ty, COUNT(*) AS n {$from} WHERE {$where} GROUP BY U.caid, b, ty";
+            $parts[] = "SELECT Z.caid, {$this->bucketSql('Z.dt')} AS b, Z.ty, COUNT(*) AS n
+                        FROM (SELECT U.caid, {$ty} AS ty, {$date} AS dt {$from} WHERE {$where}) Z
+                        WHERE {$this->rangeSql('Z.dt', $range)} GROUP BY Z.caid, b, Z.ty";
         }
         if (!$parts) return [];
         return DB::select('SELECT caid, b, ty, SUM(n) AS n FROM (' . implode(' UNION ALL ', $parts) . ') X GROUP BY caid, b, ty');
@@ -126,6 +125,12 @@ class AuditAgingController extends MonitoringController
         return $y >= 2000 && $y <= 2100 ? $y : null;
     }
 
+    /** date column in [from, to) — or always true (all years) */
+    private function rangeSql(string $col, ?array $range): string
+    {
+        return $range ? "{$col} >= '{$range[0]}' AND {$col} < '{$range[1]}'" : '1 = 1';
+    }
+
     /** ?year=&month= → [from, to) · month only counts with a year · nothing → all dates */
     private function rangeOf(Request $request): ?array
     {
@@ -137,19 +142,6 @@ class AuditAgingController extends MonitoringController
         return [$from, date('Y-m-d', strtotime("{$from} +1 month"))];
     }
 
-    /** the tab counts of the year: $kind → [1..12 => n] */
-    private function monthCounts(?array $caids, string $kind, int $year): array
-    {
-        $parts = [];
-        foreach ($this->tables() as $t) {
-            [$from, $where, $date] = $this->source($t, $kind, $caids, ["{$year}-01-01", ($year + 1) . '-01-01']);
-            $parts[] = "SELECT MONTH({$date}) AS m, COUNT(*) AS n {$from} WHERE {$where} GROUP BY m";
-        }
-        $out = array_fill(1, 12, 0);
-        if (!$parts) return $out;
-        foreach (DB::select('SELECT m, SUM(n) AS n FROM (' . implode(' UNION ALL ', $parts) . ') X GROUP BY m') as $r) $out[(int) $r->m] = (int) $r->n;
-        return $out;
-    }
 
     /** rows of (caid, b, n) → { totals, clients[] } */
     private function aged(array $rows, array $names): array
@@ -210,14 +202,15 @@ class AuditAgingController extends MonitoringController
         $parts = [];
         foreach ($this->tables() as $t) {
             [$from, $where, $date] = $this->source($t, $kind, $caids, $range);
-            $days = "DATEDIFF(CURDATE(), DATE({$date}))";
-            if ($bucket) $where .= " AND {$this->bucketSql($date)} = '{$bucket}'";
             $type = $this->typeSql($t);
             $ar = in_array('audit_remarks', $this->cols($t), true) ? 'A.audit_remarks' : 'NULL';
-            $parts[] = "SELECT U.caid, A.invoice_no, A.document_no, A.declared_month, {$type} AS type,
-                               COALESCE(A.audit_status_id, 0) AS st, A.grand_total AS amount, {$ar} AS a_remarks,
-                               DATE({$date}) AS since, {$days} AS days
-                        {$from} WHERE {$where}";
+            $outer = $this->rangeSql('Z.dt', $range) . ($bucket ? " AND {$this->bucketSql('Z.dt')} = '{$bucket}'" : '');
+            $parts[] = "SELECT Z.caid, Z.invoice_no, Z.document_no, Z.declared_month, Z.type, Z.st, Z.amount, Z.a_remarks,
+                               DATE(Z.dt) AS since, DATEDIFF(CURDATE(), DATE(Z.dt)) AS days
+                        FROM (SELECT U.caid, A.invoice_no, A.document_no, A.declared_month, {$type} AS type,
+                                     COALESCE(A.audit_status_id, 0) AS st, A.grand_total AS amount, {$ar} AS a_remarks, {$date} AS dt
+                              {$from} WHERE {$where}) Z
+                        WHERE {$outer}";
         }
         if (!$parts) return response()->json(['rows' => [], 'more' => false]);
 
