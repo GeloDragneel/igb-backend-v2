@@ -350,7 +350,7 @@ class IMSDashboardController extends MonitoringController
             $bills = DB::table('t_service')->select(array_values(array_unique([...$cols, ...self::RF_NET_COLS])))
                 ->whereIn('ser_list_id', $list ?: [0])
                 ->whereIn('ca_id', array_keys($dbt[$t]))
-                ->where(fn ($w) => $w->whereNull('invoice_status_id')->orWhere('invoice_status_id', '<>', self::VOID))
+                ->where(fn ($w) => $w->whereNull('invoice_status_id')->orWhereNotIn('invoice_status_id', [self::VOID, self::CANCELLED]))
                 ->where(fn ($w) => $w->whereNull('is_paid')->orWhere('is_paid', '<>', 1))
                 ->where('total_service_fee', '>', 0)
                 ->get();
@@ -422,7 +422,7 @@ class IMSDashboardController extends MonitoringController
             ->where(fn ($w) => $w
                 ->where(fn ($x) => $x->whereIn('S.ser_list_id', $pf ?: [0])->whereIn('S.service_period', $pfBefore ?: ['']))
                 ->orWhere(fn ($x) => $x->whereIn('S.ser_list_id', $eo ?: [0])->whereIn('S.service_period', $eoBefore ?: [''])))
-            ->where(fn ($w) => $w->whereNull('S.invoice_status_id')->orWhere('S.invoice_status_id', '<>', self::VOID))
+            ->where(fn ($w) => $w->whereNull('S.invoice_status_id')->orWhereNotIn('S.invoice_status_id', [self::VOID, self::CANCELLED]))
             ->where('S.total_service_fee', '>', 0)
             ->whereNotExists(fn ($q) => $q->select(DB::raw(1))->from('t_payment as P')->whereColumn('P.trans_number', 'S.trans_number'))
             ->get();
@@ -522,7 +522,9 @@ class IMSDashboardController extends MonitoringController
                 return ['id' => $s->id] + $who($s->ca_id) + [
                     'type' => $type($s), 'service' => (string) ($names[$s->ser_list_id] ?? ''), 'period' => $s->service_period,
                     'trans_number' => $s->trans_number, 'date_billed' => $billed ? substr((string) $billed, 0, 10) : '',
-                    'months_unpaid' => $age, 'amount' => $net, 'collected' => round($paid, 2), 'balance' => round($net - $paid, 2),
+                    'months_unpaid' => $age, 'amount' => $net, 'collected' => round($paid, 2),
+                    // same as the Outstanding tile: a bill marked paid has no balance, and never below 0
+                    'balance' => (int) $s->is_paid === 1 ? 0.0 : round(max(0, $net - $paid), 2),
                     'status' => (int) $s->is_paid === 1 ? 'Paid' : ($paid > 0 ? 'Partial' : 'Unpaid'),
                 ];
             })->when($d['kpi'] === 'outstanding', fn ($c) => $c->filter(fn ($r) => $r['balance'] > 0.004))

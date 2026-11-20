@@ -34,6 +34,7 @@ use Illuminate\Support\Facades\Schema;
 class MonitoringController extends Controller
 {
     const VOID = 5;
+    const CANCELLED = 9;   // t_service.invoice_status_id (Billing → Void / Cancel)
     const CLIENT_STATUSES = [2, 9, 11];
     const FILE_CODES = ['0619E', '1601Cv2018', '2550Qv2024', '1701Qv2018', '2551Qv2018', '1601EQ', '2550M'];
 
@@ -1750,7 +1751,7 @@ class MonitoringController extends Controller
         return $all->filter(fn ($p) => !str_starts_with($p, 'EO-') && ($t = strtotime('1 ' . $p)) && $t < $limit)->values()->all();
     }
 
-    /** t_service lines of a type in some periods (void lines left out) */
+    /** t_service lines of a type in some periods (void / cancelled lines left out) */
     protected function rfServices(array $listIds, array $periods, array $cols, bool $unpaidOnly = false, ?array $caIds = null)
     {
         if (!$listIds || !$periods) return collect();
@@ -1758,7 +1759,7 @@ class MonitoringController extends Controller
             ->select(array_values(array_unique([...$cols, ...self::RF_NET_COLS])))
             ->whereIn('ser_list_id', $listIds)
             ->whereIn('service_period', $periods)
-            ->where(fn ($w) => $w->whereNull('invoice_status_id')->orWhere('invoice_status_id', '<>', self::VOID))
+            ->where(fn ($w) => $w->whereNull('invoice_status_id')->orWhereNotIn('invoice_status_id', [self::VOID, self::CANCELLED]))
             ->when($unpaidOnly, fn ($q) => $q->where('total_service_fee', '>', 0)
                 ->where(fn ($w) => $w->whereNull('is_paid')->orWhere('is_paid', '<>', 1)))
             ->when($caIds !== null, fn ($q) => $q->whereIn('ca_id', $caIds ?: [0]))
