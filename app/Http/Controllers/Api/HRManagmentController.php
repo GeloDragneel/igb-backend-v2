@@ -1641,6 +1641,90 @@ class HRManagmentController extends Controller
     }
 
     /* POST /lending/loans/{id}/payments   manual payment { amount, date, or_number, remarks } */
+    /* GET /lending/payments?loan_id=&member_id=&q=   loan payments to pick from (Pay → link a payment to a due) */
+    public function lendingPayments(Request $request)
+    {
+        $q = trim((string) $request->query('q', ''));
+        $rows = DB::table('t_lending_loan_payment as P')
+            ->join('t_lending_loan as L', 'L.id', '=', 'P.loan_id')
+            ->join('m_lending_member as M', 'M.id', '=', 'L.member_id')
+            ->leftJoin('t_lending_loan_schedule as S', 'S.id', '=', 'P.schedule_id')
+            ->when($request->filled('member_id'), fn ($w) => $w->where('L.member_id', (int) $request->query('member_id')))
+            ->when($request->filled('loan_id'), fn ($w) => $w->where('P.loan_id', (int) $request->query('loan_id')))
+            ->when($q !== '', fn ($w) => $w->where(fn ($x) => $x->where('P.or_number', 'like', "%{$q}%")->orWhere('L.reference_no', 'like', "%{$q}%")
+                ->orWhere('M.name', 'like', "%{$q}%")->orWhere('M.code', 'like', "%{$q}%")))
+            ->orderByDesc('P.payment_date')->orderByDesc('P.id')->limit(300)
+            ->get(['P.id', 'P.loan_id', 'P.schedule_id', 'P.payment_date', 'P.amount', 'P.payment_type', 'P.or_number', 'P.remarks',
+                'L.reference_no', 'M.name', 'M.code', 'S.due_no']);
+        return response()->json($rows);
+    }
+
+    /* POST /lending/loans/{id}/link-payment   { payment_id, schedule_id }
+       moves the payment to this loan + due, then recomputes both loans (dues filled oldest first, paid, balance, status) */
+    public function linkLoanPayment(Request $request, int $id)
+    {
+        $d = $request->validate([
+            'payment_id' => ['required', 'integer', 'exists:t_lending_loan_payment,id'],
+            'schedule_id' => ['required', 'integer', 'exists:t_lending_loan_schedule,id'],
+        ]);
+        $loan = LendingLoan::findOrFail($id);
+        abort_unless(DB::table('t_lending_loan_schedule')->where('id', $d['schedule_id'])->where('loan_id', $loan->id)->exists(), 422, 'That due is not on this loan.');
+        DB::transaction(function () use ($d, $loan) {
+            $from = (int) DB::table('t_lending_loan_payment')->where('id', $d['payment_id'])->value('loan_id');
+            DB::table('t_lending_loan_payment')->where('id', $d['payment_id'])
+                ->update(['loan_id' => $loan->id, 'schedule_id' => $d['schedule_id'], 'updated_at' => now()]);
+            $this->resyncLoan($loan->id);
+            if ($from && $from !== $loan->id) $this->resyncLoan($from);
+        });
+        return response()->json(['message' => 'Payment linked.', 'loan' => LendingLoan::with('schedules', 'payments')->find($id)]);
+    }
+
+    /** dues + paid + balance + status of a loan, from its payments in sequence:
+        payments by date (oldest first) fill the dues in order (due #1 first) · each payment is tagged with the due it paid
+        · a due's paid date = the date of the payment that completed it */
+    public function resyncLoan(int $loanId): void
+    {
+        $pays = DB::table('t_lending_loan_payment')->where('loan_id', $loanId)->orderBy('payment_date')->orderBy('id')
+            ->get(['id', 'amount', 'penalty_paid', 'payment_date']);
+        $dues = DB::table('t_lending_loan_schedule')->where('loan_id', $loanId)->orderBy('due_no')->get()->values();
+
+        $paid = []; $paidOn = [];
+        foreach ($dues as $s) { $paid[$s->id] = 0.0; $paidOn[$s->id] = null; }
+        $i = 0; $total = 0.0;
+        foreach ($pays as $p) {
+            $left = round((float) $p->amount - (float) $p->penalty_paid, 2);
+            $total += $left;
+            $first = null;
+            while ($left > 0.004 && $i < count($dues)) {
+                $s = $dues[$i];
+                $need = round((float) $s->amount_due - $paid[$s->id], 2);
+                if ($need <= 0.004) { $i++; continue; }
+                $first ??= $s->id;
+                $take = min($need, $left);
+                $paid[$s->id] = round($paid[$s->id] + $take, 2);
+                $left = round($left - $take, 2);
+                if ($paid[$s->id] >= (float) $s->amount_due - 0.004) { $paidOn[$s->id] = $p->payment_date; $i++; }
+            }
+            // the payment points to the due it went to (extra after the last due → last due)
+            $first ??= $dues->last()->id ?? null;
+            DB::table('t_lending_loan_payment')->where('id', $p->id)->update(['schedule_id' => $first]);
+        }
+
+        foreach ($dues as $s) {
+            $full = $paid[$s->id] >= (float) $s->amount_due - 0.01;
+            DB::table('t_lending_loan_schedule')->where('id', $s->id)->update([
+                'amount_paid' => $paid[$s->id], 'status' => $full ? 'paid' : 'unpaid',
+                'paid_date' => $full ? $paidOn[$s->id] : null, 'updated_at' => now(),
+            ]);
+        }
+
+        $loan = DB::table('t_lending_loan')->where('id', $loanId)->first();
+        $balance = round(max(0, (float) $loan->total_payable - $total), 2);
+        $set = ['total_paid' => round($total, 2), 'balance' => $balance, 'updated_at' => now()];
+        if (in_array($loan->status, ['released', 'paid'], true)) $set['status'] = $balance <= 0.01 ? 'paid' : 'released';
+        DB::table('t_lending_loan')->where('id', $loanId)->update($set);
+    }
+
     public function payLoan(Request $request, int $id)
     {
         $d = $request->validate([

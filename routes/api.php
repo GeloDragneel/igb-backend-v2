@@ -668,6 +668,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/lending/loans/{id}/release', [HR::class, 'releaseLoan']);
     Route::post('/lending/loans/{id}/payments', [HR::class, 'payLoan']);
     Route::get('/lending/dashboard', [HR::class, 'lendingDashboard']);
+    Route::get('/lending/payments', [HR::class, 'lendingPayments']);
+    Route::post('/lending/loans/{id}/link-payment', [HR::class, 'linkLoanPayment']);
     
     // ---------- My profile (the logged-in staff) → ProfileController ----------
     // add at the top of routes/api.php:  use App\Http\Controllers\Api\ProfileController;
