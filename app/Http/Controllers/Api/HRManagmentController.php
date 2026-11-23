@@ -1571,6 +1571,172 @@ class HRManagmentController extends Controller
         return response()->json(['message' => 'Cash-out of ' . number_format($res['paid'], 2) . ' saved.'] + $res);
     }
 
+    /* ================= PROFIT SHARE (the IGBLending capital-share sheet) =================
+       capital share %  = investor's capital ÷ total capital (all investments)
+       profit share     = capital share % × net profit (interest of the paid loan dues)
+       months           = full months invested, in half months (8, 8.5, 9 …), counted per deposit / top-up, at most the period
+       interest earned  = profit share × months ÷ period months          (what is not earned stays with management)
+       cash-out         = capital + interest earned − interest already credited */
+    private function profitShare(LendingInvestment $inv, string $asOf, float $period): array
+    {
+        $period = max(1, $period);
+        $totalCapital = (float) LendingInvestment::query()->sum('total_invested');
+        $profit = (float) DB::table('t_lending_loan_schedule as S')->join('t_lending_loan as L', 'L.id', '=', 'S.loan_id')
+            ->whereIn('L.status', ['released', 'paid'])->where('S.status', 'paid')->sum('S.interest_due');
+        $end = CarbonImmutable::parse($asOf)->startOfDay();
+
+        $rows = [];
+        $weighted = 0.0;
+        $deposits = DB::table('t_lending_investment_txn')->where('investment_id', $inv->id)
+            ->whereIn('txn_type', ['deposit', 'top_up'])->orderBy('txn_date')->orderBy('id')->get(['txn_date', 'amount']);
+        foreach ($deposits as $t) {
+            $from = CarbonImmutable::parse($t->txn_date)->startOfDay();
+            $months = 0.0;
+            if ($end->greaterThan($from)) {
+                $full = (int) $from->diffInMonths($end);
+                $days = (int) $from->addMonthsNoOverflow($full)->diffInDays($end);
+                $months = $full + ($days >= 15 ? 0.5 : 0);
+            }
+            $use = min($months, $period);
+            $weighted += (float) $t->amount * $use / $period;
+            $rows[] = ['date' => $t->txn_date, 'amount' => round((float) $t->amount, 2), 'months' => $months, 'pct' => round($use / $period * 100, 4)];
+        }
+
+        $invested = (float) $inv->total_invested;
+        $scale = $invested > 0 ? (float) $inv->principal_balance / $invested : 0;   // part already cashed out earns nothing more
+        $sharePct = $totalCapital > 0 ? $invested / $totalCapital : 0;
+        $shareFull = $sharePct * $profit;                                            // M − K in the sheet
+        $earned = $totalCapital > 0 ? $profit * $weighted / $totalCapital * $scale : 0;
+        $already = (float) $inv->total_interest_earned;
+        $interest = round(max(0, $earned - $already), 2);
+
+        return [
+            'as_of' => $end->toDateString(), 'period_months' => $period,
+            'capital' => round((float) $inv->principal_balance, 2), 'total_invested' => round($invested, 2),
+            'total_capital' => round($totalCapital, 2), 'profit' => round($profit, 2),
+            'share_pct' => round($sharePct * 100, 4), 'share_full' => round($shareFull, 2),
+            'deposits' => $rows, 'earned' => round($earned, 2), 'already_credited' => round($already, 2),
+            'interest' => $interest, 'total' => round((float) $inv->principal_balance + (float) $inv->interest_balance + $interest, 2),
+            'interest_balance' => round((float) $inv->interest_balance, 2),
+        ];
+    }
+
+    /* GET /lending/cashout-sheet?as_of=&period=11&q=&page=&per_page=&sort=&dir=
+       every active investment: capital · share % · profit share · months · interest earned · capital + interest (the capital-share sheet)
+       totals: for shareholders = Σ capital + interest · for management = profit − Σ interest earned */
+    public function cashoutSheet(Request $request)
+    {
+        $asOf = $request->query('as_of') ?: LendingCalculator::today();
+        $period = max(1, (float) $request->query('period', 11));
+        $q = trim((string) $request->query('q', ''));
+
+        $invs = LendingInvestment::query()->with('member:id,code,name')->where('status', 'active')
+            ->when($q !== '', fn ($w) => $w->where(fn ($x) => $x->where('reference_no', 'like', "%{$q}%")
+                ->orWhereHas('member', fn ($m) => $m->where('name', 'like', "%{$q}%")->orWhere('code', 'like', "%{$q}%"))))
+            ->get();
+        $rows = $invs->map(function (LendingInvestment $inv) use ($asOf, $period) {
+            $s = $this->profitShare($inv, $asOf, $period);
+            $amt = array_sum(array_column($s['deposits'], 'amount'));
+            $months = $amt > 0 ? array_sum(array_map(fn ($d) => $d['amount'] * $d['months'], $s['deposits'])) / $amt : 0;
+            return [
+                'id' => $inv->id, 'reference_no' => $inv->reference_no, 'name' => $inv->member?->name, 'code' => $inv->member?->code,
+                'date_invested' => $inv->date_invested, 'deposits' => count($s['deposits']),
+                'capital' => $s['capital'], 'share_pct' => $s['share_pct'], 'share_full' => $s['share_full'],
+                'months' => round($months, 2), 'months_pct' => round(min($months, $period) / $period * 100, 4),
+                'earned' => $s['earned'], 'already_credited' => $s['already_credited'], 'interest' => $s['interest'],
+                'capital_interest' => round($s['capital'] + $s['interest'] + $s['interest_balance'], 2),
+                'cashed_out' => round((float) $inv->total_cashed_out, 2),
+                '_profit' => $s['profit'], '_total_capital' => $s['total_capital'],
+            ];
+        });
+
+        $sorts = ['reference_no', 'name', 'capital', 'share_pct', 'months', 'interest', 'capital_interest', 'cashed_out', 'date_invested'];
+        $sort = in_array($request->query('sort'), $sorts, true) ? $request->query('sort') : 'reference_no';
+        $desc = strtolower((string) $request->query('dir', 'desc')) !== 'asc';
+        $rows = $rows->sortBy($sort, SORT_NATURAL | SORT_FLAG_CASE, $desc)->values();
+
+        $profit = (float) ($rows->first()['_profit'] ?? 0);
+        $totalCapital = (float) ($rows->first()['_total_capital'] ?? LendingInvestment::query()->sum('total_invested'));
+        $sumInterest = (float) $rows->sum('interest') + (float) $rows->sum('already_credited');
+        $totals = [
+            'capital' => round($rows->sum('capital'), 2), 'interest' => round($rows->sum('interest'), 2),
+            'capital_interest' => round($rows->sum('capital_interest'), 2), 'cashed_out' => round($rows->sum('cashed_out'), 2),
+            'profit' => round($profit, 2), 'total_capital' => round($totalCapital, 2), 'pool' => round($totalCapital + $profit, 2),
+            'for_management' => $q === '' ? round(max(0, $profit - $sumInterest), 2) : null,
+        ];
+
+        $per = min(100, max(10, (int) $request->query('per_page', 25)));
+        $total = $rows->count();
+        $page = min(max(1, (int) $request->query('page', 1)), max(1, (int) ceil($total / $per)));
+        $pageRows = $rows->forPage($page, $per)->map(fn ($r) => array_diff_key($r, ['_profit' => 1, '_total_capital' => 1]))->values();
+
+        return response()->json(['rows' => $pageRows, 'total' => $total, 'page' => $page, 'per_page' => $per,
+            'as_of' => $asOf, 'period_months' => $period, 'totals' => $totals]);
+    }
+
+    /* GET /lending/investments/{id}/share?as_of=&period=11 */
+    public function investmentShare(Request $request, int $id)
+    {
+        $inv = LendingInvestment::findOrFail($id);
+        return response()->json($this->profitShare($inv, $request->query('as_of') ?: LendingCalculator::today(), (float) $request->query('period', 11)));
+    }
+
+    /* POST /lending/investments/{id}/cashout-share   { date, period, amount (empty = all) }
+       credits the earned profit share as interest, then pays interest first, then principal · all = closes the investment */
+    public function cashoutShare(Request $request, int $id)
+    {
+        $d = $request->validate([
+            'date' => ['nullable', 'date'], 'period' => ['nullable', 'numeric', 'min:1', 'max:120'],
+            'amount' => ['nullable', 'numeric', 'min:0.01'],
+        ]);
+        $date = $d['date'] ?? LendingCalculator::today();
+        $me = $this->me($request);
+
+        $res = DB::transaction(function () use ($id, $d, $date, $me) {
+            $inv = LendingInvestment::query()->lockForUpdate()->findOrFail($id);
+            abort_if($inv->status !== 'active', 422, "This investment is {$inv->status}.");
+            $s = $this->profitShare($inv, $date, (float) ($d['period'] ?? 11));
+            $now = now();
+            $principal = (float) $inv->principal_balance;
+            $interestBal = round((float) $inv->interest_balance + $s['interest'], 2);
+
+            if ($s['interest'] > 0) {
+                DB::table('t_lending_investment_txn')->insert([
+                    'investment_id' => $inv->id, 'txn_type' => 'interest', 'txn_date' => $date, 'amount' => $s['interest'], 'days' => null,
+                    'principal_after' => round($principal, 2), 'interest_after' => $interestBal,
+                    'remarks' => "Profit share · {$s['share_pct']}% of " . number_format($s['profit'], 2) . " · period {$s['period_months']} mo",
+                    'created_at' => $now, 'updated_at' => $now,
+                ]);
+            }
+
+            $want = isset($d['amount']) ? min((float) $d['amount'], $principal + $interestBal) : $principal + $interestBal;
+            $payInt = round(min($want, $interestBal), 2);
+            $payPrin = round(min($want - $payInt, $principal), 2);
+            $interestBal = round($interestBal - $payInt, 2);
+            $principal = round($principal - $payPrin, 2);
+            foreach ([['cashout_interest', $payInt, 'Cash-out · interest'], ['cashout_principal', $payPrin, 'Cash-out · principal']] as [$type, $amt, $label]) {
+                if ($amt <= 0) continue;
+                DB::table('t_lending_investment_txn')->insert([
+                    'investment_id' => $inv->id, 'txn_type' => $type, 'txn_date' => $date, 'amount' => $amt, 'days' => null,
+                    'principal_after' => $type === 'cashout_interest' ? round($principal + $payPrin, 2) : $principal,
+                    'interest_after' => $interestBal, 'remarks' => $label, 'created_at' => $now, 'updated_at' => $now,
+                ]);
+            }
+
+            $closed = $principal <= 0.004 && $interestBal <= 0.004;
+            $inv->forceFill([
+                'principal_balance' => $principal, 'interest_balance' => $interestBal,
+                'total_interest_earned' => round((float) $inv->total_interest_earned + $s['interest'], 2),
+                'total_cashed_out' => round((float) $inv->total_cashed_out + $payInt + $payPrin, 2),
+                'last_accrual_date' => $date,
+            ] + ($closed ? ['status' => 'closed', 'closed_at' => $date] : []))->save();
+
+            return ['paid' => round($payInt + $payPrin, 2), 'interest_paid' => $payInt, 'principal_paid' => $payPrin, 'closed' => $closed, 'share' => $s];
+        });
+
+        return response()->json(['message' => 'Cash-out of ' . number_format($res['paid'], 2) . ' saved.'] + $res);
+    }
+
     /* GET /lending/loans?status=&member_id= */
     public function loans(Request $request)
     {
