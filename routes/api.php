@@ -667,6 +667,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::put('/lending/loans/{id}/{action}', [HR::class, 'decideLoan'])->whereIn('action', ['approve', 'reject', 'cancel']);
     Route::post('/lending/loans/{id}/release', [HR::class, 'releaseLoan']);
     Route::post('/lending/loans/{id}/payments', [HR::class, 'payLoan']);
+    Route::get('/lending/dashboard', [HR::class, 'lendingDashboard']);
     
     // ---------- My profile (the logged-in staff) → ProfileController ----------
     // add at the top of routes/api.php:  use App\Http\Controllers\Api\ProfileController;
@@ -681,6 +682,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::get('/hr/dashboard', [HRDashboardController::class, 'dashboard']);
     Route::get('/hr/birthdays-today', [ProfileController::class, 'birthdaysToday']);
+
 
     // ---------- VAT Summary ----------
     Route::get('/reports/vat-clients/lookups', [ReportController::class, 'vatClientsLookups']);

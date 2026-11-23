@@ -14,8 +14,11 @@ class LendingLoanPayment extends Model
         'schedule_id',
         'payment_date',
         'amount',
+        'principal_paid',
+        'interest_paid',
         'penalty_paid',
         'source',
+        'payment_type',
         'payroll_item_id',
         'or_number',
         'remarks',
@@ -23,9 +26,11 @@ class LendingLoanPayment extends Model
     ];
 
     protected $casts = [
-        'payment_date' => 'date:Y-m-d',
-        'amount'       => 'decimal:2',
-        'penalty_paid' => 'decimal:2',
+        'payment_date'   => 'date:Y-m-d',
+        'amount'         => 'decimal:2',
+        'principal_paid' => 'decimal:2',
+        'interest_paid'  => 'decimal:2',
+        'penalty_paid'   => 'decimal:2',
     ];
 
     public function loan(): BelongsTo

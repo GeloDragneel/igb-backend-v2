@@ -1387,12 +1387,61 @@ class HRManagmentController extends Controller
         ]);
     }
 
+    /* GET /lending/dashboard   the IGBLending Excel dashboard
+       capital        = total investment + net profit
+       cash balance   = total investment + total collected − total lent − withdrawal
+       total lent     = principal of every released / paid loan
+       collected      = dues marked paid (amount · principal part) · net profit = interest of the paid dues
+       receivable     = dues not paid yet (amount · outstanding principal · future interest)
+       overdue        = unpaid dues before today · due today = unpaid dues of today */
+    public function lendingDashboard()
+    {
+        $today = LendingCalculator::today();
+        $live = ['released', 'paid'];
+
+        $invested = (float) LendingInvestment::query()->sum('total_invested');
+        $withdrawn = (float) LendingInvestment::query()->sum('total_cashed_out');
+        $lent = (float) LendingLoan::query()->whereIn('status', $live)->sum('principal');
+
+        $dues = DB::table('t_lending_loan_schedule as S')->join('t_lending_loan as L', 'L.id', '=', 'S.loan_id')->whereIn('L.status', $live);
+        $paid = (clone $dues)->where('S.status', 'paid')
+            ->selectRaw('COALESCE(SUM(S.amount_due),0) AS amount, COALESCE(SUM(S.principal_due),0) AS principal, COALESCE(SUM(S.interest_due),0) AS interest')->first();
+        $open = (clone $dues)->where('S.status', '<>', 'paid')
+            ->selectRaw('COALESCE(SUM(S.amount_due - S.amount_paid),0) AS amount, COALESCE(SUM(S.principal_due),0) AS principal, COALESCE(SUM(S.interest_due),0) AS interest')->first();
+
+        $list = fn ($q) => $q->join('m_lending_member as M', 'M.id', '=', 'L.member_id')
+            ->where('S.status', '<>', 'paid')->where('L.status', 'released')
+            ->orderBy('S.due_date')->orderBy('M.name')
+            ->get(['S.id', 'L.id as loan_id', 'L.reference_no', 'L.deduction_mode', 'M.code', 'M.name', 'S.due_no', 'S.due_date',
+                DB::raw('ROUND(S.amount_due - S.amount_paid, 2) AS amount'), 'S.penalty', DB::raw("DATEDIFF('{$today}', S.due_date) AS days_late")]);
+        $base = fn () => DB::table('t_lending_loan_schedule as S')->join('t_lending_loan as L', 'L.id', '=', 'S.loan_id');
+
+        $r = fn ($v) => round((float) $v, 2);
+        return response()->json([
+            'as_of'               => $today,
+            'capital'             => $r($invested + $paid->interest),
+            'total_investment'    => $r($invested),
+            'cash_balance'        => $r($invested + $paid->amount - $lent - $withdrawn),
+            'withdrawal'          => $r($withdrawn),
+            'total_lent'          => $r($lent),
+            'total_collected'     => $r($paid->amount),
+            'collected_principal' => $r($paid->principal),
+            'net_profit'          => $r($paid->interest),
+            'total_receivable'    => $r($open->amount),
+            'outstanding_principal' => $r($open->principal),
+            'future_interest'     => $r($open->interest),
+            'overdue'             => $list($base()->where('S.due_date', '<', $today)),
+            'due_today'           => $list($base()->where('S.due_date', $today)),
+        ]);
+    }
+
     /* POST /lending/settings   PUT /lending/settings/{id} */
     public function saveLendingSetting(Request $request, ?int $id = null)
     {
         $d = $request->validate([
             'name' => ['required', 'string', 'max:100'], 'applies_to' => ['required', 'in:loan,investment'],
-            'interest_type' => ['required', 'in:per_day,per_month,fixed'], 'interest_rate' => ['nullable', 'numeric', 'min:0', 'max:1'],
+            // flat = the IGBLending Excel rule: the rate is per due, on the original amount (loans only)
+            'interest_type' => ['required', 'in:per_day,per_month,fixed,flat'], 'interest_rate' => ['nullable', 'numeric', 'min:0', 'max:1'],
             'fixed_interest' => ['nullable', 'numeric', 'min:0'], 'min_amount' => ['nullable', 'numeric', 'min:0'],
             'max_amount' => ['nullable', 'numeric', 'min:0'], 'max_term_months' => ['nullable', 'integer', 'min:1', 'max:120'],
             'penalty_rate_per_day' => ['nullable', 'numeric', 'min:0', 'max:1'], 'lock_in_days' => ['nullable', 'integer', 'min:0'],
@@ -1441,6 +1490,7 @@ class HRManagmentController extends Controller
     {
         $d = $request->validate([
             'member_type' => ['required', 'in:employee,outside'],
+            'code' => ['nullable', 'string', 'max:10', Rule::unique('m_lending_member', 'code')->ignore($id)],
             'employee_id' => ['nullable', 'required_if:member_type,employee', 'integer', 'exists:m_employee,id', Rule::unique('m_lending_member', 'employee_id')->ignore($id)],
             'name' => ['nullable', 'required_if:member_type,outside', 'string', 'max:150'],
             'contact_no' => ['nullable', 'string', 'max:30'], 'email' => ['nullable', 'email', 'max:150'], 'address' => ['nullable', 'string', 'max:255'],
@@ -1459,7 +1509,7 @@ class HRManagmentController extends Controller
     public function investments(Request $request)
     {
         $today = LendingCalculator::today();
-        $investments = LendingInvestment::query()->with('member:id,name,member_type')
+        $investments = LendingInvestment::query()->with('member:id,code,name,member_type')
             ->when($request->query('status'), fn ($q, $v) => $q->where('status', $v))
             ->orderByDesc('date_invested')
             ->get();
@@ -1516,7 +1566,7 @@ class HRManagmentController extends Controller
     /* GET /lending/loans?status=&member_id= */
     public function loans(Request $request)
     {
-        return response()->json(LendingLoan::query()->with('member:id,name,member_type')
+        return response()->json(LendingLoan::query()->with('member:id,code,name,member_type')
             ->when($request->query('status'), fn ($q, $v) => $q->where('status', $v))
             ->when($request->query('member_id'), fn ($q, $v) => $q->where('member_id', $v))
             ->orderByDesc('id')->limit(1000)->get());
@@ -1555,12 +1605,14 @@ class HRManagmentController extends Controller
     private function loanInput(Request $request): array
     {
         return $request->validate([
+            // flat loans: term_months = the number of dues (Excel "Terms"), the rate is per due
             'principal' => ['required', 'numeric', 'min:1'], 'term_months' => ['required', 'integer', 'min:1', 'max:120'],
             'lending_setting_id' => ['nullable', 'integer', 'exists:m_lending_setting,id'],
-            'interest_type' => ['nullable', 'in:per_day,per_month,fixed'], 'interest_rate' => ['nullable', 'numeric', 'min:0', 'max:1'],
+            'interest_type' => ['nullable', 'in:per_day,per_month,fixed,flat'], 'interest_rate' => ['nullable', 'numeric', 'min:0', 'max:1'],
             'fixed_interest' => ['nullable', 'numeric', 'min:0'], 'penalty_rate_per_day' => ['nullable', 'numeric', 'min:0', 'max:1'],
-            'due_frequency' => ['nullable', 'in:monthly,semi_monthly'], 'deduction_mode' => ['nullable', 'in:payroll,manual'],
+            'due_frequency' => ['nullable', 'in:monthly,semi_monthly,weekly'], 'deduction_mode' => ['nullable', 'in:payroll,manual'],
             'date_released' => ['nullable', 'date'], 'purpose' => ['nullable', 'string', 'max:255'],
+            'co_maker' => ['nullable', 'string', 'max:150'], 'collection_method' => ['nullable', 'string', 'max:30'],
         ]);
     }
 

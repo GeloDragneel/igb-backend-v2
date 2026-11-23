@@ -19,6 +19,6 @@ class AppServiceProvider extends ServiceProvider
      */
     public function boot(): void
     {
-        //
+        $this->app->bind(\App\Services\LendingCalculator::class, \App\Services\LendingFlatCalculator::class);
     }
 }

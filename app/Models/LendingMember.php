@@ -11,6 +11,7 @@ class LendingMember extends Model
     protected $table = 'm_lending_member';
 
     protected $fillable = [
+        'code',
         'member_type',
         'employee_id',
         'name',
