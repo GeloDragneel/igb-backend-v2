@@ -1409,11 +1409,6 @@ class HRManagmentController extends Controller
         $open = (clone $dues)->where('S.status', '<>', 'paid')
             ->selectRaw('COALESCE(SUM(S.amount_due - S.amount_paid),0) AS amount, COALESCE(SUM(S.principal_due),0) AS principal, COALESCE(SUM(S.interest_due),0) AS interest')->first();
 
-        $list = fn ($q) => $q->join('m_lending_member as M', 'M.id', '=', 'L.member_id')
-            ->where('S.status', '<>', 'paid')->where('L.status', 'released')
-            ->orderBy('S.due_date')->orderBy('M.name')
-            ->get(['S.id', 'L.id as loan_id', 'L.reference_no', 'L.deduction_mode', 'M.code', 'M.name', 'S.due_no', 'S.due_date',
-                DB::raw('ROUND(S.amount_due - S.amount_paid, 2) AS amount'), 'S.penalty', DB::raw("DATEDIFF('{$today}', S.due_date) AS days_late")]);
         $base = fn () => DB::table('t_lending_loan_schedule as S')->join('t_lending_loan as L', 'L.id', '=', 'S.loan_id');
 
         $r = fn ($v) => round((float) $v, 2);
@@ -1430,8 +1425,8 @@ class HRManagmentController extends Controller
             'total_receivable'    => $r($open->amount),
             'outstanding_principal' => $r($open->principal),
             'future_interest'     => $r($open->interest),
-            'overdue'             => $list($base()->where('S.due_date', '<', $today)),
-            'due_today'           => $list($base()->where('S.due_date', $today)),
+            'overdue_count'       => $base()->where('S.status', '<>', 'paid')->where('L.status', 'released')->where('S.due_date', '<', $today)->count(),
+            'due_today_count'     => $base()->where('S.status', '<>', 'paid')->where('L.status', 'released')->where('S.due_date', $today)->count(),
         ]);
     }
 
@@ -1509,16 +1504,29 @@ class HRManagmentController extends Controller
     public function investments(Request $request)
     {
         $today = LendingCalculator::today();
-        $investments = LendingInvestment::query()->with('member:id,code,name,member_type')
+        $query = LendingInvestment::query()->with('member:id,code,name,member_type')
             ->when($request->query('status'), fn ($q, $v) => $q->where('status', $v))
-            ->orderByDesc('date_invested')
-            ->get();
+            ->when(trim((string) $request->query('q')), fn ($q, $v) => $q->where(fn ($w) => $w->where('reference_no', 'like', "%{$v}%")
+                ->orWhereHas('member', fn ($m) => $m->where('name', 'like', "%{$v}%")->orWhere('code', 'like', "%{$v}%"))));
 
-        $rows = $investments->map(fn (LendingInvestment $inv) => $inv->toArray() + [
+        // ?sort=&dir=asc|desc  (only these columns)
+        $sorts = ['reference_no' => 'reference_no', 'date_invested' => 'date_invested', 'interest' => 'interest_rate',
+            'principal_balance' => 'principal_balance', 'status' => 'status'];
+        $dir = strtolower((string) $request->query('dir')) === 'asc' ? 'asc' : 'desc';
+        $sort = (string) $request->query('sort', '');
+        if ($sort === 'member') {
+            $query->orderBy(LendingMember::query()->select('name')->whereColumn('m_lending_member.id', 't_lending_investment.member_id'), $dir);
+        } elseif (isset($sorts[$sort])) {
+            $query->orderBy($sorts[$sort], $dir);
+        }
+        $query->orderByDesc('date_invested')->orderByDesc('id');
+        $row = fn (LendingInvestment $inv) => $inv->toArray() + [
             'today' => $inv->status === 'active' ? $this->lending->preview($inv, $today) : null,
-        ]);
+        ];
 
-        return response()->json($rows);
+        // ?page= → only that page is read from the database
+        if ($request->filled('page')) return response()->json($this->pageOf($request, $query, $row));
+        return response()->json($query->get()->map($row));
     }
 
     /* GET /lending/investments/{id}?as_of=   statement + "if cashed out on" value */
@@ -1566,10 +1574,42 @@ class HRManagmentController extends Controller
     /* GET /lending/loans?status=&member_id= */
     public function loans(Request $request)
     {
-        return response()->json(LendingLoan::query()->with('member:id,code,name,member_type')
+        $query = LendingLoan::query()->with('member:id,code,name,member_type')
             ->when($request->query('status'), fn ($q, $v) => $q->where('status', $v))
             ->when($request->query('member_id'), fn ($q, $v) => $q->where('member_id', $v))
-            ->orderByDesc('id')->limit(1000)->get());
+            ->when(trim((string) $request->query('q')), fn ($q, $v) => $q->where(fn ($w) => $w->where('reference_no', 'like', "%{$v}%")
+                ->orWhere('purpose', 'like', "%{$v}%")->orWhere('co_maker', 'like', "%{$v}%")->orWhere('collection_method', 'like', "%{$v}%")
+                ->orWhereHas('member', fn ($m) => $m->where('name', 'like', "%{$v}%")->orWhere('code', 'like', "%{$v}%"))));
+
+        // ?sort=&dir=asc|desc  (only these columns)
+        $sorts = [
+            'reference_no' => 'reference_no', 'date_released' => 'date_released', 'interest' => 'interest_rate', 'term' => 'dues',
+            'principal' => 'principal', 'total_payable' => 'total_payable', 'amount_per_due' => 'amount_per_due',
+            'total_paid' => 'total_paid', 'balance' => 'balance', 'deduction_mode' => 'deduction_mode', 'status' => 'status',
+        ];
+        $dir = strtolower((string) $request->query('dir')) === 'asc' ? 'asc' : 'desc';
+        $sort = (string) $request->query('sort', '');
+        if ($sort === 'member') {
+            $query->orderBy(LendingMember::query()->select('name')->whereColumn('m_lending_member.id', 't_lending_loan.member_id'), $dir);
+        } elseif (isset($sorts[$sort])) {
+            $query->orderBy($sorts[$sort], $dir);
+        }
+        $query->orderByDesc('id');
+
+        // ?page= → only that page is read from the database
+        if ($request->filled('page')) return response()->json($this->pageOf($request, $query));
+        return response()->json($query->limit(1000)->get());
+    }
+
+    /** one page of a query: { rows, total, page, per_page } · per_page 10–100 */
+    private function pageOf(Request $request, $query, ?callable $map = null): array
+    {
+        $per = min(100, max(10, (int) $request->query('per_page', 25)));
+        $count = clone $query;
+        $total = ($count instanceof \Illuminate\Database\Eloquent\Builder ? $count->toBase() : $count)->getCountForPagination();
+        $page = min(max(1, (int) $request->query('page', 1)), max(1, (int) ceil($total / $per)));
+        $rows = $query->forPage($page, $per)->get();
+        return ['rows' => $map ? $rows->map($map)->values() : $rows, 'total' => $total, 'page' => $page, 'per_page' => $per];
     }
 
     /* GET /lending/loans/{id} */
@@ -1641,6 +1681,27 @@ class HRManagmentController extends Controller
     }
 
     /* POST /lending/loans/{id}/payments   manual payment { amount, date, or_number, remarks } */
+    /* GET /lending/dues?type=overdue|due_today&q=&page=&per_page=   unpaid dues of released loans, one page at a time */
+    public function lendingDues(Request $request)
+    {
+        $today = LendingCalculator::today();
+        $base = fn () => DB::table('t_lending_loan_schedule as S')->join('t_lending_loan as L', 'L.id', '=', 'S.loan_id')
+            ->join('m_lending_member as M', 'M.id', '=', 'L.member_id')
+            ->where('S.status', '<>', 'paid')->where('L.status', 'released');
+        $q = trim((string) $request->query('q', ''));
+        $query = $base()->where('S.due_date', $request->query('type') === 'due_today' ? '=' : '<', $today)
+            ->when($q !== '', fn ($w) => $w->where(fn ($x) => $x->where('L.reference_no', 'like', "%{$q}%")
+                ->orWhere('M.name', 'like', "%{$q}%")->orWhere('M.code', 'like', "%{$q}%")))
+            ->orderBy('S.due_date')->orderBy('M.name')->orderBy('S.id')
+            ->select(['S.id', 'L.id as loan_id', 'L.reference_no', 'L.deduction_mode', 'M.code', 'M.name', 'S.due_no', 'S.due_date',
+                DB::raw('ROUND(S.amount_due - S.amount_paid, 2) AS amount'), 'S.penalty', DB::raw("DATEDIFF('{$today}', S.due_date) AS days_late")]);
+
+        return response()->json($this->pageOf($request, $query) + [
+            'overdue_count'   => $base()->where('S.due_date', '<', $today)->count(),
+            'due_today_count' => $base()->where('S.due_date', $today)->count(),
+        ]);
+    }
+
     /* GET /lending/payments?loan_id=&member_id=&q=   loan payments to pick from (Pay → link a payment to a due) */
     public function lendingPayments(Request $request)
     {
