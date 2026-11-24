@@ -9,7 +9,7 @@ use Illuminate\Support\Facades\Schema;
 
 /**
  * Client → Masterlist → Engagement → Print
- *   Engagement / Disengagement letter: Word template (resources/templates/*.docx) → filled → LibreOffice → PDF
+ *   Engagement / Disengagement letter: Word template (resources/templates/*.docx) → filled → A4 · header on page 1 only → LibreOffice → PDF
  *
  * routes/api.php (inside the auth:sanctum group):
  *   use App\Http\Controllers\Api\ClientLetterController;
@@ -300,9 +300,91 @@ class ClientLetterController extends Controller
         abort_unless($zip->open($docx) === true, 500, "Couldn't open the letter template.");
         $xml = $zip->getFromName('word/document.xml');
         $safe = array_map(fn ($x) => htmlspecialchars((string) $x, ENT_XML1 | ENT_QUOTES, 'UTF-8'), $values);
-        $zip->addFromString('word/document.xml', strtr($xml, $safe));
+        $xml = $this->smallTitles($this->headerFirstPageOnly($this->a4(strtr($xml, $safe))));
+        $zip->addFromString('word/document.xml', $this->letterheadOnPageOne($zip, $xml));
         $zip->close();
         return $docx;
+    }
+
+    /** paper = A4 (210 × 297 mm = 11906 × 16838 twips) on every section of the letter, whatever size the Word template was saved with */
+    private function a4(string $xml): string
+    {
+        $size = '<w:pgSz w:w="11906" w:h="16838"/>';
+        $xml = preg_replace('/<w:pgSz\b[^>]*\/>/', $size, $xml, -1, $n);
+        if (!$n) {
+            // no paper size saved in the template → add one to each section
+            $xml = preg_replace('/<w:sectPr\b([^>]*)>/', '<w:sectPr$1>' . $size, $xml);
+        }
+        return $xml;
+    }
+
+    /** header on page 1 only: page 1 uses the template's header, page 2 onward has none (the footer stays on every page) */
+    private function headerFirstPageOnly(string $xml): string
+    {
+        return preg_replace_callback('/<w:sectPr\b[^>]*>.*?<\/w:sectPr>/s', function ($m) {
+            $sec = $m[0];
+            $ref = fn (string $kind, string $type) => preg_match('/<w:' . $kind . 'Reference\b[^>]*w:type="' . $type . '"[^>]*\/>/', $sec, $r) ? $r[0] : null;
+
+            $hDefault = $ref('header', 'default');
+            if (!$hDefault) return $sec;                                   // no header in this section
+
+            // page 1 → the header that shows today (the "first page" one if the template already has it, else the default one)
+            if (!$ref('header', 'first')) $sec = str_replace($hDefault, str_replace('w:type="default"', 'w:type="first"', $hDefault), $sec);
+            else $sec = str_replace($hDefault, '', $sec);
+            $sec = preg_replace('/<w:headerReference\b[^>]*w:type="even"[^>]*\/>/', '', $sec);   // no header on page 2+ (even pages too)
+
+            // the footer keeps showing on page 1 too
+            $fDefault = $ref('footer', 'default');
+            if ($fDefault && !$ref('footer', 'first')) {
+                $sec = str_replace($fDefault, $fDefault . str_replace('w:type="default"', 'w:type="first"', $fDefault), $sec);
+            }
+
+            // "different first page" on (titlePg sits before textDirection / bidi / rtlGutter / docGrid / printerSettings)
+            if (!preg_match('/<w:titlePg\b/', $sec)) {
+                $sec = preg_match('/<w:(textDirection|bidi|rtlGutter|docGrid|printerSettings)\b/', $sec, $t, PREG_OFFSET_CAPTURE)
+                    ? substr_replace($sec, '<w:titlePg/>', $t[0][1], 0)
+                    : str_replace('</w:sectPr>', '<w:titlePg/></w:sectPr>', $sec);
+            }
+            return $sec;
+        }, $xml);
+    }
+
+    /** page 2 onward starts near the top: the big top margin (made for the letterhead) is kept on page 1 only
+        → top margin 1.5 cm, and the page-1 header gets an empty line as tall as the old margin so page 1 looks the same */
+    private function letterheadOnPageOne(\ZipArchive $zip, string $xml): string
+    {
+        $newTop = 851;                                                                  // 1.5 cm
+        if (!preg_match('/<w:pgMar\b[^>]*w:top="(\d+)"/', $xml, $m) || (int) $m[1] <= $newTop) return $xml;
+        $oldTop = (int) $m[1];
+        if (!preg_match('/<w:headerReference\b[^>]*w:type="first"[^>]*r:id="([^"]+)"/', $xml, $h)
+            && !preg_match('/<w:headerReference\b[^>]*r:id="([^"]+)"[^>]*w:type="first"/', $xml, $h)) return $xml;
+        $rels = (string) $zip->getFromName('word/_rels/document.xml.rels');
+        if (!preg_match('/<Relationship\b[^>]*Id="' . preg_quote($h[1], '/') . '"[^>]*Target="([^"]+)"/', $rels, $t)
+            && !preg_match('/<Relationship\b[^>]*Target="([^"]+)"[^>]*Id="' . preg_quote($h[1], '/') . '"/', $rels, $t)) return $xml;
+        $path = 'word/' . ltrim($t[1], '/');
+        $hdr = $zip->getFromName($path);
+        if ($hdr === false) return $xml;
+
+        // header distance from the page edge + the spacer = where the text of page 1 starts (= the old top margin)
+        $dist = preg_match('/<w:pgMar\b[^>]*w:header="(\d+)"/', $xml, $d) ? (int) $d[1] : 0;
+        $spacer = '<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="' . max(240, $oldTop - $dist) . '" w:lineRule="exact"/>'
+            . '<w:rPr><w:sz w:val="2"/></w:rPr></w:pPr></w:p>';
+        // the header's own (picture-only) paragraphs take no height
+        $hdr = preg_replace('/<w:p>(?=<w:pPr>|<w:r>)/', '<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="20" w:lineRule="exact"/></w:pPr>', $hdr, -1);
+        $hdr = preg_replace('/<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="20" w:lineRule="exact"\/><\/w:pPr><w:pPr>/', '<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="20" w:lineRule="exact"/>', $hdr);
+        $zip->addFromString($path, str_replace('</w:hdr>', $spacer . '</w:hdr>', $hdr));
+
+        return preg_replace('/(<w:pgMar\b[^>]*w:top=")\d+"/', '${1}' . $newTop . '"', $xml);
+    }
+
+    /** "Title" headings (ANNEX A — …) at 16 pt instead of the big Title size */
+    private function smallTitles(string $xml): string
+    {
+        return preg_replace_callback('/<w:p>(?:(?!<\/w:p>).)*?<w:pStyle w:val="Title"\/>.*?<\/w:p>/s', fn ($m) => preg_replace(
+            ['/<w:sz w:val="\\d+"\/>|<w:szCs w:val="\\d+"\/>/', '/<\/w:rPr>/', '/<w:r>(?!<w:rPr>)/'],
+            ['', '<w:sz w:val="32"/><w:szCs w:val="32"/></w:rPr>', '<w:r><w:rPr><w:sz w:val="32"/><w:szCs w:val="32"/></w:rPr>'],
+            $m[0]
+        ), $xml);
     }
 
     private function tempPath(string $ext): string
