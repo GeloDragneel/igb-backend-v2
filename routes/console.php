@@ -3,6 +3,7 @@
 use App\Support\Passwords;
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Schedule;
 
 Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());
@@ -14,3 +15,5 @@ Artisan::command('passwords:hash', function () {
         $this->info("{$table}: {$hashed} hashed, {$skipped} already hashed, {$empty} empty  ({$note})");
     }
 })->purpose('Hash plain-text passwords in the user tables');
+
+Schedule::command('thirdparty:sync')->dailyAt('06:10')->timezone('Asia/Manila')->withoutOverlapping();

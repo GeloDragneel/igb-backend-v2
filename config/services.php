@@ -67,6 +67,19 @@ return [
         'redirect'      => env('FACEBOOK_REDIRECT_URI'),
     ],
 
+    'aws_billing' => [
+        'key'        => env('AWS_BILLING_KEY'),
+        'secret'     => env('AWS_BILLING_SECRET'),
+        'account_id' => env('AWS_BILLING_ACCOUNT_ID'),
+    ],
+
+    'godaddy' => [
+        'key'        => env('GODADDY_API_KEY'),
+        'secret'     => env('GODADDY_API_SECRET'),
+        'shopper_id' => env('GODADDY_SHOPPER_ID'),
+        'micro'      => env('GODADDY_AMOUNT_MICRO', true),
+    ],
+    
     // where Google / Facebook send the browser back to (the React site)
     'frontend_url' => env('FRONTEND_URL'),
 

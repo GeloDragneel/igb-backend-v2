@@ -51,6 +51,7 @@ use App\Http\Controllers\Api\JobOrderController;
 use App\Http\Controllers\Api\EmployeeStatusController;
 use App\Http\Controllers\Api\WorkReminderController;
 use App\Http\Controllers\Api\AuditAgingController;
+use App\Http\Controllers\Api\ThirdPartyController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -887,6 +888,15 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::get('/monitoring/audit/aging', [AuditAgingController::class, 'aging']);
     Route::get('/monitoring/audit/aging/list', [AuditAgingController::class, 'agingList']);
+
+    Route::prefix('third-party')->group(function () {
+        Route::get('/summary', [ThirdPartyController::class, 'summary']);
+        Route::get('/bills', [ThirdPartyController::class, 'bills']);
+        Route::get('/costs', [ThirdPartyController::class, 'costs']);
+        Route::get('/renewals', [ThirdPartyController::class, 'renewals']);
+        Route::get('/logs', [ThirdPartyController::class, 'logs']);
+        Route::post('/sync', [ThirdPartyController::class, 'sync']);
+    });
 
     require __DIR__ . '/api_messenger.php';
 });
