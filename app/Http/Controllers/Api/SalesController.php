@@ -395,6 +395,9 @@ class SalesController extends Controller
         $com = (int) ($u->getAttribute('comid') ?? 0);
         return $com > 0 ? ((int) DB::table('m_employee')->where('com_id', $com)->orderBy('id')->value('id') ?: null) : null;
     }
+    // m_item_class: only 1 = Stock Item gets the inventory / cost of sales entry
+    private const STOCK_ITEM_CLASSES = [1];
+
     /* =====================================================================
    GET /api/sales/invoice/{invoiceNo}/journal   (same as doGetJournalList)
    3 queries total: master, lines (+ item output VAT account), account names
@@ -424,7 +427,12 @@ class SalesController extends Controller
                 't_sales_invoice_detail.non_vat',
                 't_sales_invoice_detail.zero_rated',
                 't_sales_invoice_detail.ex_rate',
+                't_sales_invoice_detail.quantity',
                 'I.output_vat_account',
+                'I.item_class_id',
+                'I.last_unit_cost',
+                'I.gl_inventory_account',
+                'I.gl_cost_of_sales_account',
             ]);
 
         $rvs = RVoucherMaster::where('added_by', $userId)
@@ -444,6 +452,8 @@ class SalesController extends Controller
         $codes = collect([$inv->account_code])
             ->merge($lines->pluck('account_code'))
             ->merge($lines->pluck('output_vat_account'))
+            ->merge($lines->pluck('gl_inventory_account'))
+            ->merge($lines->pluck('gl_cost_of_sales_account'))
             ->merge($rvs->pluck('bank'))
             ->merge($rvLines->pluck('account_code'))
             ->filter()->unique()->values();
@@ -484,6 +494,19 @@ class SalesController extends Controller
             $amount = ((float) $l->net_of_vat + (float) $l->vat_exempt + (float) $l->non_vat + (float) $l->zero_rated) * $rate;
             $code = $l->account_code ?: '0';
             $add(5, $code, (string) ($names[$code] ?? ''), 0, $amount);
+
+            // Inventory / Cost of sales (Stock Item only, accounts from the item settings)
+            //   Debit : cost of sales account   Credit : inventory account   (qty × item unit cost)
+            $invAcct  = trim((string) $l->gl_inventory_account);
+            $cogsAcct = trim((string) $l->gl_cost_of_sales_account);
+            $cost = round((float) $l->quantity * (float) $l->last_unit_cost, 2);
+            if (in_array((int) $l->item_class_id, self::STOCK_ITEM_CLASSES, true)
+                && $invAcct !== '' && $invAcct !== '0'
+                && $cogsAcct !== '' && $cogsAcct !== '0'
+                && $cost != 0) {
+                $add(6, $cogsAcct, (string) ($names[$cogsAcct] ?? 'Cost of Sales'), $cost, 0);
+                $add(7, $invAcct, (string) ($names[$invAcct] ?? 'Inventory'), 0, $cost);
+            }
         }
 
         $list = collect($rows)
@@ -494,6 +517,7 @@ class SalesController extends Controller
                 'account_name' => $r['account_name'],
                 'debit'        => round($r['debit'], 2),
                 'credit'       => round($r['credit'], 2),
+                'section'      => $r['sort'] >= 6 ? 'cost' : 'sales',   // 'cost' = inventory / cost of sales lines
             ]);
 
         // ---- collection rows (shown under COLLECTION, not in the totals) ----

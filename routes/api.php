@@ -52,6 +52,7 @@ use App\Http\Controllers\Api\EmployeeStatusController;
 use App\Http\Controllers\Api\WorkReminderController;
 use App\Http\Controllers\Api\AuditAgingController;
 use App\Http\Controllers\Api\ThirdPartyController;
+use App\Http\Controllers\Api\InventorySettingsController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -897,6 +898,9 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/logs', [ThirdPartyController::class, 'logs']);
         Route::post('/sync', [ThirdPartyController::class, 'sync']);
     });
+
+    Route::get('/inventory/settings', [InventorySettingsController::class, 'showInvSettings']);
+    Route::put('/inventory/settings', [InventorySettingsController::class, 'updateInvSettings']);
 
     require __DIR__ . '/api_messenger.php';
 });
