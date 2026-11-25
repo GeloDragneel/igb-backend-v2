@@ -1,6 +1,7 @@
 <?php
 
 namespace App\Http\Controllers\Api;
+use App\Services\InventoryCosting;
 use Carbon\Carbon;
 use App\Http\Controllers\Controller;
 use App\Models\UserClient;
@@ -428,6 +429,7 @@ class SalesController extends Controller
                 't_sales_invoice_detail.zero_rated',
                 't_sales_invoice_detail.ex_rate',
                 't_sales_invoice_detail.quantity',
+                't_sales_invoice_detail.id as line_id',
                 'I.output_vat_account',
                 'I.item_class_id',
                 'I.last_unit_cost',
@@ -465,6 +467,9 @@ class SalesController extends Controller
                 ->whereIn('account_code', $codes)
                 ->pluck('account_name', 'account_code');
 
+        // cost of Stock Items sold, by the client's Inventory Method (FIFO / WAC / Specific)
+        $costs = InventoryCosting::costs([$userId], $this->caidFor($request));
+
         // ---- build the entry (same rules and order as the old UNION) ----
         $rows = [];
         $add = function (int $sort, $code, string $name, float $dr, float $cr) use (&$rows) {
@@ -496,10 +501,10 @@ class SalesController extends Controller
             $add(5, $code, (string) ($names[$code] ?? ''), 0, $amount);
 
             // Inventory / Cost of sales (Stock Item only, accounts from the item settings)
-            //   Debit : cost of sales account   Credit : inventory account   (qty × item unit cost)
+            //   Debit : cost of sales account   Credit : inventory account   (cost by the Inventory Method)
             $invAcct  = trim((string) $l->gl_inventory_account);
             $cogsAcct = trim((string) $l->gl_cost_of_sales_account);
-            $cost = round((float) $l->quantity * (float) $l->last_unit_cost, 2);
+            $cost = (float) ($costs[(int) $l->line_id] ?? 0);
             if (in_array((int) $l->item_class_id, self::STOCK_ITEM_CLASSES, true)
                 && $invAcct !== '' && $invAcct !== '0'
                 && $cogsAcct !== '' && $cogsAcct !== '0'
