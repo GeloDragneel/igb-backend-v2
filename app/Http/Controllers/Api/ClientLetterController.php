@@ -169,7 +169,7 @@ class ClientLetterController extends Controller
             '{TARGET_DATE}' => $long($d['target_date'] ?? null),
         ];
 
-        $docx = $this->fill($template, $values);
+        $docx = $this->fill($template, $values, true);
         $pdf = $this->toPdf($docx);
         $bytes = file_get_contents($pdf);
         @unlink($pdf);
@@ -292,7 +292,7 @@ class ClientLetterController extends Controller
     /* ---------------- docx → pdf ---------------- */
 
     /** copy of the template with {PLACEHOLDERS} replaced (word/document.xml) */
-    private function fill(string $template, array $values): string
+    private function fill(string $template, array $values, bool $audit = false): string
     {
         $docx = $this->tempPath('docx');
         copy($template, $docx);
@@ -300,10 +300,48 @@ class ClientLetterController extends Controller
         abort_unless($zip->open($docx) === true, 500, "Couldn't open the letter template.");
         $xml = $zip->getFromName('word/document.xml');
         $safe = array_map(fn ($x) => htmlspecialchars((string) $x, ENT_XML1 | ENT_QUOTES, 'UTF-8'), $values);
-        $xml = $this->smallTitles($this->headerFirstPageOnly($this->a4(strtr($xml, $safe))));
+        $xml = strtr($xml, $safe);
+        if ($audit) $xml = $this->auditCleanup($xml);
+        $xml = $this->smallTitles($this->headerFirstPageOnly($this->a4($xml)));
         $zip->addFromString('word/document.xml', $this->letterheadOnPageOne($zip, $xml));
         $zip->close();
         return $docx;
+    }
+
+    /** audit letter: no "— SOLE PROPRIETORSHIP" (etc.) after the title, no "Date: …" line, no "To: Owner / Proprietor" line */
+    private function auditCleanup(string $xml): string
+    {
+        $tRe = '/(<w:t(?:\s[^>]*)?>)([^<]*)(<\/w:t>)/';
+        return preg_replace_callback('/<w:p(?:\s[^>]*)?>(?:(?!<w:p[\s>]).)*?<\/w:p>/s', function ($m) use ($tRe) {
+            $p = $m[0];
+            preg_match_all($tRe, $p, $t);
+            $text = trim(html_entity_decode(implode('', $t[2]), ENT_QUOTES | ENT_XML1, 'UTF-8'));
+
+            // the "Date: …" and "To: …" lines go
+            if (preg_match('/^(Date|To)\s*:/i', $text)) {
+                // the line may share its paragraph with the address (line breaks): drop only up to the first break
+                if (preg_match('/<w:br\s*\/>/', $p, $br, PREG_OFFSET_CAPTURE)) {
+                    $head = preg_replace($tRe, '$1$3', substr($p, 0, $br[0][1]));
+                    return $head . substr($p, $br[0][1] + strlen($br[0][0]));
+                }
+                return '';
+            }
+
+            // title: cut from the dash on (the dash may sit in any run)
+            if (stripos($text, 'ENGAGEMENT LETTER') !== false && preg_match('/ENGAGEMENT LETTER\s*[—–-]/u', $text)) {
+                $cut = false;
+                return preg_replace_callback($tRe, function ($r) use (&$cut) {
+                    if ($cut) return $r[1] . $r[3];
+                    $s = html_entity_decode($r[2], ENT_QUOTES | ENT_XML1, 'UTF-8');
+                    if (preg_match('/\s*[—–]|\s+-\s/u', $s, $d, PREG_OFFSET_CAPTURE)) {
+                        $cut = true;
+                        return $r[1] . htmlspecialchars(rtrim(substr($s, 0, $d[0][1])), ENT_XML1 | ENT_QUOTES, 'UTF-8') . $r[3];
+                    }
+                    return $r[0];
+                }, $p);
+            }
+            return $p;
+        }, $xml);
     }
 
     /** paper = A4 (210 × 297 mm = 11906 × 16838 twips) on every section of the letter, whatever size the Word template was saved with */
@@ -377,14 +415,20 @@ class ClientLetterController extends Controller
         return preg_replace('/(<w:pgMar\b[^>]*w:top=")\d+"/', '${1}' . $newTop . '"', $xml);
     }
 
-    /** "Title" headings (ANNEX A — …) at 16 pt instead of the big Title size */
+    /** "Title" headings (ANNEX A — …): 18 pt instead of the big Title size, and no space above them */
     private function smallTitles(string $xml): string
     {
-        return preg_replace_callback('/<w:p>(?:(?!<\/w:p>).)*?<w:pStyle w:val="Title"\/>.*?<\/w:p>/s', fn ($m) => preg_replace(
-            ['/<w:sz w:val="\\d+"\/>|<w:szCs w:val="\\d+"\/>/', '/<\/w:rPr>/', '/<w:r>(?!<w:rPr>)/'],
-            ['', '<w:sz w:val="32"/><w:szCs w:val="32"/></w:rPr>', '<w:r><w:rPr><w:sz w:val="32"/><w:szCs w:val="32"/></w:rPr>'],
-            $m[0]
-        ), $xml);
+        $sz = '<w:sz w:val="36"/><w:szCs w:val="36"/>';
+        return preg_replace_callback('/<w:p(?:\s[^>]*)?>(?:(?!<w:p[\s>]).)*?<w:pStyle w:val="Title"\/>.*?<\/w:p>/s', function ($m) use ($sz) {
+            $p = preg_replace('/<w:sz w:val="\d+"\/>|<w:szCs w:val="\d+"\/>/', '', $m[0]);
+            $p = preg_replace('/<w:r>(?!<w:rPr>)/', '<w:r><w:rPr></w:rPr>', $p);
+            $p = preg_replace('/<w:r(\s[^>]*)?>(?!<w:rPr>)/', '<w:r$1><w:rPr></w:rPr>', $p);
+            $p = str_replace('</w:rPr>', $sz . '</w:rPr>', $p);
+            // no space above the title (spacing before = 0, small gap after)
+            $p = preg_replace('/<w:spacing\b[^>]*\/>/', '', $p, 1);
+            $p = preg_replace('/(<w:pStyle w:val="Title"\/>)/', '$1<w:spacing w:before="0" w:after="120"/>', $p, 1);
+            return $p;
+        }, $xml);
     }
 
     private function tempPath(string $ext): string
