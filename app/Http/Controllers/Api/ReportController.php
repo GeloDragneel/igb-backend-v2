@@ -3194,7 +3194,7 @@ class ReportController extends SalesController
             ->whereIn('m.added_by', $ids)->where('m.invoice_status_id', '<>', 5)->where('m.record_status', 'posted')->where('x.record_status', 'posted')
             ->whereBetween('m.declared_month', [$from, $to]);
 
-        $sales = $purchases = $expenses = [];
+        $sales = $purchases = $expenses = $cogs = [];
         if ($ids) {
             // SALES – 4xxxx
             $sales = $this->itsGroup(
@@ -3209,7 +3209,6 @@ class ReportController extends SalesController
             //  2) cost of Stock Items sold (m_item_class 1), by the Inventory Method (FIFO / WAC / Specific),
             //     on the item's cost of sales account (same entry as the Sales journal: Dr cost of sales / Cr inventory)
             $costs = InventoryCosting::costs($ids, $account->id ?? null);
-            $cogs = [];
             $soldLines = DB::table('t_sales_invoice_detail as x')
                 ->join('m_items as I', 'I.id', '=', 'x.item_id')
                 ->whereIn('x.added_by', $ids)->where('x.invoice_status_id', '<>', 5)->where('x.trans_type', 'posted')
@@ -3226,10 +3225,8 @@ class ReportController extends SalesController
                 $cogs[$c]['refs'][$l->declared_month][] = (string) $l->invoice_no;
                 $cogs[$c]['extra'] = 0;
             }
-            $purchases = $this->itsMerge(
-                $this->itsGroup($ap()->whereRaw('LOWER(m.trans_type) = ?', ['purchases']), 'x.account_code', 'm.declared_month', $amt('x'), 'm.invoice_no'),
-                $cogs
-            );
+            // purchases and cost of sales are kept apart: Ending = Beginning + Purchases − Cost of Sales
+            $purchases = $this->itsGroup($ap()->whereRaw('LOWER(m.trans_type) = ?', ['purchases']), 'x.account_code', 'm.declared_month', $amt('x'), 'm.invoice_no');
 
             // EXPENSES – 6xxxx and 8xxxx of trans_type = Expenses (with Non-VAT total)
             // (Purchases lines are all in Cost of Sales now, so they are not counted twice)
@@ -3298,6 +3295,7 @@ class ReportController extends SalesController
             'months'    => $months,
             'sales'     => $toRows($sales, 'SALES'),
             'purchases' => $toRows($purchases, 'COGS'),
+            'costs'     => $toRows($cogs, 'COGS'),          // cost of Stock Items sold (Inventory Method)
             'expenses'  => $toRows($expenses, 'EXP'),
             'beginning' => round($beginning, 2),
             'ending'    => round($ending, 2),
