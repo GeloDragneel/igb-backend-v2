@@ -93,9 +93,6 @@ class TeamController extends SalesController
         $own  = $memberId ? (int) UserClientStaff::whereKey($memberId)->value('employee_id') : 0;
         abort_unless($own === $empId || DB::table('m_employee')->where('id', $empId)->where('company_caid', $caid)->exists(),
             422, 'Pick an employee of this branch.');
-        $taken = UserClientStaff::where('employee_id', $empId)
-            ->when($memberId, fn ($q) => $q->where('id', '<>', $memberId))->value('username');
-        abort_if($taken, 422, "This employee already has a login ({$taken}).");
     }
 
     private function rules(bool $creating): array

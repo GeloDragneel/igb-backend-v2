@@ -676,9 +676,9 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/lending/cashout-sheet', [HR::class, 'cashoutSheet']);
     Route::get('/lending/investments/{id}/share', [HR::class, 'investmentShare']);
     Route::post('/lending/investments/{id}/cashout-share', [HR::class, 'cashoutShare']);
-    Route::post('/lending/cashout-batch', [HRManagmentController::class, 'cashoutBatch']);
-    Route::get('/lending/config', [HRManagmentController::class, 'lendingConfigGet']);
-    Route::put('/lending/config', [HRManagmentController::class, 'lendingConfigSave']);
+    Route::post('/lending/cashout-batch', [HR::class, 'cashoutBatch']);
+    Route::get('/lending/config', [HR::class, 'lendingConfigGet']);
+    Route::put('/lending/config', [HR::class, 'lendingConfigSave']);
         
     // ---------- My profile (the logged-in staff) → ProfileController ----------
     // add at the top of routes/api.php:  use App\Http\Controllers\Api\ProfileController;

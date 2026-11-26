@@ -18,8 +18,6 @@ use App\Models\GRNMaster;
 use App\Models\GRNDetail;
 use App\Models\GeneralJournal;
 use App\Models\Items;
-use App\Models\PurchaseOrderMaster;
-use App\Models\PurchaseOrderDetail;
 use App\Models\WtbManual;
 use App\Models\BegBalanceAccount;
 use App\Models\BegBalanceProduct;
@@ -216,7 +214,13 @@ class ReportController extends SalesController
             ->where('invoice_status_id', '<>', 5)
             ->where('trans_type', 'posted')
             ->where(fn($q) => $byDate($q, 'transaction_date'))
-            ->get(['id', 'added_by', 'invoice_no', 'document_no', 'customer_id', 'account_code', 'transaction_date', 'declared_month', 'created_at', 'input_vat', 'net_of_vat', 'vat_exempt', 'non_vat', 'zero_rated', 'ex_rate']);
+            ->get(['id', 'added_by', 'invoice_no', 'document_no', 'customer_id', 'account_code', 'transaction_date', 'declared_month', 'created_at', 'input_vat', 'net_of_vat', 'vat_exempt', 'non_vat', 'zero_rated', 'ex_rate', 'item_id']);
+
+        // Cost of Sales of Stock Items (m_item_class 1): cost by the Inventory Method, accounts from the item
+        $stockItems = DB::table('m_items')->whereIn('id', $lines->pluck('item_id')->filter()->unique()->values()->all() ?: [0])
+            ->where('item_class_id', 1)
+            ->get(['id', 'gl_inventory_account', 'gl_cost_of_sales_account'])->keyBy('id');
+        $lineCost = $stockItems->isNotEmpty() ? InventoryCosting::costs($ids, $account->id ?? null) : [];
 
         $rvs = RVoucherMaster::whereIn('added_by', $ids)
             ->where('sub_total', '>', 0)
@@ -245,8 +249,8 @@ class ReportController extends SalesController
 
         $rows = [];
 
-        $push = function(int $rank, $src, string $date, $code, string $desc, float $dr, float $cr, ?string $docNo = null) use (&$rows, $cust) {
-            $rows[] = [
+        $push = function(int $rank, $src, string $date, $code, string $desc, float $dr, float $cr, ?string $docNo = null, ?string $section = null) use (&$rows, $cust) {
+            $rows[] = ($section ? ['section' => $section] : []) + [
                 'date' => $date,
                 'invoice_no' => (string) $src->invoice_no,
                 'account_id' => (string) $code,
@@ -273,6 +277,16 @@ class ReportController extends SalesController
             $total = ((float) $l->net_of_vat + (float) $l->vat_exempt + (float) $l->non_vat + (float) $l->zero_rated) * $rate;
             if ((float) $l->input_vat != 0) $push(2, $l, $date, $l->account_code, 'Output VAT', 0, (float) $l->input_vat * $rate);
             if ($total != 0) $push(2, $l, $date, $l->account_code, $acct($l->added_by, $l->account_code), 0, $total);
+
+            // Inventory / Cost of Sales (Stock Item with both accounts): Dr cost of sales · Cr inventory
+            $it = $stockItems[$l->item_id] ?? null;
+            $inv = trim((string) ($it->gl_inventory_account ?? ''));
+            $cos = trim((string) ($it->gl_cost_of_sales_account ?? ''));
+            $cost = (float) ($lineCost[(int) $l->id] ?? 0);
+            if ($it && $inv !== '' && $inv !== '0' && $cos !== '' && $cos !== '0' && $cost != 0) {
+                $push(2, $l, $date, $cos, $acct($l->added_by, $cos) ?: 'Cost of Sales', $cost, 0, null, 'cost');
+                $push(2, $l, $date, $inv, $acct($l->added_by, $inv) ?: 'Inventory', 0, $cost, null, 'cost');
+            }
         }
 
         foreach ($rvs as $r) {
@@ -293,6 +307,9 @@ class ReportController extends SalesController
             return $r;
         }, $rows);
 
+        // totals = sales journal only (inventory / cost of sales lines are shown, not added)
+        $counted = array_filter($rows, fn ($r) => ($r['section'] ?? '') !== 'cost');
+
         return response()->json([
             'company' => $this->companyHeader($account),
             'branches' => $branches->map(fn($b) => [
@@ -301,8 +318,8 @@ class ReportController extends SalesController
             ])->values(),
             'rows' => $rows,
             'totals' => [
-                'debit' => round(array_sum(array_column($rows, 'debit')), 4),
-                'credit' => round(array_sum(array_column($rows, 'credit')), 4),
+                'debit' => round(array_sum(array_column($counted, 'debit')), 4),
+                'credit' => round(array_sum(array_column($counted, 'credit')), 4),
             ],
         ]);
     }
