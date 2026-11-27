@@ -53,6 +53,7 @@ use App\Http\Controllers\Api\WorkReminderController;
 use App\Http\Controllers\Api\AuditAgingController;
 use App\Http\Controllers\Api\ThirdPartyController;
 use App\Http\Controllers\Api\InventorySettingsController;
+use App\Http\Controllers\Api\VatManagementController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -901,6 +902,11 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::get('/inventory/settings', [InventorySettingsController::class, 'showInvSettings']);
     Route::put('/inventory/settings', [InventorySettingsController::class, 'updateInvSettings']);
+
+    Route::get('/vat-management/state', [VatManagementController::class, 'state']);
+    Route::get('/vat-management/logs', [VatManagementController::class, 'logs']);
+    Route::post('/vat-management/logs', [VatManagementController::class, 'addLog']);
+    Route::post('/vat-management/status', [VatManagementController::class, 'setStatus']);
 
     require __DIR__ . '/api_messenger.php';
 });
