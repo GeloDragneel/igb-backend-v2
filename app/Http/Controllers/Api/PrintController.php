@@ -784,7 +784,7 @@ private function reliefSheet(Request $request, string $type, array $pick = []): 
      * Old OpenTBS merge for templates with one-row blocks (a, m, n → [a.cap1], [m.ClientName], [n.data1] …)
      * and one repeating block (b → the row with [b.data1] … repeats per line).
      */
-    private function fillTemplate(string $template, array $singles, array $rows, string $repeat = 'b'): Spreadsheet
+    private function fillTemplate(string $template, array $singles, array $rows, string $repeat = 'b', ?array &$at = null): Spreadsheet
     {
         $ss = IOFactory::load($template);
         $sh = $ss->getSheet(0);                                         // OPENTBS_SELECT_SHEET, 1
@@ -822,6 +822,7 @@ private function reliefSheet(Request $request, string $type, array $pick = []): 
             }
         }
         if (!$blockRow) return $ss;
+        $at = ['row' => $blockRow, 'cols' => $colOf];                  // data n → column letter (1-based n)
 
         // 2) the repeating block (rows below, like the footer, move down)
         if (count($rows) > 1) $sh->insertNewRowBefore($blockRow + 1, count($rows) - 1);
@@ -1982,6 +1983,9 @@ private function reliefSheet(Request $request, string $type, array $pick = []): 
             'rows'   => ['present', 'array', 'max:50000'],
             'rows.*' => ['array', 'max:40'],
             'total'  => ['nullable', 'array', 'max:40'],
+            'merge'      => ['nullable', 'array', 'max:50000'],         // [[first row (0-based), how many rows], …] = one transaction
+            'merge.*'    => ['array', 'size:2'],
+            'merge_cols' => ['nullable', 'array', 'max:40'],            // 0-based columns merged per transaction (ATC / BIR2307)
         ]);
 
         $clean = fn ($r) => array_map(fn ($v) => is_int($v) || is_float($v) ? (float) $v : mb_substr((string) ($v ?? ''), 0, 500), array_values($r));
@@ -1996,6 +2000,8 @@ private function reliefSheet(Request $request, string $type, array $pick = []): 
             'money'  => array_map('intval', $d['money'] ?? []),
             'rows'   => array_map($clean, $d['rows']),
             'total'  => $clean($d['total'] ?? []),
+            'merge'      => array_map(fn ($m) => [(int) $m[0], (int) $m[1]], $d['merge'] ?? []),
+            'merge_cols' => array_map('intval', $d['merge_cols'] ?? []),
         ], now()->addMinutes(10));
 
         return response()->json(['token' => $token]);
@@ -2022,9 +2028,26 @@ private function reliefSheet(Request $request, string $type, array $pick = []): 
         if ($saved['total']) $data[] = $saved['total'];             // old: totals line at the end
 
         $template = $this->template('Transactions.xlsx');
+        $at = null;                                                    // where the data rows start + which column each one is in
         $ss = is_file($template)
-            ? $this->fillTemplate($template, ['m' => $master], $data)
-            : $this->transactionsSheet($saved['head'], $saved['money'], $saved['rows'], $saved['total'], $master);
+            ? $this->fillTemplate($template, ['m' => $master], $data, 'b', $at)
+            : $this->transactionsSheet($saved['head'], $saved['money'], $saved['rows'], $saved['total'], $master, $at);
+
+        // ATC / BIR2307 columns: one merged cell per transaction (same as on screen)
+        if ($at && !empty($saved['merge']) && !empty($saved['merge_cols'])) {
+            $sh = $ss->getSheet(0);
+            foreach ($saved['merge'] as [$i, $n]) {
+                if ($n < 2) continue;
+                $top = $at['row'] + $i;
+                $bottom = $top + $n - 1;
+                foreach ($saved['merge_cols'] as $c) {
+                    $col = $at['cols'][$c + 1] ?? null;
+                    if (!$col) continue;
+                    $sh->mergeCells("{$col}{$top}:{$col}{$bottom}");
+                    $sh->getStyle("{$col}{$top}")->getAlignment()->setVertical('center');
+                }
+            }
+        }
 
         $who = $request->user()?->username ?? $this->addedByFor($request) ?? 'report';
         $xlsx = $this->tempFile('xlsx');
@@ -2043,7 +2066,7 @@ private function reliefSheet(Request $request, string $type, array $pick = []): 
     }
 
     /** no template: the table as on screen */
-    private function transactionsSheet(array $head, array $money, array $rows, array $total, array $master): Spreadsheet
+    private function transactionsSheet(array $head, array $money, array $rows, array $total, array $master, ?array &$at = null): Spreadsheet
     {
         $ss = new Spreadsheet();
         $sh = $ss->getActiveSheet();
@@ -2068,6 +2091,7 @@ private function reliefSheet(Request $request, string $type, array $pick = []): 
         ]);
         $sh->getRowDimension($r)->setRowHeight(30);
         $r++;
+        $at = ['row' => $r, 'cols' => array_combine(range(1, $n), array_map(fn ($i) => Coordinate::stringFromColumnIndex($i), range(1, $n)))];
 
         foreach ($rows as $line) {
             foreach ($line as $c => $val) {
